@@ -1,0 +1,68 @@
+[package]
+name = "tokio-rustls-acme"
+version = "0.1.0"
+authors = ["dignifiedquire <me@dignifiedquire.com>", "Florian Uekermann <florian@uekermann.me>"]
+edition = "2018"
+description = "Automatic TLS certificate management using rustls"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/n0-comuter/tokio-rustls-acme"
+documentation = "https://docs.rs/tokio-rustls-acme"
+keywords = ["acme", "rustls", "tls", "letsencrypt"]
+categories = ["asynchronous", "cryptography", "network-programming"]
+
+[dependencies]
+futures = "0.3.21"
+rcgen = "0.10"
+http-types = { version = "2.12.0", default-features = false }
+serde_json = "1.0.81"
+serde = "1.0.137"
+ring = { version = "0.16.20", features = ["std"] }
+base64 = "0.13.0"
+log = "0.4.17"
+webpki-roots = "0.23"
+pem = "1.0.2"
+thiserror = "1.0.31"
+x509-parser = "0.13.2"
+chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
+url = "2.2.2"
+async-trait = "0.1.53"
+rustls = "0.21"
+
+tokio = { version = "1.20.1", default-features = false }
+tokio-rustls = { version = "0.24" }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+
+# Axum
+axum-server = { version = "0.5", features = ["tls-rustls"], optional = true }
+
+[dev-dependencies]
+simple_logger = "2.1.0"
+structopt = "0.3.26"
+clap = { version = "3.1.18", features = ["derive"] }
+smol-potat = "1.1.2"
+axum = "0.6"
+tokio = { version="1.19.2", features = ["full"] }
+tokio-stream = { version="0.1.9", features = ["net"] }
+tokio-util = { version="0.7.3", features = ["compat"] }
+warp = "0.3.4"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "doc_auto_cfg"]
+
+[features]
+default = []
+axum = ["dep:axum-server"]
+
+[[example]]
+name="low_level_axum"
+required-features=["axum"]
+
+[[example]]
+name="high_level_warp"
+
+[[example]]
+name="high_level"
+
+[[example]]
+name="low_level"
