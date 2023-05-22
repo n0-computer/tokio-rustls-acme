@@ -20,7 +20,7 @@ impl AcmeAcceptor {
         let mut config = ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
-            .with_cert_resolver(resolver.clone());
+            .with_cert_resolver(resolver);
         config.alpn_protocols.push(ACME_TLS_ALPN_NAME.to_vec());
         Self {
             config: Arc::new(config),

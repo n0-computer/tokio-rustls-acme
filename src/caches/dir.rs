@@ -22,7 +22,7 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             Ok(content) => Ok(Some(content)),
             Err(err) => match err.kind() {
                 ErrorKind::NotFound => Ok(None),
-                _ => Err(err.into()),
+                _ => Err(err),
             },
         }
     }
@@ -33,8 +33,9 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
     ) -> Result<(), std::io::Error> {
         fs::create_dir_all(&self.inner).await?;
         let path = self.inner.as_ref().join(file);
-        Ok(fs::write(path, contents).await?)
+        fs::write(path, contents).await
     }
+
     fn cached_account_file_name(contact: &[String], directory_url: impl AsRef<str>) -> String {
         let mut ctx = Context::new(&SHA256);
         for el in contact {
@@ -65,7 +66,7 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         domains: &[String],
         directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
-        let file_name = Self::cached_cert_file_name(&domains, directory_url);
+        let file_name = Self::cached_cert_file_name(domains, directory_url);
         self.read_if_exist(file_name).await
     }
     async fn store_cert(
@@ -74,7 +75,7 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         directory_url: &str,
         cert: &[u8],
     ) -> Result<(), Self::EC> {
-        let file_name = Self::cached_cert_file_name(&domains, directory_url);
+        let file_name = Self::cached_cert_file_name(domains, directory_url);
         self.write(file_name, cert).await
     }
 }
@@ -87,7 +88,7 @@ impl<P: AsRef<Path> + Send + Sync> AccountCache for DirCache<P> {
         contact: &[String],
         directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EA> {
-        let file_name = Self::cached_account_file_name(&contact, directory_url);
+        let file_name = Self::cached_account_file_name(contact, directory_url);
         self.read_if_exist(file_name).await
     }
 
@@ -97,7 +98,7 @@ impl<P: AsRef<Path> + Send + Sync> AccountCache for DirCache<P> {
         directory_url: &str,
         account: &[u8],
     ) -> Result<(), Self::EA> {
-        let file_name = Self::cached_account_file_name(&contact, directory_url);
+        let file_name = Self::cached_account_file_name(contact, directory_url);
         self.write(file_name, account).await
     }
 }

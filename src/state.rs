@@ -141,7 +141,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
             })),
             load_account: Some(Box::pin({
-                let config = config.clone();
+                let config = config;
                 async move {
                     config
                         .cache
@@ -155,7 +155,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
     }
     fn parse_cert(pem: &[u8]) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertParseError> {
-        let mut pems = pem::parse_many(&pem)?;
+        let mut pems = pem::parse_many(pem)?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
         }

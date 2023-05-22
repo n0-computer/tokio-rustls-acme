@@ -26,7 +26,7 @@ pub struct Account {
     pub kid: String,
 }
 
-static ALG: &'static EcdsaSigningAlgorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
+static ALG: &EcdsaSigningAlgorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
 
 impl Account {
     pub fn generate_key_pair() -> Vec<u8> {
@@ -44,7 +44,7 @@ impl Account {
         I: IntoIterator<Item = &'a S>,
     {
         let key_pair = Self::generate_key_pair();
-        Ok(Self::create_with_keypair(client_config, directory, contact, &key_pair).await?)
+        Self::create_with_keypair(client_config, directory, contact, &key_pair).await
     }
     pub async fn create_with_keypair<'a, S, I>(
         client_config: &Arc<ClientConfig>,
@@ -108,7 +108,7 @@ impl Account {
         client_config: &Arc<ClientConfig>,
         domains: Vec<String>,
     ) -> Result<(String, Order), AcmeError> {
-        let domains: Vec<Identifier> = domains.into_iter().map(|d| Identifier::Dns(d)).collect();
+        let domains: Vec<Identifier> = domains.into_iter().map(Identifier::Dns).collect();
         let payload = format!("{{\"identifiers\":{}}}", serde_json::to_string(&domains)?);
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
@@ -164,19 +164,19 @@ impl Account {
     }
     pub fn tls_alpn_01<'a>(
         &self,
-        challenges: &'a Vec<Challenge>,
+        challenges: &'a [Challenge],
         domain: String,
     ) -> Result<(&'a Challenge, CertifiedKey), AcmeError> {
         let challenge = challenges
             .iter()
-            .filter(|c| c.typ == ChallengeType::TlsAlpn01)
-            .next();
+            .find(|c| c.typ == ChallengeType::TlsAlpn01);
+
         let challenge = match challenge {
             Some(challenge) => challenge,
             None => return Err(AcmeError::NoTlsAlpn01Challenge),
         };
         let mut params = rcgen::CertificateParams::new(vec![domain]);
-        let key_auth = key_authorization_sha256(&self.key_pair, &*challenge.token)?;
+        let key_auth = key_authorization_sha256(&self.key_pair, &challenge.token)?;
         params.alg = &PKCS_ECDSA_P256_SHA256;
         params.custom_extensions = vec![CustomExtension::new_acme_identifier(key_auth.as_ref())];
         let cert = Certificate::from_params(params)?;

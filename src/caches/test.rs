@@ -28,8 +28,8 @@ pub struct TestCache<EC: Debug = std::io::Error, EA: Debug = std::io::Error> {
     _account_error: PhantomData<AtomicPtr<Box<EA>>>,
 }
 
-impl<EC: Debug, EA: Debug> TestCache<EC, EA> {
-    pub fn new() -> Self {
+impl<EC: Debug, EA: Debug> Default for TestCache<EC, EA> {
+    fn default() -> Self {
         let mut params = CertificateParams::default();
         let mut distinguished_name = DistinguishedName::new();
         distinguished_name.push(DnType::CountryName, "US");
@@ -51,6 +51,13 @@ impl<EC: Debug, EA: Debug> TestCache<EC, EA> {
             _account_error: Default::default(),
         }
     }
+}
+
+impl<EC: Debug, EA: Debug> TestCache<EC, EA> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn ca_pem(&self) -> &str {
         &self.ca_pem
     }

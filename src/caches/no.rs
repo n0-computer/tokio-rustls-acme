@@ -18,12 +18,18 @@ pub struct NoCache<EC: Debug = Infallible, EA: Debug = Infallible> {
     _account_error: PhantomData<AtomicPtr<Box<EA>>>,
 }
 
-impl<EC: Debug, EA: Debug> NoCache<EC, EA> {
-    pub fn new() -> Self {
+impl<EC: Debug, EA: Debug> Default for NoCache<EC, EA> {
+    fn default() -> Self {
         Self {
             _cert_error: Default::default(),
             _account_error: Default::default(),
         }
+    }
+}
+
+impl<EC: Debug, EA: Debug> NoCache<EC, EA> {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
