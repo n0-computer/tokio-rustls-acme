@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::https_helper::{https, HttpsRequestError, Method, Response};
 use crate::jose::{key_authorization_sha256, sign, JoseError};
-use base64::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use rcgen::{Certificate, CustomExtension, RcgenError, PKCS_ECDSA_P256_SHA256};
 use ring::error::{KeyRejected, Unspecified};
 use ring::rand::SystemRandom;
@@ -148,10 +149,7 @@ impl Account {
         url: impl AsRef<str>,
         csr: Vec<u8>,
     ) -> Result<Order, AcmeError> {
-        let payload = format!(
-            "{{\"csr\":\"{}\"}}",
-            base64::encode_config(csr, URL_SAFE_NO_PAD)
-        );
+        let payload = format!("{{\"csr\":\"{}\"}}", URL_SAFE_NO_PAD.encode(csr),);
         let response = self.request(client_config, &url, &payload).await?;
         Ok(serde_json::from_str(&response.1)?)
     }

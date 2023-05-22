@@ -1,4 +1,5 @@
-use base64::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use ring::digest::{digest, Digest, SHA256};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair};
@@ -17,10 +18,10 @@ pub(crate) fn sign(
         Some(_) => None,
     };
     let protected = Protected::base64(jwk, kid, nonce, url)?;
-    let payload = base64::encode_config(payload, URL_SAFE_NO_PAD);
+    let payload = URL_SAFE_NO_PAD.encode(payload);
     let combined = format!("{}.{}", &protected, &payload);
     let signature = key.sign(&SystemRandom::new(), combined.as_bytes())?;
-    let signature = base64::encode_config(signature.as_ref(), URL_SAFE_NO_PAD);
+    let signature = URL_SAFE_NO_PAD.encode(signature.as_ref());
     let body = Body {
         protected,
         payload,
@@ -71,7 +72,7 @@ impl<'a> Protected<'a> {
             url,
         };
         let protected = serde_json::to_vec(&protected)?;
-        Ok(base64::encode_config(protected, URL_SAFE_NO_PAD))
+        Ok(URL_SAFE_NO_PAD.encode(protected))
     }
 }
 
@@ -94,8 +95,8 @@ impl Jwk {
             crv: "P-256",
             kty: "EC",
             u: "sig",
-            x: base64::encode_config(x, URL_SAFE_NO_PAD),
-            y: base64::encode_config(y, URL_SAFE_NO_PAD),
+            x: URL_SAFE_NO_PAD.encode(x),
+            y: URL_SAFE_NO_PAD.encode(y),
         }
     }
     pub(crate) fn thumb_sha256_base64(&self) -> Result<String, JoseError> {
@@ -107,7 +108,7 @@ impl Jwk {
         };
         let json = serde_json::to_vec(&jwk_thumb)?;
         let hash = digest(&SHA256, &json);
-        Ok(base64::encode_config(hash, URL_SAFE_NO_PAD))
+        Ok(URL_SAFE_NO_PAD.encode(hash))
     }
 }
 

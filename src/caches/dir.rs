@@ -1,5 +1,7 @@
 use crate::{AccountCache, CertCache};
 use async_trait::async_trait;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use ring::digest::{Context, SHA256};
 use std::io::ErrorKind;
 use std::path::Path;
@@ -43,7 +45,7 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             ctx.update(&[0])
         }
         ctx.update(directory_url.as_ref().as_bytes());
-        let hash = base64::encode_config(ctx.finish(), base64::URL_SAFE_NO_PAD);
+        let hash = URL_SAFE_NO_PAD.encode(ctx.finish());
         format!("cached_account_{}", hash)
     }
     fn cached_cert_file_name(domains: &[String], directory_url: impl AsRef<str>) -> String {
@@ -53,7 +55,7 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             ctx.update(&[0])
         }
         ctx.update(directory_url.as_ref().as_bytes());
-        let hash = base64::encode_config(ctx.finish(), base64::URL_SAFE_NO_PAD);
+        let hash = URL_SAFE_NO_PAD.encode(ctx.finish());
         format!("cached_cert_{}", hash)
     }
 }
