@@ -29,7 +29,7 @@ pub(crate) async fn https(
     body: Option<String>,
 ) -> Result<Response, HttpsRequestError> {
     let method: reqwest::Method = method.into();
-    let client_config: Option<ClientConfig> = Some(client_config.as_ref().clone());
+    let client_config: ClientConfig = client_config.as_ref().clone();
     let client = reqwest::ClientBuilder::new()
         .use_preconfigured_tls(client_config)
         .build()?;
