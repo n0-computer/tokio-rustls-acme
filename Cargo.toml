@@ -5,7 +5,7 @@ authors = ["dignifiedquire <me@dignifiedquire.com>", "Florian Uekermann <florian
 edition = "2018"
 description = "Automatic TLS certificate management using rustls"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/n0-comuter/tokio-rustls-acme"
+repository = "https://github.com/n0-computer/tokio-rustls-acme"
 documentation = "https://docs.rs/tokio-rustls-acme"
 keywords = ["acme", "rustls", "tls", "letsencrypt"]
 categories = ["asynchronous", "cryptography", "network-programming"]
@@ -18,7 +18,7 @@ serde = { version = "1.0.137", features = ["derive"] }
 ring = { version = "0.16.20", features = ["std"] }
 base64 = "0.21.0"
 log = "0.4.17"
-webpki-roots = "0.23"
+webpki-roots = "0.25.2"
 pem = "2.0"
 thiserror = "1.0.31"
 x509-parser = "0.15"
@@ -29,7 +29,7 @@ rustls = "0.21"
 
 tokio = { version = "1.20.1", default-features = false }
 tokio-rustls = { version = "0.24" }
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.11.19", default-features = false, features = ["rustls-tls"] }
 
 # Axum
 axum-server = { version = "0.5", features = ["tls-rustls"], optional = true }
