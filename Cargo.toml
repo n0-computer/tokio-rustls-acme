@@ -1,6 +1,6 @@
 [package]
 name = "tokio-rustls-acme"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["dignifiedquire <me@dignifiedquire.com>", "Florian Uekermann <florian@uekermann.me>"]
 edition = "2018"
 description = "Automatic TLS certificate management using rustls"
