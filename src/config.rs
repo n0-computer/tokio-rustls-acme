@@ -50,7 +50,7 @@ impl AcmeConfig<Infallible, Infallible> {
     ///
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         let mut root_store = RootCertStore::empty();
-        root_store.add_server_trust_anchors(TLS_SERVER_ROOTS.iter().map(|ta| {
+        root_store.add_trust_anchors(TLS_SERVER_ROOTS.iter().map(|ta| {
             rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
                 ta.subject,
                 ta.spki,
