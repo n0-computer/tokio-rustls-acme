@@ -28,6 +28,7 @@ pub fn after(d: std::time::Duration) -> Timer {
     Box::pin(tokio::time::sleep(d))
 }
 
+#[must_use = "the state must be polled to drive the cert renewal process"]
 pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
     resolver: Arc<ResolvesServerCertAcme>,
