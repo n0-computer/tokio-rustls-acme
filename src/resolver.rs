@@ -5,10 +5,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+#[derive(Debug)]
 pub struct ResolvesServerCertAcme {
     inner: Mutex<Inner>,
 }
 
+#[derive(Debug)]
 struct Inner {
     cert: Option<Arc<CertifiedKey>>,
     auth_keys: BTreeMap<String, Arc<CertifiedKey>>,
