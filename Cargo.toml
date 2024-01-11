@@ -38,7 +38,7 @@ axum-server = { version = "0.6", features = ["tls-rustls"], optional = true }
 simple_logger = "4.1"
 structopt = "0.3.26"
 clap = { version = "4", features = ["derive"] }
-axum = "0.6"
+axum = "0.7"
 tokio = { version="1.19.2", features = ["full"] }
 tokio-stream = { version="0.1.9", features = ["net"] }
 tokio-util = { version="0.7.3", features = ["compat"] }

@@ -9,7 +9,7 @@ use futures::{ready, FutureExt, Stream};
 use rcgen::{CertificateParams, DistinguishedName, RcgenError, PKCS_ECDSA_P256_SHA256};
 use rustls::{sign::CertifiedKey, crypto::ring::sign::any_ecdsa_type};
 use rustls::pki_types::CertificateDer as RustlsCertificate;
-use rustls::pki_types::PrivateKeyDer;
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::future::Future;
@@ -160,7 +160,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             return Err(CertParseError::TooFewPem(pems.len()));
         }
         let pk_bytes = pems.remove(0).into_contents();
-        let pk: PrivateKeyDer = pk_bytes.into();
+        let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
+        let pk: PrivateKeyDer = pk_der.into();
         let pk = match any_ecdsa_type(&pk) {
             Ok(pk) => pk,
             Err(_) => return Err(CertParseError::InvalidPrivateKey),
@@ -169,7 +170,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             .into_iter()
             .map(|p| p.into_contents().into())
             .collect();
-        let validity = match parse_x509_certificate(cert_chain[0].0.as_slice()) {
+        let validity = match parse_x509_certificate(cert_chain[0].as_ref()) {
             Ok((_, cert)) => {
                 let validity = cert.validity();
                 [validity.not_before, validity.not_after]

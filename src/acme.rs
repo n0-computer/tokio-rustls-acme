@@ -9,7 +9,7 @@ use ring::error::{KeyRejected, Unspecified};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{sign::CertifiedKey, crypto::ring::sign::any_ecdsa_type};
-use rustls::{ClientConfig, pki_types::PrivateKeyDer};
+use rustls::{ClientConfig, pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer}};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -179,7 +179,8 @@ impl Account {
         params.custom_extensions = vec![CustomExtension::new_acme_identifier(key_auth.as_ref())];
         let cert = Certificate::from_params(params)?;
         let pk_bytes = cert.serialize_private_key_der();
-        let pk_der: PrivateKeyDer = pk_bytes.into();
+        let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
+        let pk_der: PrivateKeyDer = pk_der.into();
         let pk = any_ecdsa_type(&pk_der).unwrap();
         let cert_bytes = cert.serialize_der()?;
         let certified_key = CertifiedKey::new(vec![cert_bytes.into()], pk);

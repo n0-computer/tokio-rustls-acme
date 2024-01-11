@@ -52,9 +52,9 @@ impl AcmeConfig<Infallible, Infallible> {
         let mut root_store = RootCertStore::empty();
         root_store.extend(TLS_SERVER_ROOTS.iter().map(|ta| {
             rustls::pki_types::TrustAnchor {
-                subject: ta.subject,
-                subject_public_key_info: ta.subject_public_key_info,
-                name_constraints: ta.name_constraints,
+                subject: ta.subject.clone(),
+                subject_public_key_info: ta.subject_public_key_info.clone(),
+                name_constraints: ta.name_constraints.clone(),
             }
         }));
         let client_config = Arc::new(
