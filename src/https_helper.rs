@@ -1,4 +1,4 @@
-use rustls::client::InvalidDnsNameError;
+use rustls::pki_types::InvalidDnsNameError;
 use rustls::ClientConfig;
 use std::sync::Arc;
 use thiserror::Error;
