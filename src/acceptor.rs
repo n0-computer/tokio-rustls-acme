@@ -18,7 +18,6 @@ pub struct AcmeAcceptor {
 impl AcmeAcceptor {
     pub(crate) fn new(resolver: Arc<ResolvesServerCertAcme>) -> Self {
         let mut config = ServerConfig::builder()
-            .with_safe_defaults()
             .with_no_client_auth()
             .with_cert_resolver(resolver);
         config.alpn_protocols.push(ACME_TLS_ALPN_NAME.to_vec());

@@ -8,8 +8,8 @@ use rcgen::{Certificate, CustomExtension, RcgenError, PKCS_ECDSA_P256_SHA256};
 use ring::error::{KeyRejected, Unspecified};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::sign::{any_ecdsa_type, CertifiedKey};
-use rustls::{ClientConfig, PrivateKey};
+use rustls::{sign::CertifiedKey, crypto::ring::sign::any_ecdsa_type};
+use rustls::{ClientConfig, pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer}};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -72,7 +72,6 @@ impl Account {
             &payload,
         )?;
         let response = https(
-            client_config,
             &directory.new_account,
             Method::Post,
             Some(body),
@@ -98,7 +97,7 @@ impl Account {
             url.as_ref(),
             payload,
         )?;
-        let response = https(client_config, url.as_ref(), Method::Post, Some(body)).await?;
+        let response = https(url.as_ref(), Method::Post, Some(body)).await?;
         let location = get_header(&response, "Location").ok();
         let body = response.text().await.map_err(HttpsRequestError::from)?;
         log::debug!("response: {:?}", body);
@@ -178,8 +177,12 @@ impl Account {
         params.alg = &PKCS_ECDSA_P256_SHA256;
         params.custom_extensions = vec![CustomExtension::new_acme_identifier(key_auth.as_ref())];
         let cert = Certificate::from_params(params)?;
-        let pk = any_ecdsa_type(&PrivateKey(cert.serialize_private_key_der())).unwrap();
-        let certified_key = CertifiedKey::new(vec![rustls::Certificate(cert.serialize_der()?)], pk);
+        let pk_bytes = cert.serialize_private_key_der();
+        let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
+        let pk_der: PrivateKeyDer = pk_der.into();
+        let pk = any_ecdsa_type(&pk_der).unwrap();
+        let cert_bytes = cert.serialize_der()?;
+        let certified_key = CertifiedKey::new(vec![cert_bytes.into()], pk);
         Ok((challenge, certified_key))
     }
 }
@@ -194,16 +197,16 @@ pub struct Directory {
 
 impl Directory {
     pub async fn discover(
-        client_config: &Arc<ClientConfig>,
+        _client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<Self, AcmeError> {
-        let response = https(client_config, url, Method::Get, None).await?;
+        let response = https(url, Method::Get, None).await?;
         let body = response.bytes().await.map_err(HttpsRequestError::from)?;
 
         Ok(serde_json::from_slice(&body)?)
     }
-    pub async fn nonce(&self, client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
-        let response = &https(client_config, &self.new_nonce.as_str(), Method::Head, None).await?;
+    pub async fn nonce(&self, _client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
+        let response = &https(&self.new_nonce.as_str(), Method::Head, None).await?;
         get_header(response, "replay-nonce")
     }
 }

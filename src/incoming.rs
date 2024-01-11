@@ -50,7 +50,6 @@ impl<
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Self {
         let mut config = ServerConfig::builder()
-            .with_safe_defaults()
             .with_no_client_auth()
             .with_cert_resolver(state.resolver());
         config.alpn_protocols = alpn_protocols;
