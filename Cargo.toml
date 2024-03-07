@@ -32,7 +32,7 @@ tokio-rustls = { version = "0.24" }
 reqwest = { version = "0.11.19", default-features = false, features = ["rustls-tls"] }
 
 # Axum
-axum-server = { version = "0.5", features = ["tls-rustls"], optional = true }
+axum-server = { version = "0.6", features = ["tls-rustls"], optional = true }
 
 [dependencies.proc-macro2]
 # This is a transitive dependency, we specify it to make sure we have
@@ -50,7 +50,7 @@ version = "0.4.4"
 simple_logger = "4.1"
 structopt = "0.3.26"
 clap = { version = "4", features = ["derive"] }
-axum = "0.6"
+axum = "0.7"
 tokio = { version="1.19.2", features = ["full"] }
 tokio-stream = { version="0.1.9", features = ["net"] }
 tokio-util = { version="0.7.3", features = ["compat"] }
