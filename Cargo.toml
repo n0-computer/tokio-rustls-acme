@@ -21,7 +21,7 @@ log = "0.4.17"
 webpki-roots = "0.25.2"
 pem = "2.0"
 thiserror = "1.0.31"
-x509-parser = "0.15"
+x509-parser = "0.16"
 chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 url = "2.2.2"
 async-trait = "0.1.53"
@@ -33,6 +33,18 @@ reqwest = { version = "0.11.19", default-features = false, features = ["rustls-t
 
 # Axum
 axum-server = { version = "0.5", features = ["tls-rustls"], optional = true }
+
+[dependencies.proc-macro2]
+# This is a transitive dependency, we specify it to make sure we have
+# a recent-enough version so that -Z minimal-versions crate resolution
+# works.
+version = "1.0.78"
+
+[dependencies.num-bigint]
+# This is a transitive dependency, we specify it to make sure we have
+# a recent-enough version so that -Z minimal-versions crate resolution
+# works.
+version = "0.4.4"
 
 [dev-dependencies]
 simple_logger = "4.1"
