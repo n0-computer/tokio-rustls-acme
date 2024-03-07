@@ -1,15 +1,3 @@
-use crate::acceptor::AcmeAcceptor;
-use crate::acme::{
-    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
-};
-use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
-use chrono::{DateTime, TimeZone, Utc};
-use futures::future::try_join_all;
-use futures::{ready, FutureExt, Stream};
-use rcgen::{CertificateParams, DistinguishedName, RcgenError, PKCS_ECDSA_P256_SHA256};
-use rustls::sign::{any_ecdsa_type, CertifiedKey};
-use rustls::Certificate as RustlsCertificate;
-use rustls::PrivateKey;
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::future::Future;
@@ -17,12 +5,27 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+
+use chrono::{DateTime, TimeZone, Utc};
+use futures::future::try_join_all;
+use futures::{ready, FutureExt, Stream};
+use rcgen::{CertificateParams, DistinguishedName, RcgenError, PKCS_ECDSA_P256_SHA256};
+use rustls::sign::{any_ecdsa_type, CertifiedKey};
+use rustls::Certificate as RustlsCertificate;
+use rustls::PrivateKey;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
 use x509_parser::parse_x509_certificate;
 
+use crate::acceptor::AcmeAcceptor;
+use crate::acme::{
+    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
+};
+use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
+
 type Timer = std::pin::Pin<Box<Sleep>>;
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 pub fn after(d: std::time::Duration) -> Timer {
     Box::pin(tokio::time::sleep(d))
@@ -33,10 +36,10 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     resolver: Arc<ResolvesServerCertAcme>,
     account_key: Option<Vec<u8>>,
 
-    early_action: Option<Pin<Box<dyn Future<Output = Event<EC, EA>> + Send>>>,
-    load_cert: Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, EC>> + Send>>>,
-    load_account: Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, EA>> + Send>>>,
-    order: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>, OrderError>> + Send>>>,
+    early_action: Option<BoxFuture<Event<EC, EA>>>,
+    load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
+    load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
+    order: Option<BoxFuture<Result<Vec<u8>, OrderError>>>,
     backoff_cnt: usize,
     wait: Option<Timer>,
 }
@@ -178,6 +181,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let cert = CertifiedKey::new(cert_chain, pk);
         Ok((cert, validity))
     }
+
+    #[allow(clippy::result_large_err)]
     fn process_cert(&mut self, pem: Vec<u8>, cached: bool) -> Event<EC, EA> {
         let (cert, validity) = match (Self::parse_cert(&pem), cached) {
             (Ok(r), _) => r,

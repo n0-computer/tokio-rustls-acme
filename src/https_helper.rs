@@ -3,7 +3,7 @@ use rustls::ClientConfig;
 use std::sync::Arc;
 use thiserror::Error;
 
-pub use reqwest::{Request, Response};
+pub use reqwest::Response;
 
 #[derive(Copy, Clone)]
 pub enum Method {
