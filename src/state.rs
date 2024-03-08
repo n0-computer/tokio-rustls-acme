@@ -9,7 +9,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 use futures::future::try_join_all;
 use futures::{ready, FutureExt, Stream};
-use rcgen::{CertificateParams, DistinguishedName, RcgenError, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
 use rustls::sign::{any_ecdsa_type, CertifiedKey};
 use rustls::Certificate as RustlsCertificate;
 use rustls::PrivateKey;
