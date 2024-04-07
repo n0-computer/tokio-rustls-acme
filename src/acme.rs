@@ -72,6 +72,7 @@ impl Account {
             &payload,
         )?;
         let response = https(
+            client_config,
             &directory.new_account,
             Method::Post,
             Some(body),
@@ -97,7 +98,7 @@ impl Account {
             url.as_ref(),
             payload,
         )?;
-        let response = https(url.as_ref(), Method::Post, Some(body)).await?;
+        let response = https(client_config, url.as_ref(), Method::Post, Some(body)).await?;
         let location = get_header(&response, "Location").ok();
         let body = response.text().await.map_err(HttpsRequestError::from)?;
         log::debug!("response: {:?}", body);
@@ -197,16 +198,16 @@ pub struct Directory {
 
 impl Directory {
     pub async fn discover(
-        _client_config: &Arc<ClientConfig>,
+        client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<Self, AcmeError> {
-        let response = https(url, Method::Get, None).await?;
+        let response = https(client_config, url, Method::Get, None).await?;
         let body = response.bytes().await.map_err(HttpsRequestError::from)?;
 
         Ok(serde_json::from_slice(&body)?)
     }
-    pub async fn nonce(&self, _client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
-        let response = &https(&self.new_nonce.as_str(), Method::Head, None).await?;
+    pub async fn nonce(&self, client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
+        let response = &https(client_config, &self.new_nonce.as_str(), Method::Head, None).await?;
         get_header(response, "replay-nonce")
     }
 }

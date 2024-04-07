@@ -1,5 +1,6 @@
-use rustls::pki_types::InvalidDnsNameError;
+use rustls::{pki_types::InvalidDnsNameError, ClientConfig};
 use thiserror::Error;
+use std::sync::Arc;
 
 pub use reqwest::{Request, Response};
 
@@ -21,13 +22,14 @@ impl From<Method> for reqwest::Method {
 }
 
 pub(crate) async fn https(
+    client_config: &Arc<ClientConfig>,
     url: impl AsRef<str>,
     method: Method,
     body: Option<String>,
 ) -> Result<Response, HttpsRequestError> {
     let method: reqwest::Method = method.into();
     let client = reqwest::ClientBuilder::new()
-        .use_rustls_tls()
+        .use_preconfigured_tls(Arc::clone(client_config))
         .build()?;
     let mut request = client.request(method, url.as_ref());
     if let Some(body) = body {
