@@ -1,8 +1,8 @@
 use rustls::{pki_types::InvalidDnsNameError, ClientConfig};
-use thiserror::Error;
 use std::sync::Arc;
+use thiserror::Error;
 
-pub use reqwest::{Request, Response};
+pub use reqwest::Response;
 
 #[derive(Copy, Clone)]
 pub enum Method {
