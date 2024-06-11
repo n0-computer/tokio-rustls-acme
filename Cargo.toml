@@ -1,6 +1,6 @@
 [package]
 name = "tokio-rustls-acme"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["dignifiedquire <me@dignifiedquire.com>", "Florian Uekermann <florian@uekermann.me>"]
 edition = "2018"
 description = "Automatic TLS certificate management using rustls"
@@ -12,16 +12,16 @@ categories = ["asynchronous", "cryptography", "network-programming"]
 
 [dependencies]
 futures = "0.3.21"
-rcgen = "0.11"
+rcgen = "0.12"
 serde_json = "1.0.81"
 serde = { version = "1.0.137", features = ["derive"] }
-ring = { version = "0.16.20", features = ["std"] }
+ring = { version = "0.17.0", features = ["std"] }
 base64 = "0.21.0"
 log = "0.4.17"
 webpki-roots = "0.26"
-pem = "2.0"
+pem = "3.0"
 thiserror = "1.0.31"
-x509-parser = "0.15"
+x509-parser = "0.16"
 chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 url = "2.2.2"
 async-trait = "0.1.53"
@@ -33,6 +33,18 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # Axum
 axum-server = { version = "0.6", features = ["tls-rustls"], optional = true }
+
+[dependencies.proc-macro2]
+# This is a transitive dependency, we specify it to make sure we have
+# a recent-enough version so that -Z minimal-versions crate resolution
+# works.
+version = "1.0.78"
+
+[dependencies.num-bigint]
+# This is a transitive dependency, we specify it to make sure we have
+# a recent-enough version so that -Z minimal-versions crate resolution
+# works.
+version = "0.4.4"
 
 [dev-dependencies]
 simple_logger = "4.1"
