@@ -68,3 +68,4 @@ pub enum HttpsRequestError {
     #[error("could not determine host from url")]
     UndefinedHost,
 }
+

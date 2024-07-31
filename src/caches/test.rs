@@ -14,6 +14,7 @@ use std::sync::Arc;
 /// # use tokio_rustls_acme::{AcmeConfig};
 /// # use tokio_rustls_acme::caches::{DirCache, TestCache};
 /// # let test_environment = true;
+/// rustls::crypto::ring::default_provider().install_default().unwrap();
 /// let mut config = AcmeConfig::new(["example.com"])
 ///     .cache(DirCache::new("./cache"));
 /// if test_environment {

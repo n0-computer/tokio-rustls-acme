@@ -1,4 +1,5 @@
 use clap::Parser;
+use rustls::crypto;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
@@ -33,6 +34,9 @@ struct Args {
 #[tokio::main]
 async fn main() {
     simple_logger::init_with_level(log::Level::Info).unwrap();
+
+    crypto::ring::default_provider().install_default().unwrap();
+
     let args = Args::parse();
 
     let tcp_listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, args.port))

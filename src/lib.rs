@@ -131,3 +131,25 @@ pub use config::*;
 pub use incoming::*;
 pub use resolver::*;
 pub use state::*;
+
+#[cfg(test)]
+mod test {
+    use rustls::{crypto, ClientConfig, RootCertStore};
+    use std::any::Any;
+
+    #[test]
+    fn downcast_client_config() {
+        crypto::ring::default_provider().install_default().unwrap();
+
+        let mut root_store = RootCertStore::empty();
+        let mut tls = Some(
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+
+        if let None = (&mut tls as &mut dyn Any).downcast_mut::<Option<rustls::ClientConfig>>() {
+            panic!("could not downcast client config");
+        }
+    }
+}

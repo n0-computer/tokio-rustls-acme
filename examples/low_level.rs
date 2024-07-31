@@ -1,5 +1,5 @@
 use clap::Parser;
-use rustls::ServerConfig;
+use rustls::{crypto, ServerConfig};
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +34,9 @@ struct Args {
 #[tokio::main]
 async fn main() {
     simple_logger::init_with_level(log::Level::Info).unwrap();
+
+    crypto::ring::default_provider().install_default().unwrap();
+
     let args = Args::parse();
 
     let mut state = AcmeConfig::new(args.domains)
@@ -42,7 +45,6 @@ async fn main() {
         .directory_lets_encrypt(args.prod)
         .state();
     let rustls_config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_cert_resolver(state.resolver());
     let acceptor = state.acceptor();

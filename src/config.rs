@@ -31,6 +31,7 @@ impl AcmeConfig<Infallible, Infallible> {
     /// ```rust
     /// # use tokio_rustls_acme::AcmeConfig;
     /// use tokio_rustls_acme::caches::DirCache;
+    /// rustls::crypto::ring::default_provider().install_default().unwrap();
     /// let config = AcmeConfig::new(["example.com"]).cache(DirCache::new("./rustls_acme_cache"));
     /// ```
     ///
@@ -43,6 +44,7 @@ impl AcmeConfig<Infallible, Infallible> {
     /// ```rust
     /// # use tokio_rustls_acme::AcmeConfig;
     /// use tokio_rustls_acme::caches::NoCache;
+    /// rustls::crypto::ring::default_provider().install_default().unwrap();
     /// # type EC = std::io::Error;
     /// # type EA = EC;
     /// let config: AcmeConfig<EC, EA> = AcmeConfig::new(["example.com"]).cache(NoCache::new());
@@ -50,13 +52,15 @@ impl AcmeConfig<Infallible, Infallible> {
     ///
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         let mut root_store = RootCertStore::empty();
-        root_store.extend(TLS_SERVER_ROOTS.iter().map(|ta| {
-            rustls::pki_types::TrustAnchor {
-                subject: ta.subject.clone(),
-                subject_public_key_info: ta.subject_public_key_info.clone(),
-                name_constraints: ta.name_constraints.clone(),
-            }
-        }));
+        root_store.extend(
+            TLS_SERVER_ROOTS
+                .iter()
+                .map(|ta| rustls::pki_types::TrustAnchor {
+                    subject: ta.subject.clone(),
+                    subject_public_key_info: ta.subject_public_key_info.clone(),
+                    name_constraints: ta.name_constraints.clone(),
+                }),
+        );
         let client_config = Arc::new(
             ClientConfig::builder()
                 .with_root_certificates(root_store)

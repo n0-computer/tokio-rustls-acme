@@ -7,9 +7,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::future::try_join_all;
 use futures::{ready, FutureExt, Stream};
 use rcgen::{CertificateParams, DistinguishedName, RcgenError, PKCS_ECDSA_P256_SHA256};
-use rustls::{sign::CertifiedKey, crypto::ring::sign::any_ecdsa_type};
 use rustls::pki_types::CertificateDer as RustlsCertificate;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::{crypto::ring::sign::any_ecdsa_type, sign::CertifiedKey};
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::future::Future;
@@ -166,10 +166,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             Ok(pk) => pk,
             Err(_) => return Err(CertParseError::InvalidPrivateKey),
         };
-        let cert_chain: Vec<RustlsCertificate> = pems
-            .into_iter()
-            .map(|p| p.into_contents().into())
-            .collect();
+        let cert_chain: Vec<RustlsCertificate> =
+            pems.into_iter().map(|p| p.into_contents().into()).collect();
         let validity = match parse_x509_certificate(cert_chain[0].as_ref()) {
             Ok((_, cert)) => {
                 let validity = cert.validity();
