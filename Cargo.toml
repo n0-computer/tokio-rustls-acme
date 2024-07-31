@@ -12,10 +12,10 @@ categories = ["asynchronous", "cryptography", "network-programming"]
 
 [dependencies]
 futures = "0.3.21"
-rcgen = "0.11"
+rcgen = "0.12"
 serde_json = "1.0.81"
 serde = { version = "1.0.137", features = ["derive"] }
-ring = { version = "0.16.20", features = ["std"] }
+ring = { version = "0.17", features = ["std"] }
 base64 = "0.21.0"
 log = "0.4.17"
 webpki-roots = "0.26"

@@ -4,12 +4,15 @@ use crate::https_helper::{https, HttpsRequestError, Method, Response};
 use crate::jose::{key_authorization_sha256, sign, JoseError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use rcgen::{Certificate, CustomExtension, RcgenError, PKCS_ECDSA_P256_SHA256};
+use rcgen::{Certificate, CustomExtension, PKCS_ECDSA_P256_SHA256};
 use ring::error::{KeyRejected, Unspecified};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{sign::CertifiedKey, crypto::ring::sign::any_ecdsa_type};
-use rustls::{ClientConfig, pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer}};
+use rustls::{crypto::ring::sign::any_ecdsa_type, sign::CertifiedKey};
+use rustls::{
+    pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+    ClientConfig,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -57,7 +60,8 @@ impl Account {
         S: AsRef<str> + 'a,
         I: IntoIterator<Item = &'a S>,
     {
-        let key_pair = EcdsaKeyPair::from_pkcs8(ALG, key_pair)?;
+        let rng = SystemRandom::new();
+        let key_pair = EcdsaKeyPair::from_pkcs8(ALG, key_pair, &rng)?;
         let contact: Vec<&'a str> = contact.into_iter().map(AsRef::<str>::as_ref).collect();
         let payload = json!({
             "termsOfServiceAgreed": true,
@@ -289,7 +293,7 @@ pub enum AcmeError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("certificate generation error: {0}")]
-    Rcgen(#[from] RcgenError),
+    Rcgen(#[from] rcgen::Error),
     #[error("JOSE error: {0}")]
     Jose(#[from] JoseError),
     #[error("JSON error: {0}")]

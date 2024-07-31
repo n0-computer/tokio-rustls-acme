@@ -6,7 +6,7 @@ use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 use chrono::{DateTime, TimeZone, Utc};
 use futures::future::try_join_all;
 use futures::{ready, FutureExt, Stream};
-use rcgen::{CertificateParams, DistinguishedName, RcgenError, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, DistinguishedName, PKCS_ECDSA_P256_SHA256};
 use rustls::pki_types::CertificateDer as RustlsCertificate;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{crypto::ring::sign::any_ecdsa_type, sign::CertifiedKey};
@@ -74,7 +74,7 @@ pub enum OrderError {
     #[error("acme error: {0}")]
     Acme(#[from] AcmeError),
     #[error("certificate generation error: {0}")]
-    Rcgen(#[from] RcgenError),
+    Rcgen(#[from] rcgen::Error),
     #[error("bad order object: {0:?}")]
     BadOrder(Order),
     #[error("bad auth object: {0:?}")]
