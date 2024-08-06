@@ -28,7 +28,7 @@ async-trait = "0.1.53"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 tokio = { version = "1.20.1", default-features = false }
-tokio-rustls = { version = "0.26" }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # Axum
