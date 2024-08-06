@@ -50,13 +50,15 @@ impl AcmeConfig<Infallible, Infallible> {
     ///
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         let mut root_store = RootCertStore::empty();
-        root_store.extend(TLS_SERVER_ROOTS.iter().map(|ta| {
-            rustls::pki_types::TrustAnchor {
-                subject: ta.subject.clone(),
-                subject_public_key_info: ta.subject_public_key_info.clone(),
-                name_constraints: ta.name_constraints.clone(),
-            }
-        }));
+        root_store.extend(
+            TLS_SERVER_ROOTS
+                .iter()
+                .map(|ta| rustls::pki_types::TrustAnchor {
+                    subject: ta.subject.clone(),
+                    subject_public_key_info: ta.subject_public_key_info.clone(),
+                    name_constraints: ta.name_constraints.clone(),
+                }),
+        );
         let client_config = Arc::new(
             ClientConfig::builder()
                 .with_root_certificates(root_store)

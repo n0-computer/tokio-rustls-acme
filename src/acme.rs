@@ -8,8 +8,11 @@ use rcgen::{Certificate, CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_S
 use ring::error::{KeyRejected, Unspecified};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{sign::CertifiedKey, crypto::ring::sign::any_ecdsa_type};
-use rustls::{ClientConfig, pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer}};
+use rustls::{crypto::ring::sign::any_ecdsa_type, sign::CertifiedKey};
+use rustls::{
+    pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+    ClientConfig,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
