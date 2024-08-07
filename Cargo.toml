@@ -18,21 +18,22 @@ serde = { version = "1.0.137", features = ["derive"] }
 ring = { version = "0.17.0", features = ["std"] }
 base64 = "0.21.0"
 log = "0.4.17"
-webpki-roots = "0.25.2"
+webpki-roots = "0.26"
 pem = "3.0"
 thiserror = "1.0.31"
 x509-parser = "0.16"
 chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 url = "2.2.2"
 async-trait = "0.1.53"
-rustls = "0.21"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+time = "0.3.36" # force the transitive dependency to a more recent minimal version. The build fails with 0.3.20
 
 tokio = { version = "1.20.1", default-features = false }
-tokio-rustls = { version = "0.24" }
-reqwest = { version = "0.11.19", default-features = false, features = ["rustls-tls"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # Axum
-axum-server = { version = "0.6", features = ["tls-rustls"], optional = true }
+axum-server = { version = "0.7", features = ["tokio-rustls"], optional = true }
 
 [dependencies.proc-macro2]
 # This is a transitive dependency, we specify it to make sure we have
@@ -54,7 +55,7 @@ axum = "0.7"
 tokio = { version="1.19.2", features = ["full"] }
 tokio-stream = { version="0.1.9", features = ["net"] }
 tokio-util = { version="0.7.3", features = ["compat"] }
-warp = "0.3.4"
+warp = "0.3.7"
 
 [package.metadata.docs.rs]
 all-features = true

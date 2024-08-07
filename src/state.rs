@@ -10,9 +10,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::future::try_join_all;
 use futures::{ready, FutureExt, Stream};
 use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
-use rustls::sign::{any_ecdsa_type, CertifiedKey};
-use rustls::Certificate as RustlsCertificate;
-use rustls::PrivateKey;
+use rustls::crypto::ring::sign::any_ecdsa_type;
+use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::sign::CertifiedKey;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
@@ -31,6 +31,7 @@ pub fn after(d: std::time::Duration) -> Timer {
     Box::pin(tokio::time::sleep(d))
 }
 
+#[allow(clippy::type_complexity)]
 pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
     resolver: Arc<ResolvesServerCertAcme>,
@@ -162,15 +163,16 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
         }
-        let pk = match any_ecdsa_type(&PrivateKey(pems.remove(0).into_contents())) {
+        let pk_bytes = pems.remove(0).into_contents();
+        let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
+        let pk: PrivateKeyDer = pk_der.into();
+        let pk = match any_ecdsa_type(&pk) {
             Ok(pk) => pk,
             Err(_) => return Err(CertParseError::InvalidPrivateKey),
         };
-        let cert_chain: Vec<RustlsCertificate> = pems
-            .into_iter()
-            .map(|p| RustlsCertificate(p.into_contents()))
-            .collect();
-        let validity = match parse_x509_certificate(cert_chain[0].0.as_slice()) {
+        let cert_chain: Vec<RustlsCertificate> =
+            pems.into_iter().map(|p| p.into_contents().into()).collect();
+        let validity = match parse_x509_certificate(cert_chain[0].as_ref()) {
             Ok((_, cert)) => {
                 let validity = cert.validity();
                 [validity.not_before, validity.not_after]

@@ -42,7 +42,6 @@ async fn main() {
         .directory_lets_encrypt(args.prod)
         .state();
     let rustls_config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_cert_resolver(state.resolver());
     let acceptor = state.acceptor();

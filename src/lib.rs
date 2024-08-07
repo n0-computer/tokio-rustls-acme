@@ -108,7 +108,7 @@
 //! [rustls](https://github.com/ctz/rustls),
 //! [tokio-rustls](https://github.com/tokio-rs/tls/tree/master/tokio-rustls) and many others.
 
-#![cfg_attr(doc_auto_cfg, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod acceptor;
 pub mod acme;
