@@ -1,7 +1,7 @@
 <h1 align="center">tokio-rustls-acme</h1>
 <div align="center">
  <strong>
-    Automatic TLS certificate management using rustls.
+    Automatic TLS certificate management using rustls with ring.
  </strong>
 </div>
 
@@ -36,7 +36,7 @@
 
 > Original implementation based on https://github.com/FlorianUekermann/rustls-acme. 
 
-An easy-to-use, async compatible ACME client library for rustls.
+An easy-to-use, async compatible [ACME] client library using [rustls] with [ring].
 The validation mechanism used is tls-alpn-01, which allows serving acme challenge responses and
 regular TLS traffic on the same port.
 
@@ -48,6 +48,10 @@ is folded into the streams and futures being polled by the library user.
 
 The goal is to provide a [Let's Encrypt](https://letsencrypt.org/) compatible TLS serving and
 certificate management using a simple and flexible stream based API.
+
+This crate uses [ring] as [rustls]'s backend, instead of [aws-lc-rs]. This generally makes it
+much easier to compile. If you'd like to use [aws-lc-rs] as [rustls]'s backend, we're open to
+contributions with the necessary `Cargo.toml` changes and feature-flags to enable you to do so.
 
 To use tokio-rustls-acme add the following lines to your `Cargo.toml`:
 
@@ -163,3 +167,9 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this project by you, as defined in the Apache-2.0 license,
 shall be dual licensed as above, without any additional terms or conditions.
+
+
+[ACME]: https://en.wikipedia.org/wiki/Automatic_Certificate_Management_Environment
+[ring]: https://github.com/briansmith/ring
+[rustls]: https://github.com/ctz/rustls
+[aws-lc-rs]: https://github.com/aws/aws-lc-rs
