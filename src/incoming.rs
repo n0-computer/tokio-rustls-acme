@@ -3,7 +3,7 @@ use crate::AcmeState;
 use futures::stream::{FusedStream, FuturesUnordered};
 use futures::Stream;
 use rustls::ServerConfig;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -14,8 +14,8 @@ pub struct Incoming<
     TCP: AsyncRead + AsyncWrite + Unpin,
     ETCP,
     ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-    EC: Debug + 'static,
-    EA: Debug + 'static,
+    EC: Debug + Display + 'static,
+    EA: Debug + Display + 'static,
 > {
     state: AcmeState<EC, EA>,
     acceptor: AcmeAcceptor,
@@ -29,8 +29,8 @@ impl<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
-        EA: Debug + 'static,
+        EC: Debug + Display + 'static,
+        EA: Debug + Display + 'static,
     > Unpin for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
 }
@@ -39,8 +39,8 @@ impl<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
-        EA: Debug + 'static,
+        EC: Debug + Display + 'static,
+        EA: Debug + Display + 'static,
     > Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     pub fn new(
@@ -68,8 +68,8 @@ impl<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
-        EA: Debug + 'static,
+        EC: Debug + Display + 'static,
+        EA: Debug + Display + 'static,
     > Stream for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     type Item = Result<TlsStream<TCP>, ETCP>;
@@ -130,8 +130,8 @@ impl<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
-        EA: Debug + 'static,
+        EC: Debug + Display + 'static,
+        EA: Debug + Display + 'static,
     > FusedStream for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     fn is_terminated(&self) -> bool {

@@ -16,11 +16,11 @@ rcgen = "0.12"
 serde_json = "1.0.81"
 serde = { version = "1.0.137", features = ["derive"] }
 ring = { version = "0.17.0", features = ["std"] }
-base64 = "0.21.0"
+base64 = "0.22"
 log = "0.4.17"
 webpki-roots = "0.26"
 pem = "3.0"
-thiserror = "1.0.31"
+thiserror = "2.0"
 x509-parser = "0.16"
 chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 url = "2.2.2"
@@ -48,14 +48,14 @@ version = "1.0.78"
 version = "0.4.4"
 
 [dev-dependencies]
-simple_logger = "4.1"
+simple_logger = "5.0"
 structopt = "0.3.26"
 clap = { version = "4", features = ["derive"] }
 axum = "0.7"
 tokio = { version="1.19.2", features = ["full"] }
 tokio-stream = { version="0.1.9", features = ["net"] }
 tokio-util = { version="0.7.3", features = ["compat"] }
-warp = "0.3.7"
+warp = "0.3"
 
 [package.metadata.docs.rs]
 all-features = true

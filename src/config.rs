@@ -5,7 +5,7 @@ use crate::{AcmeState, Incoming};
 use futures::Stream;
 use rustls::{ClientConfig, RootCertStore};
 use std::convert::Infallible;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use webpki_roots::TLS_SERVER_ROOTS;
@@ -74,7 +74,7 @@ impl AcmeConfig<Infallible, Infallible> {
     }
 }
 
-impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
+impl<EC: 'static + Debug + Display, EA: 'static + Debug + Display> AcmeConfig<EC, EA> {
     /// Set custom `rustls::ClientConfig` for ACME API calls.
     pub fn client_tls_config(mut self, client_config: Arc<ClientConfig>) -> Self {
         self.client_config = client_config;
