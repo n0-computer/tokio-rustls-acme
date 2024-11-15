@@ -74,7 +74,7 @@ impl AcmeConfig<Infallible, Infallible> {
     }
 }
 
-impl<EC: 'static + Debug + Display, EA: 'static + Debug> AcmeConfig<EC, EA> {
+impl<EC: 'static + Debug + Display, EA: 'static + Debug + Display> AcmeConfig<EC, EA> {
     /// Set custom `rustls::ClientConfig` for ACME API calls.
     pub fn client_tls_config(mut self, client_config: Arc<ClientConfig>) -> Self {
         self.client_config = client_config;

@@ -15,7 +15,7 @@ pub struct Incoming<
     ETCP,
     ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
     EC: Debug + Display + 'static,
-    EA: Debug + 'static,
+    EA: Debug + Display + 'static,
 > {
     state: AcmeState<EC, EA>,
     acceptor: AcmeAcceptor,
@@ -30,7 +30,7 @@ impl<
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
         EC: Debug + Display + 'static,
-        EA: Debug + 'static,
+        EA: Debug + Display + 'static,
     > Unpin for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
 }
@@ -40,7 +40,7 @@ impl<
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
         EC: Debug + Display + 'static,
-        EA: Debug + 'static,
+        EA: Debug + Display + 'static,
     > Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     pub fn new(
@@ -69,7 +69,7 @@ impl<
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
         EC: Debug + Display + 'static,
-        EA: Debug + 'static,
+        EA: Debug + Display + 'static,
     > Stream for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     type Item = Result<TlsStream<TCP>, ETCP>;
@@ -131,7 +131,7 @@ impl<
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
         EC: Debug + Display + 'static,
-        EA: Debug + 'static,
+        EA: Debug + Display + 'static,
     > FusedStream for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     fn is_terminated(&self) -> bool {
