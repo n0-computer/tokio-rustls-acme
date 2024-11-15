@@ -1,7 +1,10 @@
 [package]
 name = "tokio-rustls-acme"
 version = "0.4.0"
-authors = ["dignifiedquire <me@dignifiedquire.com>", "Florian Uekermann <florian@uekermann.me>"]
+authors = [
+    "dignifiedquire <me@dignifiedquire.com>",
+    "Florian Uekermann <florian@uekermann.me>",
+]
 edition = "2018"
 description = "Automatic TLS certificate management using rustls"
 license = "Apache-2.0 OR MIT"
@@ -12,7 +15,7 @@ categories = ["asynchronous", "cryptography", "network-programming"]
 
 [dependencies]
 futures = "0.3.21"
-rcgen = "0.12"
+rcgen = "0.13"
 serde_json = "1.0.81"
 serde = { version = "1.0.137", features = ["derive"] }
 ring = { version = "0.17.0", features = ["std"] }
@@ -25,11 +28,15 @@ x509-parser = "0.16"
 chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 async-trait = "0.1.53"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-time = "0.3.36" # force the transitive dependency to a more recent minimal version. The build fails with 0.3.20
+time = "0.3.36"                                                                 # force the transitive dependency to a more recent minimal version. The build fails with 0.3.20
 
 tokio = { version = "1.20.1", default-features = false }
-tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "tls12",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+] }
 
 # Axum
 axum-server = { version = "0.7", features = ["tokio-rustls"], optional = true }
@@ -51,9 +58,9 @@ simple_logger = "5.0"
 structopt = "0.3.26"
 clap = { version = "4", features = ["derive"] }
 axum = "0.7"
-tokio = { version="1.19.2", features = ["full"] }
-tokio-stream = { version="0.1.9", features = ["net"] }
-tokio-util = { version="0.7.3", features = ["compat"] }
+tokio = { version = "1.19.2", features = ["full"] }
+tokio-stream = { version = "0.1.9", features = ["net"] }
+tokio-util = { version = "0.7.3", features = ["compat"] }
 warp = "0.3"
 
 [package.metadata.docs.rs]
@@ -65,14 +72,14 @@ default = []
 axum = ["dep:axum-server"]
 
 [[example]]
-name="low_level_axum"
-required-features=["axum"]
+name = "low_level_axum"
+required-features = ["axum"]
 
 [[example]]
-name="high_level_warp"
+name = "high_level_warp"
 
 [[example]]
-name="high_level"
+name = "high_level"
 
 [[example]]
-name="low_level"
+name = "low_level"
