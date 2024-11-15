@@ -3,7 +3,7 @@ use crate::AcmeState;
 use futures::stream::{FusedStream, FuturesUnordered};
 use futures::Stream;
 use rustls::ServerConfig;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -14,7 +14,7 @@ pub struct Incoming<
     TCP: AsyncRead + AsyncWrite + Unpin,
     ETCP,
     ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-    EC: Debug + 'static,
+    EC: Debug + Display + 'static,
     EA: Debug + 'static,
 > {
     state: AcmeState<EC, EA>,
@@ -29,7 +29,7 @@ impl<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
+        EC: Debug + Display + 'static,
         EA: Debug + 'static,
     > Unpin for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
@@ -39,7 +39,7 @@ impl<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
+        EC: Debug + Display + 'static,
         EA: Debug + 'static,
     > Incoming<TCP, ETCP, ITCP, EC, EA>
 {
@@ -68,7 +68,7 @@ impl<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
+        EC: Debug + Display + 'static,
         EA: Debug + 'static,
     > Stream for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
@@ -130,7 +130,7 @@ impl<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
         ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
+        EC: Debug + Display + 'static,
         EA: Debug + 'static,
     > FusedStream for Incoming<TCP, ETCP, ITCP, EC, EA>
 {

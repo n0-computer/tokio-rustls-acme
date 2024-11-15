@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub fn after(d: std::time::Duration) -> Timer {
 }
 
 #[allow(clippy::type_complexity)]
-pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
+pub struct AcmeState<EC: Display + Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
     resolver: Arc<ResolvesServerCertAcme>,
     account_key: Option<Vec<u8>>,
@@ -56,7 +56,7 @@ pub enum EventOk {
 }
 
 #[derive(Error, Debug)]
-pub enum EventError<EC: Debug, EA: Debug> {
+pub enum EventError<EC: Debug + Display, EA: Debug> {
     #[error("cert cache load: {0}")]
     CertCacheLoad(EC),
     #[error("account cache load: {0}")]
@@ -101,7 +101,7 @@ pub enum CertParseError {
     InvalidPrivateKey,
 }
 
-impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
+impl<EC: 'static + Debug + Display, EA: 'static + Debug> AcmeState<EC, EA> {
     pub fn incoming<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
@@ -415,7 +415,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     }
 }
 
-impl<EC: 'static + Debug, EA: 'static + Debug> Stream for AcmeState<EC, EA> {
+impl<EC: 'static + Debug + Display, EA: 'static + Debug> Stream for AcmeState<EC, EA> {
     type Item = Event<EC, EA>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
