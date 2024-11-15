@@ -231,10 +231,9 @@ impl<EC: 'static + Debug + Display, EA: 'static + Debug + Display> AcmeState<EC,
         )
         .await?;
 
-        let mut params = CertificateParams::new(config.domains.clone());
+        let mut params = CertificateParams::new(config.domains.clone())?;
         params.distinguished_name = DistinguishedName::new();
-        params.alg = &PKCS_ECDSA_P256_SHA256;
-        let cert = rcgen::Certificate::from_params(params)?;
+        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
 
         let (order_url, mut order) = account
             .new_order(&config.client_config, config.domains.clone())
@@ -265,15 +264,17 @@ impl<EC: 'static + Debug + Display, EA: 'static + Debug + Display> AcmeState<EC,
                 }
                 OrderStatus::Ready => {
                     log::info!("sending csr");
-                    let csr = cert.serialize_request_der()?;
+                    let csr = params.serialize_request(&key_pair)?;
                     order = account
-                        .finalize(&config.client_config, order.finalize, csr)
+                        .finalize(&config.client_config, order.finalize, csr.der().to_vec())
                         .await?
                 }
                 OrderStatus::Valid { certificate } => {
+                    let cert = params.self_signed(&key_pair)?;
+
                     log::info!("download certificate");
                     let pem = [
-                        &cert.serialize_private_key_pem(),
+                        &cert.pem(),
                         "\n",
                         &account
                             .certificate(&config.client_config, certificate)
