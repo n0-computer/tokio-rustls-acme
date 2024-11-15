@@ -270,11 +270,9 @@ impl<EC: 'static + Debug + Display, EA: 'static + Debug + Display> AcmeState<EC,
                         .await?
                 }
                 OrderStatus::Valid { certificate } => {
-                    let cert = params.self_signed(&key_pair)?;
-
                     log::info!("download certificate");
                     let pem = [
-                        &cert.pem(),
+                        &key_pair.serialize_pem(),
                         "\n",
                         &account
                             .certificate(&config.client_config, certificate)
