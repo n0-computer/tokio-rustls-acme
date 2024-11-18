@@ -4,7 +4,7 @@ use crate::https_helper::{https, HttpsRequestError, Method, Response};
 use crate::jose::{key_authorization_sha256, sign, JoseError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use rcgen::{Certificate, CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
 use ring::error::{KeyRejected, Unspecified};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, ECDSA_P256_SHA256_FIXED_SIGNING};
@@ -176,17 +176,18 @@ impl Account {
             Some(challenge) => challenge,
             None => return Err(AcmeError::NoTlsAlpn01Challenge),
         };
-        let mut params = rcgen::CertificateParams::new(vec![domain]);
+        let mut params = rcgen::CertificateParams::new(vec![domain])?;
         let key_auth = key_authorization_sha256(&self.key_pair, &challenge.token)?;
-        params.alg = &PKCS_ECDSA_P256_SHA256;
         params.custom_extensions = vec![CustomExtension::new_acme_identifier(key_auth.as_ref())];
-        let cert = Certificate::from_params(params)?;
-        let pk_bytes = cert.serialize_private_key_der();
+
+        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let cert = params.self_signed(&key_pair)?;
+
+        let pk_bytes = key_pair.serialize_der();
         let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
         let pk_der: PrivateKeyDer = pk_der.into();
         let pk = any_ecdsa_type(&pk_der).unwrap();
-        let cert_bytes = cert.serialize_der()?;
-        let certified_key = CertifiedKey::new(vec![cert_bytes.into()], pk);
+        let certified_key = CertifiedKey::new(vec![cert.der().clone()], pk);
         Ok((challenge, certified_key))
     }
 }
