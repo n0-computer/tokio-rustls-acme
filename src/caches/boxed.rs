@@ -1,12 +1,14 @@
 use crate::{AccountCache, CertCache};
 use async_trait::async_trait;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 
-pub struct BoxedErrCache<T: Send + Sync> {
+pub struct BoxedErrCache<T: Send + Sync + Display> {
     inner: T,
 }
 
-impl<T: Send + Sync> BoxedErrCache<T> {
+trait DD: std::fmt::Display + std::fmt::Debug {}
+
+impl<T: Send + Sync + Display> BoxedErrCache<T> {
     pub fn new(inner: T) -> Self {
         Self { inner }
     }
@@ -15,14 +17,20 @@ impl<T: Send + Sync> BoxedErrCache<T> {
     }
 }
 
-fn box_err(e: impl Debug + 'static) -> Box<dyn Debug> {
+impl<T: Send + Sync + Display> Display for BoxedErrCache<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BoxedErrCache({})", self.inner)
+    }
+}
+
+fn box_err(e: impl 'static + DD) -> Box<dyn DD> {
     Box::new(e)
 }
 
 #[async_trait]
-impl<T: CertCache> CertCache for BoxedErrCache<T>
+impl<T: CertCache + Display> CertCache for BoxedErrCache<T>
 where
-    <T as CertCache>::EC: 'static,
+    <T as CertCache>::EC: 'static + Display,
 {
     type EC = Box<dyn Debug>;
     async fn load_cert(
@@ -50,9 +58,9 @@ where
 }
 
 #[async_trait]
-impl<T: AccountCache> AccountCache for BoxedErrCache<T>
+impl<T: AccountCache + Display> AccountCache for BoxedErrCache<T>
 where
-    <T as AccountCache>::EA: 'static,
+    <T as AccountCache>::EA: 'static + Display,
 {
     type EA = Box<dyn Debug>;
     async fn load_account(

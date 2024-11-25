@@ -13,7 +13,7 @@ use webpki_roots::TLS_SERVER_ROOTS;
 /// Configuration for an ACME resolver.
 ///
 /// The type parameters represent the error types for the certificate cache and account cache.
-pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
+pub struct AcmeConfig<EC: Debug + Display, EA: Display + Debug = EC> {
     pub(crate) client_config: Arc<ClientConfig>,
     pub(crate) directory_url: String,
     pub(crate) domains: Vec<String>,
@@ -117,7 +117,7 @@ impl<EC: 'static + Debug + Display, EA: 'static + Debug + Display> AcmeConfig<EC
         self
     }
 
-    pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> {
+    pub fn cache<C: 'static + Cache + Display>(self, cache: C) -> AcmeConfig<C::EC, C::EA> {
         AcmeConfig {
             client_config: self.client_config,
             directory_url: self.directory_url,
@@ -126,17 +126,26 @@ impl<EC: 'static + Debug + Display, EA: 'static + Debug + Display> AcmeConfig<EC
             cache: Box::new(cache),
         }
     }
-    pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(
+    pub fn cache_compose<
+        CC: 'static + CertCache + Display,
+        CA: 'static + AccountCache + Display,
+    >(
         self,
         cert_cache: CC,
         account_cache: CA,
     ) -> AcmeConfig<CC::EC, CA::EA> {
         self.cache(CompositeCache::new(cert_cache, account_cache))
     }
-    pub fn cache_with_boxed_err<C: 'static + Cache>(self, cache: C) -> AcmeConfig<Box<dyn Debug>> {
+    pub fn cache_with_boxed_err<C: 'static + Cache + Display>(
+        self,
+        cache: C,
+    ) -> AcmeConfig<Box<dyn Debug>> {
         self.cache(BoxedErrCache::new(cache))
     }
-    pub fn cache_option<C: 'static + Cache>(self, cache: Option<C>) -> AcmeConfig<C::EC, C::EA> {
+    pub fn cache_option<C: 'static + Cache + Display>(
+        self,
+        cache: Option<C>,
+    ) -> AcmeConfig<C::EC, C::EA> {
         match cache {
             Some(cache) => self.cache(cache),
             None => self.cache(NoCache::<C::EC, C::EA>::new()),

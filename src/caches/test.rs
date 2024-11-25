@@ -4,7 +4,7 @@ use rcgen::{
     date_time_ymd, BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// }
 /// ```
 #[derive(Clone)]
-pub struct TestCache<EC: Debug = std::io::Error, EA: Debug = std::io::Error> {
+pub struct TestCache<EC: Display + Debug = std::io::Error, EA: Display + Debug = std::io::Error> {
     ca_cert: Arc<rcgen::Certificate>,
     ca_pem: Arc<String>,
     ca_key_pair: Arc<rcgen::KeyPair>,
@@ -29,7 +29,13 @@ pub struct TestCache<EC: Debug = std::io::Error, EA: Debug = std::io::Error> {
     _account_error: PhantomData<AtomicPtr<Box<EA>>>,
 }
 
-impl<EC: Debug, EA: Debug> Default for TestCache<EC, EA> {
+impl<EC: Display + Debug, EA: Display + Debug> Display for TestCache<EC, EA> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TestCache")
+    }
+}
+
+impl<EC: Debug + Display, EA: Debug + Display> Default for TestCache<EC, EA> {
     fn default() -> Self {
         let mut params = CertificateParams::default();
         let mut distinguished_name = DistinguishedName::new();
@@ -56,7 +62,7 @@ impl<EC: Debug, EA: Debug> Default for TestCache<EC, EA> {
     }
 }
 
-impl<EC: Debug, EA: Debug> TestCache<EC, EA> {
+impl<EC: Debug + Display, EA: Debug + Display> TestCache<EC, EA> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -67,7 +73,7 @@ impl<EC: Debug, EA: Debug> TestCache<EC, EA> {
 }
 
 #[async_trait]
-impl<EC: Debug, EA: Debug> CertCache for TestCache<EC, EA> {
+impl<EC: Debug + Display, EA: Debug + Display> CertCache for TestCache<EC, EA> {
     type EC = EC;
     async fn load_cert(
         &self,
@@ -114,7 +120,7 @@ impl<EC: Debug, EA: Debug> CertCache for TestCache<EC, EA> {
 }
 
 #[async_trait]
-impl<EC: Debug, EA: Debug> AccountCache for TestCache<EC, EA> {
+impl<EC: Debug + Display, EA: Debug + Display> AccountCache for TestCache<EC, EA> {
     type EA = EA;
     async fn load_account(
         &self,

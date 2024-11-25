@@ -1,12 +1,31 @@
+use std::fmt::Display;
+
 use crate::{AccountCache, CertCache};
 use async_trait::async_trait;
 
-pub struct CompositeCache<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> {
+pub struct CompositeCache<
+    C: CertCache + Send + Sync + Display,
+    A: AccountCache + Send + Sync + Display,
+> {
     pub cert_cache: C,
     pub account_cache: A,
 }
 
-impl<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> CompositeCache<C, A> {
+impl<C: CertCache + Send + Sync + Display, A: AccountCache + Send + Sync + Display> Display
+    for CompositeCache<C, A>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CompositeCache(cert_cache: {}, account_cache: {})",
+            self.cert_cache, self.account_cache
+        )
+    }
+}
+
+impl<C: CertCache + Send + Sync + Display, A: AccountCache + Send + Sync + Display>
+    CompositeCache<C, A>
+{
     pub fn new(cert_cache: C, account_cache: A) -> Self {
         Self {
             cert_cache,
@@ -19,7 +38,9 @@ impl<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> CompositeCache<C
 }
 
 #[async_trait]
-impl<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> CertCache for CompositeCache<C, A> {
+impl<C: CertCache + Send + Sync + Display, A: AccountCache + Send + Sync + Display> CertCache
+    for CompositeCache<C, A>
+{
     type EC = C::EC;
     async fn load_cert(
         &self,
@@ -42,7 +63,7 @@ impl<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> CertCache for Co
 }
 
 #[async_trait]
-impl<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> AccountCache
+impl<C: CertCache + Send + Sync + Display, A: AccountCache + Send + Sync + Display> AccountCache
     for CompositeCache<C, A>
 {
     type EA = A::EA;

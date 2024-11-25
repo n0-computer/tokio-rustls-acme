@@ -1,14 +1,14 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 
 use async_trait::async_trait;
 
-pub trait Cache: CertCache + AccountCache {}
+pub trait Cache: CertCache + AccountCache + Display {}
 
-impl<T> Cache for T where T: CertCache + AccountCache {}
+impl<T> Cache for T where T: CertCache + AccountCache + Display {}
 
 #[async_trait]
-pub trait CertCache: Send + Sync {
-    type EC: Debug;
+pub trait CertCache: Send + Sync + Display {
+    type EC: Debug + Display;
     async fn load_cert(
         &self,
         domains: &[String],
@@ -23,8 +23,8 @@ pub trait CertCache: Send + Sync {
 }
 
 #[async_trait]
-pub trait AccountCache: Send + Sync {
-    type EA: Debug;
+pub trait AccountCache: Send + Sync + Display {
+    type EA: Debug + Display;
     async fn load_account(
         &self,
         contact: &[String],

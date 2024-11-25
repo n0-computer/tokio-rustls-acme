@@ -3,15 +3,22 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ring::digest::{Context, SHA256};
+use std::fmt::Display;
 use std::io::ErrorKind;
 use std::path::Path;
 use tokio::fs;
 
-pub struct DirCache<P: AsRef<Path> + Send + Sync> {
+pub struct DirCache<P: AsRef<Path> + Send + Sync + Display> {
     inner: P,
 }
 
-impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
+impl<P: AsRef<Path> + Send + Sync + Display> Display for DirCache<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DirCache({})", self.inner)
+    }
+}
+
+impl<P: AsRef<Path> + Send + Sync + Display> DirCache<P> {
     pub fn new(dir: P) -> Self {
         Self { inner: dir }
     }
@@ -61,7 +68,7 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
 }
 
 #[async_trait]
-impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
+impl<P: AsRef<Path> + Send + Sync + Display> CertCache for DirCache<P> {
     type EC = std::io::Error;
     async fn load_cert(
         &self,
@@ -83,7 +90,7 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
 }
 
 #[async_trait]
-impl<P: AsRef<Path> + Send + Sync> AccountCache for DirCache<P> {
+impl<P: AsRef<Path> + Send + Sync + Display> AccountCache for DirCache<P> {
     type EA = std::io::Error;
     async fn load_account(
         &self,
