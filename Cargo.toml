@@ -1,6 +1,6 @@
 [package]
 name = "tokio-rustls-acme"
-version = "0.5.0"
+version = "0.6.0"
 authors = [
     "dignifiedquire <me@dignifiedquire.com>",
     "Florian Uekermann <florian@uekermann.me>",
