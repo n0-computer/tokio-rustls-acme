@@ -228,6 +228,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             directory,
             &config.contact,
             &key_pair,
+            &config.eab,
         )
         .await?;
 

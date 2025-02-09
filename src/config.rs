@@ -1,4 +1,4 @@
-use crate::acme::{LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY};
+use crate::acme::{ExternalAccountKey, LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY};
 use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
@@ -19,6 +19,7 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) domains: Vec<String>,
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
+    pub(crate) eab: Option<ExternalAccountKey>,
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -70,6 +71,7 @@ impl AcmeConfig<Infallible, Infallible> {
             domains: domains.into_iter().map(|s| s.as_ref().into()).collect(),
             contact: vec![],
             cache: Box::new(NoCache::new()),
+            eab: None,
         }
     }
 }
@@ -101,6 +103,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
+    pub fn external_account_binding(mut self, kid: impl AsRef<str>, key: impl AsRef<[u8]>) -> Self {
+        self.eab = Some(ExternalAccountKey::new(kid.as_ref().into(), key.as_ref().into()));
+        self
+    }
+
     /// Provide a list of contacts for the account.
     ///
     /// Note that email addresses must include a `mailto:` prefix.
@@ -124,6 +131,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             domains: self.domains,
             contact: self.contact,
             cache: Box::new(cache),
+            eab: self.eab,
         }
     }
     pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(
