@@ -95,10 +95,7 @@ impl<'a> Protected<'a> {
         Ok(URL_SAFE_NO_PAD.encode(protected))
     }
 
-    fn hmac_base64(
-        kid: &'a str,
-        url: &'a str,
-    ) -> Result<String, JoseError> {
+    fn hmac_base64(kid: &'a str, url: &'a str) -> Result<String, JoseError> {
         let protected = Self {
             alg: "HS256",
             jwk: None,

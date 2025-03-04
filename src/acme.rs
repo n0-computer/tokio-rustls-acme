@@ -66,12 +66,7 @@ impl Account {
         let contact: Vec<&'a str> = contact.into_iter().map(AsRef::<str>::as_ref).collect();
 
         let payload = if let Some(eab) = &eab.as_ref() {
-            let eab_body = sign_eab(
-                &key_pair,
-                &eab.key,
-                &eab.kid,
-                &directory.new_account,
-            )?;
+            let eab_body = sign_eab(&key_pair, &eab.key, &eab.kid, &directory.new_account)?;
 
             json!({
                 "termsOfServiceAgreed": true,
@@ -83,7 +78,8 @@ impl Account {
                 "termsOfServiceAgreed": true,
                 "contact": contact,
             })
-        }.to_string();
+        }
+        .to_string();
 
         let body = sign(
             &key_pair,

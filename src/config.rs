@@ -1,4 +1,6 @@
-use crate::acme::{ExternalAccountKey, LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY};
+use crate::acme::{
+    ExternalAccountKey, LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY,
+};
 use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
@@ -104,7 +106,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     }
 
     pub fn external_account_binding(mut self, kid: impl AsRef<str>, key: impl AsRef<[u8]>) -> Self {
-        self.eab = Some(ExternalAccountKey::new(kid.as_ref().into(), key.as_ref().into()));
+        self.eab = Some(ExternalAccountKey::new(kid.as_ref().into(), key.as_ref()));
         self
     }
 
