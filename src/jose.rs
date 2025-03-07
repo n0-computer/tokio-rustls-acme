@@ -17,7 +17,7 @@ pub(crate) fn sign(
         None => Some(Jwk::new(key)),
         Some(_) => None,
     };
-    let protected = Protected::base64(jwk, kid, nonce, url)?;
+    let protected = Protected::base64(jwk, kid, Some(nonce.as_ref()), url)?;
     let payload = URL_SAFE_NO_PAD.encode(payload);
     let combined = format!("{}.{}", &protected, &payload);
     let signature = key.sign(&SystemRandom::new(), combined.as_bytes())?;
@@ -30,6 +30,25 @@ pub(crate) fn sign(
     Ok(serde_json::to_string(&body)?)
 }
 
+pub(crate) fn sign_eab(
+    key: &EcdsaKeyPair,
+    eab_key: &ring::hmac::Key,
+    kid: &str,
+    url: &str,
+) -> Result<Body, JoseError> {
+    let protected = Protected::hmac_base64(kid, url)?;
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Jwk::new(key))?);
+    let combined = format!("{}.{}", &protected, &payload);
+    let signature = ring::hmac::sign(eab_key, combined.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(signature.as_ref());
+    let body = Body {
+        protected,
+        payload,
+        signature,
+    };
+    Ok(body)
+}
+
 pub(crate) fn key_authorization_sha256(
     key: &EcdsaKeyPair,
     token: &str,
@@ -40,7 +59,7 @@ pub(crate) fn key_authorization_sha256(
 }
 
 #[derive(Serialize)]
-struct Body {
+pub(crate) struct Body {
     protected: String,
     payload: String,
     signature: String,
@@ -53,7 +72,8 @@ struct Protected<'a> {
     jwk: Option<Jwk>,
     #[serde(skip_serializing_if = "Option::is_none")]
     kid: Option<&'a str>,
-    nonce: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonce: Option<&'a str>,
     url: &'a str,
 }
 
@@ -61,7 +81,7 @@ impl<'a> Protected<'a> {
     fn base64(
         jwk: Option<Jwk>,
         kid: Option<&'a str>,
-        nonce: String,
+        nonce: Option<&'a str>,
         url: &'a str,
     ) -> Result<String, JoseError> {
         let protected = Self {
@@ -69,6 +89,18 @@ impl<'a> Protected<'a> {
             jwk,
             kid,
             nonce,
+            url,
+        };
+        let protected = serde_json::to_vec(&protected)?;
+        Ok(URL_SAFE_NO_PAD.encode(protected))
+    }
+
+    fn hmac_base64(kid: &'a str, url: &'a str) -> Result<String, JoseError> {
+        let protected = Self {
+            alg: "HS256",
+            jwk: None,
+            kid: Some(kid),
+            nonce: None,
             url,
         };
         let protected = serde_json::to_vec(&protected)?;
