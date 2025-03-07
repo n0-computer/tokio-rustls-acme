@@ -119,7 +119,7 @@ impl<
             match Pin::new(tcp_incoming).poll_next(cx) {
                 Poll::Ready(Some(Ok(tcp))) => self.acme_accepting.push(self.acceptor.accept(tcp)),
                 Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
-                Poll::Ready(None) => drop(self.tcp_incoming.as_mut().take()),
+                Poll::Ready(None) => drop(self.tcp_incoming.as_mut()),
                 Poll::Pending => return Poll::Pending,
             }
         }
