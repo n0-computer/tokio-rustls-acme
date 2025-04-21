@@ -344,7 +344,7 @@ fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeE
         .headers()
         .get_all(header)
         .iter()
-        .last()
+        .next_back()
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     match h {
