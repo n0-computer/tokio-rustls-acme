@@ -13,6 +13,7 @@ use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDS
 use rustls::crypto::ring::sign::any_ecdsa_type;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
+use rustls::ServerConfig;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
@@ -114,6 +115,20 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let acceptor = self.acceptor();
         Incoming::new(tcp_incoming, self, acceptor, alpn_protocols)
     }
+
+    pub fn incoming_with_server<
+        TCP: AsyncRead + AsyncWrite + Unpin,
+        ETCP,
+        ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
+    >(
+        self,
+        tcp_incoming: ITCP,
+        server_config: ServerConfig,
+    ) -> Incoming<TCP, ETCP, ITCP, EC, EA> {
+        let acceptor = self.acceptor();
+        Incoming::new_with_server(tcp_incoming, self, acceptor, server_config)
+    }
+
     pub fn acceptor(&self) -> AcmeAcceptor {
         AcmeAcceptor::new(self.resolver())
     }
