@@ -79,8 +79,8 @@ impl<
             match Pin::new(&mut self.state).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
                     match event {
-                        Ok(ok) => log::info!("event: {:?}", ok),
-                        Err(err) => log::error!("event: {:?}", err),
+                        Ok(ok) => log::info!("event: {ok:?}"),
+                        Err(err) => log::error!("event: {err:?}"),
                     }
                     continue;
                 }
@@ -96,7 +96,7 @@ impl<
                     continue;
                 }
                 Poll::Ready(Some(Err(err))) => {
-                    log::error!("tls accept failed, {:?}", err);
+                    log::error!("tls accept failed, {err:?}");
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => {}
@@ -104,7 +104,7 @@ impl<
             match Pin::new(&mut self.tls_accepting).poll_next(cx) {
                 Poll::Ready(Some(Ok(tls))) => return Poll::Ready(Some(Ok(tls))),
                 Poll::Ready(Some(Err(err))) => {
-                    log::error!("tls accept failed, {:?}", err);
+                    log::error!("tls accept failed, {err:?}");
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => {}
