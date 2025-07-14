@@ -73,9 +73,9 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> Futu
                     self.tls_accept = Some(start_handshake.into_stream(config));
                     continue;
                 }
-                Poll::Ready(Ok(None)) => Poll::Ready(Err(io::Error::other(
-                    "TLS-ALPN-01 validation request",
-                ))),
+                Poll::Ready(Ok(None)) => {
+                    Poll::Ready(Err(io::Error::other("TLS-ALPN-01 validation request")))
+                }
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
                 Poll::Pending => Poll::Pending,
             };
