@@ -85,7 +85,7 @@ impl<EC: Debug, EA: Debug> CertCache for TestCache<EC, EA> {
         let cert = match params.signed_by(&key_pair, &self.ca_cert, &self.ca_key_pair) {
             Ok(cert) => cert,
             Err(err) => {
-                log::error!("test cache: generation error: {:?}", err);
+                log::error!("test cache: generation error: {err:?}");
                 return Ok(None);
             }
         };

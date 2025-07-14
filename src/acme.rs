@@ -118,7 +118,7 @@ impl Account {
         let response = https(client_config, url.as_ref(), Method::Post, Some(body)).await?;
         let location = get_header(&response, "Location").ok();
         let body = response.text().await.map_err(HttpsRequestError::from)?;
-        log::debug!("response: {:?}", body);
+        log::debug!("response: {body:?}");
         Ok((location, body))
     }
     pub async fn new_order(

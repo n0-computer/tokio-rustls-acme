@@ -37,7 +37,7 @@ async fn main() {
     let args = Args::parse();
 
     let mut state = AcmeConfig::new(args.domains)
-        .contact(args.email.iter().map(|e| format!("mailto:{}", e)))
+        .contact(args.email.iter().map(|e| format!("mailto:{e}")))
         .cache_option(args.cache.clone().map(DirCache::new))
         .directory_lets_encrypt(args.prod)
         .state();
@@ -49,8 +49,8 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             match state.next().await.unwrap() {
-                Ok(ok) => log::info!("event: {:?}", ok),
-                Err(err) => log::error!("error: {:?}", err),
+                Ok(ok) => log::info!("event: {ok:?}"),
+                Err(err) => log::error!("error: {err:?}"),
             }
         }
     });

@@ -40,7 +40,7 @@ async fn main() {
     let tcp_incoming = TcpListenerStream::new(tcp_listener);
 
     let tls_incoming = AcmeConfig::new(args.domains)
-        .contact(args.email.iter().map(|e| format!("mailto:{}", e)))
+        .contact(args.email.iter().map(|e| format!("mailto:{e}")))
         .cache_option(args.cache.clone().map(DirCache::new))
         .directory_lets_encrypt(args.prod)
         .incoming(tcp_incoming, Vec::new());
