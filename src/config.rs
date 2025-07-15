@@ -5,7 +5,7 @@ use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
 use futures::Stream;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -168,5 +168,18 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Incoming<TCP, ETCP, ITCP, EC, EA> {
         self.state().incoming(tcp_incoming, alpn_protocols)
+    }
+    /// Same as [AcmeConfig::incoming] but this version allows to specify a custom `rustls::ServerConfig`.
+    pub fn incoming_with_server<
+        TCP: AsyncRead + AsyncWrite + Unpin,
+        ETCP,
+        ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
+    >(
+        self,
+        tcp_incoming: ITCP,
+        server_config: ServerConfig,
+    ) -> Incoming<TCP, ETCP, ITCP, EC, EA> {
+        self.state()
+            .incoming_with_server(tcp_incoming, server_config)
     }
 }

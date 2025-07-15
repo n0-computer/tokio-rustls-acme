@@ -43,24 +43,33 @@ impl<
         EA: Debug + 'static,
     > Incoming<TCP, ETCP, ITCP, EC, EA>
 {
+    pub fn new_with_server(
+        tcp_incoming: ITCP,
+        state: AcmeState<EC, EA>,
+        acceptor: AcmeAcceptor,
+        server_config: ServerConfig,
+    ) -> Self {
+        Self {
+            state,
+            acceptor,
+            rustls_config: Arc::new(server_config),
+            tcp_incoming: Some(tcp_incoming),
+            acme_accepting: FuturesUnordered::new(),
+            tls_accepting: FuturesUnordered::new(),
+        }
+    }
+
     pub fn new(
         tcp_incoming: ITCP,
         state: AcmeState<EC, EA>,
         acceptor: AcmeAcceptor,
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Self {
-        let mut config = ServerConfig::builder()
+        let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(state.resolver());
-        config.alpn_protocols = alpn_protocols;
-        Self {
-            state,
-            acceptor,
-            rustls_config: Arc::new(config),
-            tcp_incoming: Some(tcp_incoming),
-            acme_accepting: FuturesUnordered::new(),
-            tls_accepting: FuturesUnordered::new(),
-        }
+        server_config.alpn_protocols = alpn_protocols;
+        Self::new_with_server(tcp_incoming, state, acceptor, server_config)
     }
 }
 
