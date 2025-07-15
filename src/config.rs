@@ -10,7 +10,6 @@ use std::convert::Infallible;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use webpki_roots::TLS_SERVER_ROOTS;
 
 /// Configuration for an ACME resolver.
 ///
@@ -52,16 +51,16 @@ impl AcmeConfig<Infallible, Infallible> {
     /// ```
     ///
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        #[allow(unused_mut)]
         let mut root_store = RootCertStore::empty();
-        root_store.extend(
-            TLS_SERVER_ROOTS
-                .iter()
-                .map(|ta| rustls::pki_types::TrustAnchor {
-                    subject: ta.subject.clone(),
-                    subject_public_key_info: ta.subject_public_key_info.clone(),
-                    name_constraints: ta.name_constraints.clone(),
-                }),
-        );
+        #[cfg(feature = "rustls-tls-webpki-roots")]
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+            rustls::pki_types::TrustAnchor {
+                subject: ta.subject.clone(),
+                subject_public_key_info: ta.subject_public_key_info.clone(),
+                name_constraints: ta.name_constraints.clone(),
+            }
+        }));
         let client_config = Arc::new(
             ClientConfig::builder()
                 .with_root_certificates(root_store)
