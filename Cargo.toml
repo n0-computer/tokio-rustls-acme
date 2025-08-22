@@ -21,7 +21,7 @@ serde = { version = "1.0.137", features = ["derive"] }
 ring = { version = "0.17.0", features = ["std"] }
 base64 = "0.22"
 log = "0.4.17"
-webpki-roots = "0.26"
+webpki-roots = { version = "0.26", optional = true }
 pem = "3.0"
 thiserror = "2.0"
 x509-parser = "0.16"
@@ -35,7 +35,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
 ] }
 reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
+    "rustls-tls-manual-roots"
 ] }
 
 # Axum
@@ -68,8 +68,9 @@ all-features = true
 rustdoc-args = ["--cfg", "doc_auto_cfg"]
 
 [features]
-default = []
+default = ["rustls-tls-webpki-roots"]
 axum = ["dep:axum-server"]
+rustls-tls-webpki-roots = ["dep:webpki-roots", "reqwest/rustls-tls-webpki-roots"]
 
 [[example]]
 name = "low_level_axum"

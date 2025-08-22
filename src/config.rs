@@ -5,12 +5,11 @@ use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
 use futures::Stream;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, ServerConfig};
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use webpki_roots::TLS_SERVER_ROOTS;
 
 /// Configuration for an ACME resolver.
 ///
@@ -51,22 +50,28 @@ impl AcmeConfig<Infallible, Infallible> {
     /// let config: AcmeConfig<EC, EA> = AcmeConfig::new(["example.com"]).cache(NoCache::new());
     /// ```
     ///
+    #[cfg(feature = "rustls-tls-webpki-roots")]
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(
-            TLS_SERVER_ROOTS
-                .iter()
-                .map(|ta| rustls::pki_types::TrustAnchor {
-                    subject: ta.subject.clone(),
-                    subject_public_key_info: ta.subject_public_key_info.clone(),
-                    name_constraints: ta.name_constraints.clone(),
-                }),
-        );
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+            rustls::pki_types::TrustAnchor {
+                subject: ta.subject.clone(),
+                subject_public_key_info: ta.subject_public_key_info.clone(),
+                name_constraints: ta.name_constraints.clone(),
+            }
+        }));
         let client_config = Arc::new(
             ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         );
+        Self::new_with_client_tls_config(domains, client_config)
+    }
+
+    pub fn new_with_client_tls_config(
+        domains: impl IntoIterator<Item = impl AsRef<str>>,
+        client_config: Arc<ClientConfig>,
+    ) -> Self {
         AcmeConfig {
             client_config,
             directory_url: LETS_ENCRYPT_STAGING_DIRECTORY.into(),
