@@ -24,7 +24,7 @@ log = "0.4.17"
 webpki-roots = { version = "1.0", optional = true }
 pem = "3.0"
 thiserror = "2.0"
-x509-parser = "0.16"
+x509-parser = "0.18"
 chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 async-trait = "0.1.53"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
