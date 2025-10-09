@@ -21,7 +21,7 @@ serde = { version = "1.0.137", features = ["derive"] }
 ring = { version = "0.17.0", features = ["std"] }
 base64 = "0.22"
 log = "0.4.17"
-webpki-roots = { version = "0.26", optional = true }
+webpki-roots = { version = "1.0", optional = true }
 pem = "3.0"
 thiserror = "2.0"
 x509-parser = "0.16"
