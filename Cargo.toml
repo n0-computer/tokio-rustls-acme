@@ -15,7 +15,7 @@ categories = ["asynchronous", "cryptography", "network-programming"]
 
 [dependencies]
 futures = "0.3.21"
-rcgen = "0.13"
+rcgen = "0.14"
 serde_json = "1.0.81"
 serde = { version = "1.0.137", features = ["derive"] }
 ring = { version = "0.17.0", features = ["std"] }
