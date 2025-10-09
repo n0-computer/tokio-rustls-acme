@@ -22,9 +22,8 @@ use std::sync::Arc;
 /// ```
 #[derive(Clone)]
 pub struct TestCache<EC: Debug = std::io::Error, EA: Debug = std::io::Error> {
-    ca_cert: Arc<rcgen::Certificate>,
+    ca_issuer: Arc<rcgen::Issuer<'static, rcgen::KeyPair>>,
     ca_pem: Arc<String>,
-    ca_key_pair: Arc<rcgen::KeyPair>,
     _cert_error: PhantomData<AtomicPtr<Box<EC>>>,
     _account_error: PhantomData<AtomicPtr<Box<EA>>>,
 }
@@ -46,9 +45,10 @@ impl<EC: Debug, EA: Debug> Default for TestCache<EC, EA> {
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let ca_cert = params.self_signed(&key_pair).unwrap();
         let ca_pem = ca_cert.pem();
+        let ca_issuer = rcgen::Issuer::new(params, key_pair);
+
         Self {
-            ca_cert: ca_cert.into(),
-            ca_key_pair: key_pair.into(),
+            ca_issuer: ca_issuer.into(),
             ca_pem: ca_pem.into(),
             _cert_error: Default::default(),
             _account_error: Default::default(),
@@ -82,7 +82,7 @@ impl<EC: Debug, EA: Debug> CertCache for TestCache<EC, EA> {
         params.not_before = date_time_ymd(2000, 1, 1);
         params.not_after = date_time_ymd(3000, 1, 1);
 
-        let cert = match params.signed_by(&key_pair, &self.ca_cert, &self.ca_key_pair) {
+        let cert = match params.signed_by(&key_pair, &self.ca_issuer) {
             Ok(cert) => cert,
             Err(err) => {
                 log::error!("test cache: generation error: {err:?}");
