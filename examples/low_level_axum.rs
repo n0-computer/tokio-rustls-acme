@@ -41,9 +41,12 @@ async fn main() {
         .cache_option(args.cache.clone().map(DirCache::new))
         .directory_lets_encrypt(args.prod)
         .state();
-    let rustls_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(state.resolver());
+    let rustls_config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(state.resolver());
     let acceptor = state.axum_acceptor(Arc::new(rustls_config));
 
     tokio::spawn(async move {
