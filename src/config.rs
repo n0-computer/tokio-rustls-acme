@@ -21,6 +21,7 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
+    pub(crate) preferred_chain: Option<String>,
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -79,6 +80,7 @@ impl AcmeConfig<Infallible, Infallible> {
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
+            preferred_chain: None,
         }
     }
 }
@@ -131,6 +133,17 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
+    /// Set the preferred certificate chain issuer name.
+    ///
+    /// When set, the ACME client will check alternate certificate chains
+    /// provided by the CA and select one whose topmost intermediate or root
+    /// certificate issuer contains this string. For example, setting this to
+    /// `"ISRG Root X2"` will select Let's Encrypt's ECDSA-only chain.
+    pub fn preferred_chain(mut self, preferred_chain: impl Into<String>) -> Self {
+        self.preferred_chain = Some(preferred_chain.into());
+        self
+    }
+
     pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> {
         AcmeConfig {
             client_config: self.client_config,
@@ -139,6 +152,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             contact: self.contact,
             cache: Box::new(cache),
             eab: self.eab,
+            preferred_chain: self.preferred_chain,
         }
     }
     pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(

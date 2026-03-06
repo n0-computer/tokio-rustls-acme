@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
+// x509_parser is already a dependency (used in state.rs)
+
 pub const LETS_ENCRYPT_STAGING_DIRECTORY: &str =
     "https://acme-staging-v02.api.letsencrypt.org/directory";
 pub const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
@@ -175,7 +177,67 @@ impl Account {
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<String, AcmeError> {
-        Ok(self.request(client_config, &url, "").await?.1)
+        self.certificate_preferred(client_config, url, None).await
+    }
+
+    /// Download the certificate chain, optionally selecting an alternate chain
+    /// whose topmost issuer contains `preferred_chain`.
+    pub async fn certificate_preferred(
+        &self,
+        client_config: &Arc<ClientConfig>,
+        url: impl AsRef<str>,
+        preferred_chain: Option<&str>,
+    ) -> Result<String, AcmeError> {
+        let body = sign(
+            &self.key_pair,
+            Some(&self.kid),
+            self.directory.nonce(client_config).await?,
+            url.as_ref(),
+            "",
+        )?;
+        let response = https(client_config, url.as_ref(), Method::Post, Some(body)).await?;
+
+        // Extract alternate chain URLs from Link headers
+        let alternate_urls: Vec<String> = response
+            .headers()
+            .get_all("link")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter_map(|link| parse_alternate_link(link))
+            .collect();
+
+        let default_chain = response.text().await.map_err(HttpsRequestError::from)?;
+
+        // If no preferred chain requested, or no alternates available, return default
+        let preferred = match preferred_chain {
+            Some(preferred) if !alternate_urls.is_empty() => preferred,
+            _ => return Ok(default_chain),
+        };
+
+        // Check if default chain already matches
+        if chain_issuer_matches(&default_chain, preferred) {
+            log::info!("default chain matches preferred chain '{preferred}'");
+            return Ok(default_chain);
+        }
+
+        // Try each alternate chain
+        for alt_url in &alternate_urls {
+            log::info!("trying alternate chain: {alt_url}");
+            match self.request(client_config, alt_url, "").await {
+                Ok((_, alt_chain)) => {
+                    if chain_issuer_matches(&alt_chain, preferred) {
+                        log::info!("alternate chain matches preferred chain '{preferred}'");
+                        return Ok(alt_chain);
+                    }
+                }
+                Err(err) => {
+                    log::warn!("failed to fetch alternate chain from {alt_url}: {err}");
+                }
+            }
+        }
+
+        log::warn!("no chain matched preferred '{preferred}', using default");
+        Ok(default_chain)
     }
     pub fn tls_alpn_01<'a>(
         &self,
@@ -339,6 +401,38 @@ pub enum AcmeError {
     NoTlsAlpn01Challenge,
 }
 
+/// Parse a `Link` header value like `<https://...>;rel="alternate"` and return the URL
+/// if the relation is "alternate".
+fn parse_alternate_link(link: &str) -> Option<String> {
+    // Format: <URL>;rel="alternate" (possibly with other params)
+    if !link.contains("rel=\"alternate\"") {
+        return None;
+    }
+    let url = link.trim().strip_prefix('<')?.split('>').next()?;
+    Some(url.to_string())
+}
+
+/// Check if the topmost certificate in a PEM chain has an issuer containing `needle`.
+fn chain_issuer_matches(pem_chain: &str, needle: &str) -> bool {
+    let pems = match pem::parse_many(pem_chain.as_bytes()) {
+        Ok(pems) => pems,
+        Err(_) => return false,
+    };
+    // The last cert in the chain is the topmost (closest to root)
+    let topmost = match pems.last() {
+        Some(p) => p,
+        None => return false,
+    };
+    match x509_parser::parse_x509_certificate(topmost.contents()) {
+        Ok((_, cert)) => {
+            let issuer = cert.issuer().to_string();
+            log::debug!("topmost cert issuer: {issuer}");
+            issuer.contains(needle)
+        }
+        Err(_) => false,
+    }
+}
+
 fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeError> {
     let h = response
         .headers()
@@ -350,5 +444,87 @@ fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeE
     match h {
         None => Err(AcmeError::MissingHeader(header)),
         Some(value) => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_alternate_link() {
+        // Standard format
+        assert_eq!(
+            parse_alternate_link(r#"<https://acme.example.com/cert/abc>;rel="alternate""#),
+            Some("https://acme.example.com/cert/abc".to_string())
+        );
+
+        // Not alternate
+        assert_eq!(
+            parse_alternate_link(r#"<https://example.com>;rel="next""#),
+            None
+        );
+
+        // With extra params
+        assert_eq!(
+            parse_alternate_link(
+                r#"<https://acme.example.com/cert/xyz>;rel="alternate";title="chain2""#
+            ),
+            Some("https://acme.example.com/cert/xyz".to_string())
+        );
+
+        // Empty
+        assert_eq!(parse_alternate_link(""), None);
+    }
+
+    #[test]
+    fn test_chain_issuer_matches() {
+        // Generate a self-signed cert with a known issuer
+        let key_pair =
+            rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("keygen");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["example.com".to_string()]).expect("params");
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("Test Issuer X2".into()),
+        );
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+        let pem_str = cert.pem();
+
+        assert!(chain_issuer_matches(&pem_str, "Test Issuer X2"));
+        assert!(!chain_issuer_matches(&pem_str, "ISRG Root X1"));
+    }
+
+    #[test]
+    fn test_chain_issuer_matches_real_chain() {
+        // Simulate a two-cert chain: leaf + intermediate
+        // The topmost (last) cert's issuer should be checked
+        let leaf_kp =
+            rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("keygen");
+        let ca_kp =
+            rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("keygen");
+
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec![]).expect("params");
+        ca_params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("ISRG Root X2".into()),
+        );
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_kp).expect("self-sign ca");
+
+        let leaf_params =
+            rcgen::CertificateParams::new(vec!["leaf.example.com".to_string()]).expect("params");
+        let ca_issuer = rcgen::Issuer::from_params(&ca_params, &ca_kp);
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_kp, &ca_issuer)
+            .expect("sign leaf");
+
+        let chain_pem = format!("{}\n{}", leaf_cert.pem(), ca_cert.pem());
+
+        // Should match the CA issuer (topmost cert)
+        assert!(chain_issuer_matches(&chain_pem, "ISRG Root X2"));
+        assert!(!chain_issuer_matches(&chain_pem, "ISRG Root X1"));
     }
 }

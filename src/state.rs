@@ -287,12 +287,17 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
                 OrderStatus::Valid { certificate } => {
                     log::info!("download certificate");
+                    let chain = account
+                        .certificate_preferred(
+                            &config.client_config,
+                            certificate,
+                            config.preferred_chain.as_deref(),
+                        )
+                        .await?;
                     let pem = [
                         &key_pair.serialize_pem(),
                         "\n",
-                        &account
-                            .certificate(&config.client_config, certificate)
-                            .await?,
+                        &chain,
                     ]
                     .concat();
                     return Ok(pem.into_bytes());
