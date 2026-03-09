@@ -10,4 +10,5 @@ services:
     environment:
       PEBBLE_VA_NOSLEEP: "1"
       PEBBLE_VA_ALWAYS_VALID: "1"
+      PEBBLE_ALTERNATE_ROOTS: "1"
       PEBBLE_WFE_NONCEREJECT: "0"
