@@ -258,9 +258,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
         let mut validity = None;
         let mut required_schemes = Vec::new();
-        for (i, der) in cert_chain.iter().enumerate() {
+
+        for der in cert_chain.iter() {
             let (_, cert) = parse_x509_certificate(der.as_ref()).map_err(CertParseError::X509)?;
-            if i == 0 {
+            if validity.is_none() {
                 let v = cert.validity();
                 validity = Some(
                     [v.not_before, v.not_after]
@@ -274,8 +275,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             }
         }
 
+        let validity = validity.expect("length checked above");
         let cert = CertifiedKey::new(cert_chain, pk);
-        Ok((cert, validity.unwrap(), required_schemes))
+        Ok((cert, validity, required_schemes))
     }
 
     #[allow(clippy::result_large_err)]
@@ -436,7 +438,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     ) -> Result<Option<String>, AcmeError> {
         for url in alternate_urls {
             log::info!("fetching alternate chain from {url}");
-            let alt_pem = account.certificate_from_url(client_config, url).await?;
+            let alt_pem = account.certificate(client_config, url).await?;
             if let Some(issuer) = chain_root_issuer(&alt_pem) {
                 log::info!("alternate chain root issuer: '{issuer}'");
                 if issuer == target_issuer {
