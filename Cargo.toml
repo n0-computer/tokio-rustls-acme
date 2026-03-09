@@ -61,6 +61,8 @@ tokio = { version = "1.19.2", features = ["full"] }
 tokio-stream = { version = "0.1.9", features = ["net"] }
 tokio-util = { version = "0.7.3", features = ["compat"] }
 warp = "0.3"
+tempfile = "3"
+x509-parser = "0.18"
 
 [package.metadata.docs.rs]
 all-features = true

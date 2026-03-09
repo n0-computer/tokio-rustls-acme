@@ -1,0 +1,41 @@
+[tasks.pebble-up]
+description = "Start Pebble ACME test server"
+script = '''
+docker compose -f docker-compose.pebble.yml up -d
+echo "Waiting for Pebble to be ready..."
+for i in $(seq 1 30); do
+    if curl -sk https://localhost:14000/dir > /dev/null 2>&1; then
+        echo "Pebble is ready"
+        exit 0
+    fi
+    sleep 1
+done
+echo "Pebble failed to start"
+exit 1
+'''
+
+[tasks.pebble-down]
+description = "Stop Pebble ACME test server"
+script = '''
+docker compose -f docker-compose.pebble.yml down
+rm -f pebble.minica.pem
+'''
+
+[tasks.pebble-cert]
+description = "Extract Pebble minica root cert"
+dependencies = ["pebble-up"]
+script = '''
+docker compose -f docker-compose.pebble.yml cp pebble:/test/certs/pebble.minica.pem ./pebble.minica.pem
+'''
+
+[tasks.pebble-test-run]
+description = "Run Pebble integration tests"
+dependencies = ["pebble-cert"]
+env = { "PEBBLE_MINICA_CERT" = "./pebble.minica.pem" }
+command = "cargo"
+args = ["test", "--test", "pebble", "--", "--ignored", "--nocapture"]
+
+[tasks.test]
+clear = true
+description = "Run Pebble integration tests e2e (start server, test, stop)"
+run_task = { name = ["pebble-test-run"], fork = true, cleanup_task = "pebble-down" }

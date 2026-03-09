@@ -1,0 +1,13 @@
+services:
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: ["-config", "/test/config/pebble-config.json"]
+    ports:
+      - "14000:14000"
+      - "15000:15000"
+    volumes:
+      - ./test/pebble-config.json:/test/config/pebble-config.json:ro
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_VA_ALWAYS_VALID: "1"
+      PEBBLE_WFE_NONCEREJECT: "0"

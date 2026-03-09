@@ -253,6 +253,8 @@ pub enum ChallengeType {
     Dns01,
     #[serde(rename = "tls-alpn-01")]
     TlsAlpn01,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,7 +306,9 @@ pub enum Identifier {
 pub struct Challenge {
     #[serde(rename = "type")]
     pub typ: ChallengeType,
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
     pub token: String,
     pub error: Option<Problem>,
 }
