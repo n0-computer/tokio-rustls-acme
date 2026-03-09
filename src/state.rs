@@ -372,7 +372,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 OrderStatus::Valid { certificate } => {
                     log::info!("download certificate");
                     let cert_response = account
-                        .certificate(&config.client_config, &certificate)
+                        .certificate_with_alternate_urls(&config.client_config, &certificate)
                         .await?;
                     let key_pem = key_pair.serialize_pem();
 
