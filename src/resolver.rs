@@ -37,25 +37,16 @@ impl ResolvesServerCertAcme {
             }),
         })
     }
-    pub(crate) fn set_cert(
-        &self,
-        cert: Arc<CertifiedKey>,
-        required_schemes: Vec<SignatureScheme>,
-    ) {
+    pub(crate) fn set_cert(&self, cert: Arc<CertifiedKey>, required_schemes: Vec<SignatureScheme>) {
         self.inner.lock().unwrap().cert = Some(CertWithSchemes {
             key: cert,
             required_schemes,
         });
     }
-    pub(crate) fn set_alt_cert(
-        &self,
-        cert: Option<(Arc<CertifiedKey>, Vec<SignatureScheme>)>,
-    ) {
-        self.inner.lock().unwrap().alt_cert = cert.map(|(key, required_schemes)| {
-            CertWithSchemes {
-                key,
-                required_schemes,
-            }
+    pub(crate) fn set_alt_cert(&self, cert: Option<(Arc<CertifiedKey>, Vec<SignatureScheme>)>) {
+        self.inner.lock().unwrap().alt_cert = cert.map(|(key, required_schemes)| CertWithSchemes {
+            key,
+            required_schemes,
         });
     }
     pub(crate) fn set_auth_key(&self, domain: String, cert: Arc<CertifiedKey>) {

@@ -259,8 +259,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let mut validity = None;
         let mut required_schemes = Vec::new();
         for (i, der) in cert_chain.iter().enumerate() {
-            let (_, cert) = parse_x509_certificate(der.as_ref())
-                .map_err(CertParseError::X509)?;
+            let (_, cert) = parse_x509_certificate(der.as_ref()).map_err(CertParseError::X509)?;
             if i == 0 {
                 let v = cert.validity();
                 validity = Some(
@@ -373,7 +372,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 OrderStatus::Valid { certificate } => {
                     log::info!("download certificate");
                     let cert_response = account
-                        .certificate(&config.client_config, &certificate)
+                        .certificate_with_alternate_urls(&config.client_config, &certificate)
                         .await?;
                     let key_pem = key_pair.serialize_pem();
 
@@ -575,9 +574,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                                             )
                                             .await
                                         {
-                                            log::warn!(
-                                                "failed to cache alternate cert: {err:?}"
-                                            );
+                                            log::warn!("failed to cache alternate cert: {err:?}");
                                         }
                                     });
                                 }
