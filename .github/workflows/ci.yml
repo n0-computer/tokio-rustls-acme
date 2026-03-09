@@ -2,8 +2,9 @@ name: tests
 
 on:
   pull_request:
-    - main
-  push: -main
+  push:
+    branches:
+      - main
 
 env:
   MSRV: "1.63"
