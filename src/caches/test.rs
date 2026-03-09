@@ -73,6 +73,7 @@ impl<EC: Debug, EA: Debug> CertCache for TestCache<EC, EA> {
         &self,
         domains: &[String],
         _directory_url: &str,
+        _chain: crate::CertChainKind,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = CertificateParams::new(domains).unwrap();
@@ -106,6 +107,7 @@ impl<EC: Debug, EA: Debug> CertCache for TestCache<EC, EA> {
         &self,
         _domains: &[String],
         _directory_url: &str,
+        _chain: crate::CertChainKind,
         _cert: &[u8],
     ) -> Result<(), Self::EC> {
         log::info!("test cache configured, could not store certificate");
