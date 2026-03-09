@@ -166,9 +166,7 @@ mod tests {
         let connector = tokio_rustls::TlsConnector::from(client_config);
 
         let (client_io, server_io) = tokio::io::duplex(4096);
-        let server_name = ServerName::try_from("test.example.com")
-            .unwrap()
-            .to_owned();
+        let server_name = ServerName::try_from("test.example.com").unwrap().to_owned();
 
         let (client_result, server_result) = tokio::join!(
             connector.connect(server_name, client_io),
@@ -220,10 +218,7 @@ mod tests {
 
         let resolver = ResolvesServerCertAcme::new();
         // Primary requires ECDSA P-256 (supported by ring clients).
-        resolver.set_cert(
-            primary_key,
-            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
-        );
+        resolver.set_cert(primary_key, vec![SignatureScheme::ECDSA_NISTP256_SHA256]);
         resolver.set_alt_cert(Some((
             alt_key,
             vec![SignatureScheme::ECDSA_NISTP256_SHA256],
@@ -245,10 +240,7 @@ mod tests {
         let (primary_key, primary_chain) = make_cert(&cache).await;
 
         let resolver = ResolvesServerCertAcme::new();
-        resolver.set_cert(
-            primary_key,
-            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
-        );
+        resolver.set_cert(primary_key, vec![SignatureScheme::ECDSA_NISTP256_SHA256]);
 
         let root_store = make_root_store(cache.ca_pem());
         let peer_certs = do_handshake(resolver, root_store).await;
