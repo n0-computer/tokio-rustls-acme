@@ -336,42 +336,47 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         .await?;
                     let key_pem = key_pair.serialize_pem();
 
+                    // Build key+cert PEM bundle(s) based on chain preference.
+                    let make_pem = |cert_pem: &str| -> Vec<u8> {
+                        [&key_pem, "\n", cert_pem].concat().into_bytes()
+                    };
+
                     let (primary, alternate) = match &config.cert_chain {
-                        CertChainPreference::Default => {
-                            let pem = [&key_pem, "\n", &cert_response.pem].concat().into_bytes();
-                            (pem, None)
-                        }
+                        // Use the default chain as-is.
+                        CertChainPreference::Default => (make_pem(&cert_response.pem), None),
+
+                        // Use a single chain: prefer an alternate matching `issuer`,
+                        // fall back to the default if not found.
                         CertChainPreference::PreferredChain(issuer) => {
-                            let cert_pem =
-                                if chain_root_issuer(&cert_response.pem).as_deref() == Some(issuer)
-                                {
-                                    None
-                                } else {
-                                    Self::fetch_chain_by_issuer(
-                                        &account,
-                                        &config.client_config,
-                                        &cert_response.alternate_urls,
-                                        issuer,
-                                    )
-                                    .await?
-                                };
-                            let cert_pem = cert_pem.as_deref().unwrap_or(&cert_response.pem);
-                            let pem = [&key_pem, "\n", cert_pem].concat().into_bytes();
-                            (pem, None)
+                            let default_matches =
+                                chain_root_issuer(&cert_response.pem).as_deref() == Some(issuer);
+                            let pem = if default_matches {
+                                cert_response.pem
+                            } else {
+                                Self::fetch_chain_by_issuer(
+                                    &account,
+                                    &config.client_config,
+                                    &cert_response.alternate_urls,
+                                    issuer,
+                                )
+                                .await?
+                                .unwrap_or(cert_response.pem)
+                            };
+                            (make_pem(&pem), None)
                         }
+
+                        // Serve two chains: the default as primary, and an alternate
+                        // matching `issuer` for clients that don't support RSA.
                         CertChainPreference::DualChain(issuer) => {
-                            let primary =
-                                [&key_pem, "\n", &cert_response.pem].concat().into_bytes();
-                            let alt = Self::fetch_chain_by_issuer(
+                            let alternate = Self::fetch_chain_by_issuer(
                                 &account,
                                 &config.client_config,
                                 &cert_response.alternate_urls,
                                 issuer,
                             )
-                            .await?;
-                            let alternate = alt
-                                .map(|pem| [&key_pem, "\n", &pem].concat().into_bytes());
-                            (primary, alternate)
+                            .await?
+                            .map(|pem| make_pem(&pem));
+                            (make_pem(&cert_response.pem), alternate)
                         }
                     };
 
