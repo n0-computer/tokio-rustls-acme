@@ -40,6 +40,7 @@ impl<EC: Debug, EA: Debug> CertCache for NoCache<EC, EA> {
         &self,
         _domains: &[String],
         _directory_url: &str,
+        _chain: crate::CertChainKind,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
         log::info!("no cert cache configured, could not load certificate");
         Ok(None)
@@ -48,6 +49,7 @@ impl<EC: Debug, EA: Debug> CertCache for NoCache<EC, EA> {
         &self,
         _domains: &[String],
         _directory_url: &str,
+        _chain: crate::CertChainKind,
         _cert: &[u8],
     ) -> Result<(), Self::EC> {
         log::info!("no cert cache configured, could not store certificate");

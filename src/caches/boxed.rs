@@ -1,4 +1,4 @@
-use crate::{AccountCache, CertCache};
+use crate::{AccountCache, CertCache, CertChainKind};
 use async_trait::async_trait;
 use std::fmt::Debug;
 
@@ -29,9 +29,10 @@ where
         &self,
         domains: &[String],
         directory_url: &str,
+        chain: CertChainKind,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
         self.inner
-            .load_cert(domains, directory_url)
+            .load_cert(domains, directory_url, chain)
             .await
             .map_err(box_err)
     }
@@ -40,31 +41,11 @@ where
         &self,
         domains: &[String],
         directory_url: &str,
+        chain: CertChainKind,
         cert: &[u8],
     ) -> Result<(), Self::EC> {
         self.inner
-            .store_cert(domains, directory_url, cert)
-            .await
-            .map_err(box_err)
-    }
-    async fn load_alt_cert(
-        &self,
-        domains: &[String],
-        directory_url: &str,
-    ) -> Result<Option<Vec<u8>>, Self::EC> {
-        self.inner
-            .load_alt_cert(domains, directory_url)
-            .await
-            .map_err(box_err)
-    }
-    async fn store_alt_cert(
-        &self,
-        domains: &[String],
-        directory_url: &str,
-        cert: &[u8],
-    ) -> Result<(), Self::EC> {
-        self.inner
-            .store_alt_cert(domains, directory_url, cert)
+            .store_cert(domains, directory_url, chain, cert)
             .await
             .map_err(box_err)
     }
