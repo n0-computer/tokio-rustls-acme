@@ -11,6 +11,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
+
 /// Controls which certificate chain to serve to clients.
 ///
 /// ACME servers like Let's Encrypt may offer multiple certificate chains with different root
@@ -19,8 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// # Note
 ///
 /// For [`DualChain`](CertChainPreference::DualChain), chain selection is currently based on the
-/// client's advertised signature schemes. A server-side preference setting may be added in the
-/// future to give operators more control over chain selection logic.
+/// client's advertised signature schemes.
 #[derive(Clone, Debug, Default)]
 pub enum CertChainPreference {
     /// Use the default chain from the ACME server (typically cross-signed for broad compatibility).
@@ -30,21 +31,19 @@ pub enum CertChainPreference {
     /// string. Falls back to the default chain if no matching alternate is found.
     PreferredChain(String),
     /// Serve two chains, selecting per-client based on TLS capabilities. The string specifies the
-    /// alternate chain's root issuer common name. The default ACME chain is used as the primary
-    /// (broad compatibility). Clients whose advertised signature schemes include no RSA schemes
-    /// receive the alternate chain; all others receive the default chain.
+    /// alternate chain's root issuer common name. The default ACME chain is used as the primary.
     DualChain(String),
 }
 
 impl CertChainPreference {
     /// Use Let's Encrypt ISRG Root X2 (ECDSA-only chain, no RSA).
     pub fn letsencrypt_x2() -> Self {
-        Self::PreferredChain("ISRG Root X2".into())
+        Self::PreferredChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
     }
     /// Serve both Let's Encrypt X1 (RSA cross-signed, broad compatibility) and X2 (ECDSA-only)
     /// chains, selecting per-client based on advertised signature schemes.
-    pub fn letsencrypt_x1_x2() -> Self {
-        Self::DualChain("ISRG Root X2".into())
+    pub fn letsencrypt_dual_chain() -> Self {
+        Self::DualChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
     }
 }
 
