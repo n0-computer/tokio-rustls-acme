@@ -116,13 +116,16 @@ struct OrderResult {
     alternate: Option<Vec<u8>>,
 }
 
-/// Extract the subject common name of the last certificate (root) in a PEM chain.
+/// Extract the issuer common name of the last certificate in a PEM chain.
+/// For a typical chain [leaf, intermediate], this returns the CN of whoever
+/// signed the intermediate — i.e. the root CA, which may not be included
+/// in the chain itself.
 fn chain_root_issuer(cert_pem: &str) -> Option<String> {
     let pems = pem::parse_many(cert_pem).ok()?;
     let last_der = pems.last()?.contents().to_vec();
     let (_, cert) = parse_x509_certificate(&last_der).ok()?;
     let cn = cert
-        .subject()
+        .issuer()
         .iter_common_name()
         .next()
         .and_then(|cn| cn.as_str().ok())
