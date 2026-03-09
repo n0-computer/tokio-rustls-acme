@@ -174,6 +174,27 @@ impl Account {
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
+    ) -> Result<CertificateResponse, AcmeError> {
+        let body = sign(
+            &self.key_pair,
+            Some(&self.kid),
+            self.directory.nonce(client_config).await?,
+            url.as_ref(),
+            "",
+        )?;
+        let response = https(client_config, url.as_ref(), Method::Post, Some(body)).await?;
+        let alternate_urls = parse_link_alternate(&response);
+        let pem = response.text().await.map_err(HttpsRequestError::from)?;
+        log::debug!("certificate response: {pem:?}");
+        Ok(CertificateResponse {
+            pem,
+            alternate_urls,
+        })
+    }
+    pub async fn certificate_from_url(
+        &self,
+        client_config: &Arc<ClientConfig>,
+        url: impl AsRef<str>,
     ) -> Result<String, AcmeError> {
         Ok(self.request(client_config, &url, "").await?.1)
     }
@@ -341,6 +362,41 @@ pub enum AcmeError {
     MissingHeader(&'static str),
     #[error("no tls-alpn-01 challenge found")]
     NoTlsAlpn01Challenge,
+}
+
+/// The response from downloading a certificate, including any alternate chain URLs.
+pub struct CertificateResponse {
+    /// The PEM-encoded certificate chain.
+    pub pem: String,
+    /// URLs of alternate certificate chains (from `Link: <url>;rel="alternate"` headers).
+    pub alternate_urls: Vec<String>,
+}
+
+/// Parse `Link` headers for `rel="alternate"` URLs (RFC 8555 Section 7.4.2).
+fn parse_link_alternate(response: &Response) -> Vec<String> {
+    let mut urls = Vec::new();
+    for value in response.headers().get_all("Link").iter() {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        // Handle comma-separated Link values and individual headers.
+        // Format: <https://...>;rel="alternate"
+        for part in value.split(',') {
+            let part = part.trim();
+            if !part.contains("rel=\"alternate\"") {
+                continue;
+            }
+            if let Some(url) = part
+                .split(';')
+                .next()
+                .and_then(|s| s.trim().strip_prefix('<'))
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                urls.push(url.to_string());
+            }
+        }
+    }
+    urls
 }
 
 fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeError> {

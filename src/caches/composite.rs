@@ -39,6 +39,25 @@ impl<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> CertCache for Co
             .store_cert(domains, directory_url, cert)
             .await
     }
+    async fn load_alt_cert(
+        &self,
+        domains: &[String],
+        directory_url: &str,
+    ) -> Result<Option<Vec<u8>>, Self::EC> {
+        self.cert_cache
+            .load_alt_cert(domains, directory_url)
+            .await
+    }
+    async fn store_alt_cert(
+        &self,
+        domains: &[String],
+        directory_url: &str,
+        cert: &[u8],
+    ) -> Result<(), Self::EC> {
+        self.cert_cache
+            .store_alt_cert(domains, directory_url, cert)
+            .await
+    }
 }
 
 #[async_trait]
