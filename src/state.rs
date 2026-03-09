@@ -19,6 +19,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
 use x509_parser::parse_x509_certificate;
 
+struct ParsedCert {
+    certified_key: CertifiedKey,
+    validity: [DateTime<Utc>; 2],
+    signature_schemes: Vec<SignatureScheme>,
+}
+
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
     Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
@@ -239,9 +245,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             wait: None,
         }
     }
-    fn parse_cert(
-        pem: &[u8],
-    ) -> Result<(CertifiedKey, [DateTime<Utc>; 2], Vec<SignatureScheme>), CertParseError> {
+    fn parse_cert(pem: &[u8]) -> Result<ParsedCert, CertParseError> {
         let mut pems = pem::parse_many(pem)?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
@@ -277,12 +281,16 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
         let validity = validity.expect("length checked above");
         let cert = CertifiedKey::new(cert_chain, pk);
-        Ok((cert, validity, required_schemes))
+        Ok(ParsedCert {
+            certified_key: cert,
+            validity,
+            signature_schemes: required_schemes,
+        })
     }
 
     #[allow(clippy::result_large_err)]
     fn process_cert(&mut self, pem: Vec<u8>, cached: bool) -> Event<EC, EA> {
-        let (cert, validity, schemes) = match (Self::parse_cert(&pem), cached) {
+        let parsed = match (Self::parse_cert(&pem), cached) {
             (Ok(r), _) => r,
             (Err(err), cached) => {
                 return match cached {
@@ -291,7 +299,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
             }
         };
-        self.resolver.set_cert(Arc::new(cert), schemes);
+        self.resolver
+            .set_cert(Arc::new(parsed.certified_key), parsed.signature_schemes);
+        let validity = parsed.validity;
         let wait_duration = (validity[1] - (validity[1] - validity[0]) / 3 - Utc::now())
             .max(chrono::Duration::zero())
             .to_std()
@@ -523,9 +533,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 self.load_alt_cert.take();
                 match result {
                     Ok(Some(pem)) => match Self::parse_cert(&pem) {
-                        Ok((alt_cert, _, schemes)) => {
-                            self.resolver
-                                .set_alt_cert(Some((Arc::new(alt_cert), schemes)));
+                        Ok(parsed) => {
+                            self.resolver.set_alt_cert(Some((
+                                Arc::new(parsed.certified_key),
+                                parsed.signature_schemes,
+                            )));
                         }
                         Err(err) => {
                             log::warn!("failed to parse cached alternate cert: {err}");
@@ -559,9 +571,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         // Set alternate cert if present (DualChain mode).
                         if let Some(alt_pem) = &order_result.alternate {
                             match Self::parse_cert(alt_pem) {
-                                Ok((alt_cert, _, schemes)) => {
-                                    self.resolver
-                                        .set_alt_cert(Some((Arc::new(alt_cert), schemes)));
+                                Ok(parsed) => {
+                                    self.resolver.set_alt_cert(Some((
+                                        Arc::new(parsed.certified_key),
+                                        parsed.signature_schemes,
+                                    )));
                                     // Store alt cert in cache.
                                     let alt_pem = alt_pem.clone();
                                     let config = self.config.clone();
