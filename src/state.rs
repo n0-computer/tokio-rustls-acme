@@ -437,10 +437,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         target_issuer: &str,
     ) -> Result<Option<String>, AcmeError> {
         for url in alternate_urls {
-            log::info!("fetching alternate chain from {url}");
+            log::debug!("fetching alternate chain from {url}");
             let alt_pem = account.certificate(client_config, url).await?;
             if let Some(issuer) = chain_root_issuer(&alt_pem) {
-                log::info!("alternate chain root issuer: '{issuer}'");
+                log::debug!("alternate chain root issuer: '{issuer}'");
                 if issuer == target_issuer {
                     return Ok(Some(alt_pem));
                 }
