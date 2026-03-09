@@ -13,7 +13,7 @@ use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDS
 use rustls::crypto::ring::sign::any_ecdsa_type;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
-use rustls::ServerConfig;
+use rustls::{ServerConfig, SignatureScheme};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
@@ -124,6 +124,33 @@ fn chain_root_issuer(cert_pem: &str) -> Option<String> {
     cn
 }
 
+/// Map an X.509 signature algorithm OID to the corresponding rustls SignatureScheme.
+fn sig_oid_to_scheme(oid: &x509_parser::asn1_rs::Oid) -> Option<SignatureScheme> {
+    use x509_parser::oid_registry::*;
+
+    if *oid == OID_PKCS1_SHA256WITHRSA {
+        Some(SignatureScheme::RSA_PKCS1_SHA256)
+    } else if *oid == OID_PKCS1_SHA384WITHRSA {
+        Some(SignatureScheme::RSA_PKCS1_SHA384)
+    } else if *oid == OID_PKCS1_SHA512WITHRSA {
+        Some(SignatureScheme::RSA_PKCS1_SHA512)
+    } else if *oid == OID_PKCS1_RSASSAPSS {
+        Some(SignatureScheme::RSA_PSS_SHA256)
+    } else if *oid == OID_SIG_ECDSA_WITH_SHA256 {
+        Some(SignatureScheme::ECDSA_NISTP256_SHA256)
+    } else if *oid == OID_SIG_ECDSA_WITH_SHA384 {
+        Some(SignatureScheme::ECDSA_NISTP384_SHA384)
+    } else if *oid == OID_SIG_ECDSA_WITH_SHA512 {
+        Some(SignatureScheme::ECDSA_NISTP521_SHA512)
+    } else if *oid == OID_SIG_ED25519 {
+        Some(SignatureScheme::ED25519)
+    } else if *oid == OID_SIG_ED448 {
+        Some(SignatureScheme::ED448)
+    } else {
+        None
+    }
+}
+
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     pub fn incoming<
         TCP: AsyncRead + AsyncWrite + Unpin,
@@ -212,7 +239,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             wait: None,
         }
     }
-    fn parse_cert(pem: &[u8]) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertParseError> {
+    fn parse_cert(
+        pem: &[u8],
+    ) -> Result<(CertifiedKey, [DateTime<Utc>; 2], Vec<SignatureScheme>), CertParseError> {
         let mut pems = pem::parse_many(pem)?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
@@ -226,21 +255,33 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         };
         let cert_chain: Vec<RustlsCertificate> =
             pems.into_iter().map(|p| p.into_contents().into()).collect();
-        let validity = match parse_x509_certificate(cert_chain[0].as_ref()) {
-            Ok((_, cert)) => {
-                let validity = cert.validity();
-                [validity.not_before, validity.not_after]
-                    .map(|t| Utc.timestamp_opt(t.timestamp(), 0).earliest().unwrap())
+
+        let mut validity = None;
+        let mut required_schemes = Vec::new();
+        for (i, der) in cert_chain.iter().enumerate() {
+            let (_, cert) = parse_x509_certificate(der.as_ref())
+                .map_err(CertParseError::X509)?;
+            if i == 0 {
+                let v = cert.validity();
+                validity = Some(
+                    [v.not_before, v.not_after]
+                        .map(|t| Utc.timestamp_opt(t.timestamp(), 0).earliest().unwrap()),
+                );
             }
-            Err(err) => return Err(CertParseError::X509(err)),
-        };
+            if let Some(scheme) = sig_oid_to_scheme(&cert.signature_algorithm.algorithm) {
+                if !required_schemes.contains(&scheme) {
+                    required_schemes.push(scheme);
+                }
+            }
+        }
+
         let cert = CertifiedKey::new(cert_chain, pk);
-        Ok((cert, validity))
+        Ok((cert, validity.unwrap(), required_schemes))
     }
 
     #[allow(clippy::result_large_err)]
     fn process_cert(&mut self, pem: Vec<u8>, cached: bool) -> Event<EC, EA> {
-        let (cert, validity) = match (Self::parse_cert(&pem), cached) {
+        let (cert, validity, schemes) = match (Self::parse_cert(&pem), cached) {
             (Ok(r), _) => r,
             (Err(err), cached) => {
                 return match cached {
@@ -249,7 +290,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
             }
         };
-        self.resolver.set_cert(Arc::new(cert));
+        self.resolver.set_cert(Arc::new(cert), schemes);
         let wait_duration = (validity[1] - (validity[1] - validity[0]) / 3 - Utc::now())
             .max(chrono::Duration::zero())
             .to_std()
@@ -366,7 +407,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         }
 
                         // Serve two chains: the default as primary, and an alternate
-                        // matching `issuer` for clients that don't support RSA.
+                        // matching `issuer` for clients whose signature schemes differ.
                         CertChainPreference::DualChain(issuer) => {
                             let alternate = Self::fetch_chain_by_issuer(
                                 &account,
@@ -481,8 +522,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 self.load_alt_cert.take();
                 match result {
                     Ok(Some(pem)) => match Self::parse_cert(&pem) {
-                        Ok((alt_cert, _)) => {
-                            self.resolver.set_alt_cert(Some(Arc::new(alt_cert)));
+                        Ok((alt_cert, _, schemes)) => {
+                            self.resolver
+                                .set_alt_cert(Some((Arc::new(alt_cert), schemes)));
                         }
                         Err(err) => {
                             log::warn!("failed to parse cached alternate cert: {err}");
@@ -516,8 +558,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         // Set alternate cert if present (DualChain mode).
                         if let Some(alt_pem) = &order_result.alternate {
                             match Self::parse_cert(alt_pem) {
-                                Ok((alt_cert, _)) => {
-                                    self.resolver.set_alt_cert(Some(Arc::new(alt_cert)));
+                                Ok((alt_cert, _, schemes)) => {
+                                    self.resolver
+                                        .set_alt_cert(Some((Arc::new(alt_cert), schemes)));
                                     // Store alt cert in cache.
                                     let alt_pem = alt_pem.clone();
                                     let config = self.config.clone();

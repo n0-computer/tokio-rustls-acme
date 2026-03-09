@@ -12,11 +12,18 @@ pub struct ResolvesServerCertAcme {
 }
 
 #[derive(Debug)]
+struct CertWithSchemes {
+    key: Arc<CertifiedKey>,
+    /// Signature schemes required to verify this certificate chain.
+    required_schemes: Vec<SignatureScheme>,
+}
+
+#[derive(Debug)]
 struct Inner {
-    cert: Option<Arc<CertifiedKey>>,
-    /// Alternate certificate chain for DualChain mode. When set, clients that advertise
-    /// no RSA signature schemes receive this chain instead of the primary.
-    alt_cert: Option<Arc<CertifiedKey>>,
+    cert: Option<CertWithSchemes>,
+    /// Alternate certificate chain for DualChain mode. Served to clients that
+    /// cannot verify the primary chain but can verify this one.
+    alt_cert: Option<CertWithSchemes>,
     auth_keys: BTreeMap<String, Arc<CertifiedKey>>,
 }
 
@@ -30,31 +37,30 @@ impl ResolvesServerCertAcme {
             }),
         })
     }
-    pub(crate) fn set_cert(&self, cert: Arc<CertifiedKey>) {
-        self.inner.lock().unwrap().cert = Some(cert);
+    pub(crate) fn set_cert(
+        &self,
+        cert: Arc<CertifiedKey>,
+        required_schemes: Vec<SignatureScheme>,
+    ) {
+        self.inner.lock().unwrap().cert = Some(CertWithSchemes {
+            key: cert,
+            required_schemes,
+        });
     }
-    pub(crate) fn set_alt_cert(&self, cert: Option<Arc<CertifiedKey>>) {
-        self.inner.lock().unwrap().alt_cert = cert;
+    pub(crate) fn set_alt_cert(
+        &self,
+        cert: Option<(Arc<CertifiedKey>, Vec<SignatureScheme>)>,
+    ) {
+        self.inner.lock().unwrap().alt_cert = cert.map(|(key, required_schemes)| {
+            CertWithSchemes {
+                key,
+                required_schemes,
+            }
+        });
     }
     pub(crate) fn set_auth_key(&self, domain: String, cert: Arc<CertifiedKey>) {
         self.inner.lock().unwrap().auth_keys.insert(domain, cert);
     }
-}
-
-/// Returns true if the client's signature schemes include any RSA-based scheme.
-fn client_supports_rsa(client_hello: &ClientHello) -> bool {
-    client_hello.signature_schemes().iter().any(|s| {
-        matches!(
-            s,
-            SignatureScheme::RSA_PKCS1_SHA256
-                | SignatureScheme::RSA_PKCS1_SHA384
-                | SignatureScheme::RSA_PKCS1_SHA512
-                | SignatureScheme::RSA_PSS_SHA256
-                | SignatureScheme::RSA_PSS_SHA384
-                | SignatureScheme::RSA_PSS_SHA512
-                | SignatureScheme::RSA_PKCS1_SHA1
-        )
-    })
 }
 
 impl ResolvesServerCert for ResolvesServerCertAcme {
@@ -78,14 +84,27 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
             }
         } else {
             let inner = self.inner.lock().unwrap();
-            // In DualChain mode: serve the alternate (e.g. ECDSA-only) chain to clients
-            // that don't support RSA, and the default (e.g. RSA cross-signed) chain otherwise.
-            if let Some(alt_cert) = &inner.alt_cert {
-                if !client_supports_rsa(&client_hello) {
-                    return Some(alt_cert.clone());
+            let client_schemes = client_hello.signature_schemes();
+
+            // In DualChain mode: if the client can't verify the primary chain
+            // but can verify the alternate, serve the alternate.
+            if let (Some(primary), Some(alt)) = (&inner.cert, &inner.alt_cert) {
+                let supports_primary = primary
+                    .required_schemes
+                    .iter()
+                    .any(|s| client_schemes.contains(s));
+                if !supports_primary {
+                    let supports_alt = alt
+                        .required_schemes
+                        .iter()
+                        .any(|s| client_schemes.contains(s));
+                    if supports_alt {
+                        return Some(alt.key.clone());
+                    }
                 }
             }
-            inner.cert.clone()
+
+            inner.cert.as_ref().map(|c| c.key.clone())
         }
     }
 }
