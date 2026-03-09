@@ -126,7 +126,10 @@ impl Account {
         client_config: &Arc<ClientConfig>,
         domains: Vec<String>,
     ) -> Result<(String, Order), AcmeError> {
-        let domains: Vec<Identifier> = domains.into_iter().map(Identifier::from_str).collect();
+        let domains: Vec<Identifier> = domains
+            .into_iter()
+            .map(Identifier::parse_from_str)
+            .collect();
         let payload = format!("{{\"identifiers\":{}}}", serde_json::to_string(&domains)?);
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
@@ -309,7 +312,7 @@ pub enum Identifier {
 
 impl Identifier {
     /// Auto-detect whether the string is an IP address or DNS name.
-    pub fn from_str(s: impl Into<String>) -> Self {
+    pub fn parse_from_str(s: impl Into<String>) -> Self {
         let s = s.into();
         if s.parse::<std::net::IpAddr>().is_ok() {
             Identifier::Ip(s)
