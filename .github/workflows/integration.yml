@@ -2,14 +2,15 @@ name: integration
 
 on:
   pull_request:
-  workflow_dispatch:
-
-concurrency:
-  group: integration-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  push:
+    branches:
+      - main
 
 env:
   RUST_BACKTRACE: 1
+  RUSTFLAGS: -Dwarnings
+  SCCACHE_GHA_ENABLED: "on"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   pebble:
@@ -17,6 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-make
         run: cargo install cargo-make
       - name: Run integration tests
