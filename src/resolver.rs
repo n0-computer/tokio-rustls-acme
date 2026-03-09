@@ -99,3 +99,160 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::caches::TestCache;
+    use crate::CertCache;
+    use rustls::crypto::ring::sign::any_ecdsa_type;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use std::convert::{Infallible, TryFrom};
+
+    /// Parse TestCache PEM output into a CertifiedKey + cert chain DER.
+    async fn make_cert(
+        cache: &TestCache<Infallible, Infallible>,
+    ) -> (Arc<CertifiedKey>, Vec<CertificateDer<'static>>) {
+        let pem_bytes = cache
+            .load_cert(
+                &["test.example.com".to_string()],
+                "",
+                crate::CertChainKind::Default,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut pems = pem::parse_many(&pem_bytes).unwrap();
+        let pk_bytes = pems.remove(0).into_contents();
+        let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
+        let pk: PrivateKeyDer = pk_der.into();
+        let pk = any_ecdsa_type(&pk).unwrap();
+        let cert_chain: Vec<CertificateDer<'static>> = pems
+            .into_iter()
+            .map(|p| CertificateDer::from(p.into_contents()))
+            .collect();
+        let key = Arc::new(CertifiedKey::new(cert_chain.clone(), pk));
+        (key, cert_chain)
+    }
+
+    fn make_root_store(ca_pem: &str) -> rustls::RootCertStore {
+        let ca_pems = pem::parse_many(ca_pem).unwrap();
+        let mut root_store = rustls::RootCertStore::empty();
+        for p in ca_pems {
+            root_store
+                .add(CertificateDer::from(p.into_contents()))
+                .unwrap();
+        }
+        root_store
+    }
+
+    /// Helper: do an in-process TLS handshake and return the peer certs served.
+    async fn do_handshake(
+        resolver: Arc<ResolvesServerCertAcme>,
+        root_store: rustls::RootCertStore,
+    ) -> Vec<CertificateDer<'static>> {
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(resolver),
+        );
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server_name = ServerName::try_from("test.example.com")
+            .unwrap()
+            .to_owned();
+
+        let (client_result, server_result) = tokio::join!(
+            connector.connect(server_name, client_io),
+            acceptor.accept(server_io),
+        );
+
+        let _ = server_result.expect("TLS server handshake failed");
+        let client_tls = client_result.expect("TLS client handshake failed");
+        let (_, conn) = client_tls.get_ref();
+        conn.peer_certificates().unwrap().to_vec()
+    }
+
+    /// When the client doesn't support the primary chain's signature schemes,
+    /// the resolver should fall back to the alternate chain.
+    ///
+    /// We simulate this by setting the primary's required_schemes to ED448,
+    /// which ring-based clients don't advertise support for.
+    #[tokio::test]
+    async fn dual_chain_fallback_to_alt() {
+        let cache = TestCache::<Infallible, Infallible>::new();
+        let (primary_key, _) = make_cert(&cache).await;
+        let (alt_key, alt_chain) = make_cert(&cache).await;
+
+        let resolver = ResolvesServerCertAcme::new();
+        // Primary requires ED448 (not supported by ring clients).
+        resolver.set_cert(primary_key, vec![SignatureScheme::ED448]);
+        // Alt requires ECDSA P-256 (supported by ring clients).
+        resolver.set_alt_cert(Some((
+            alt_key,
+            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
+        )));
+
+        let root_store = make_root_store(cache.ca_pem());
+        let peer_certs = do_handshake(resolver, root_store).await;
+
+        assert_eq!(
+            peer_certs[0], alt_chain[0],
+            "should serve alt cert when client doesn't support primary's schemes"
+        );
+    }
+
+    /// When the client supports the primary chain's signature schemes,
+    /// the resolver should serve the primary chain even if alt is available.
+    #[tokio::test]
+    async fn dual_chain_serves_primary_when_supported() {
+        let cache = TestCache::<Infallible, Infallible>::new();
+        let (primary_key, primary_chain) = make_cert(&cache).await;
+        let (alt_key, _) = make_cert(&cache).await;
+
+        let resolver = ResolvesServerCertAcme::new();
+        // Primary requires ECDSA P-256 (supported by ring clients).
+        resolver.set_cert(
+            primary_key,
+            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
+        );
+        resolver.set_alt_cert(Some((
+            alt_key,
+            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
+        )));
+
+        let root_store = make_root_store(cache.ca_pem());
+        let peer_certs = do_handshake(resolver, root_store).await;
+
+        assert_eq!(
+            peer_certs[0], primary_chain[0],
+            "should serve primary cert when client supports its schemes"
+        );
+    }
+
+    /// Without DualChain (no alt cert set), the primary is always served.
+    #[tokio::test]
+    async fn single_chain_serves_primary() {
+        let cache = TestCache::<Infallible, Infallible>::new();
+        let (primary_key, primary_chain) = make_cert(&cache).await;
+
+        let resolver = ResolvesServerCertAcme::new();
+        resolver.set_cert(
+            primary_key,
+            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
+        );
+
+        let root_store = make_root_store(cache.ca_pem());
+        let peer_certs = do_handshake(resolver, root_store).await;
+
+        assert_eq!(peer_certs[0], primary_chain[0]);
+    }
+}
