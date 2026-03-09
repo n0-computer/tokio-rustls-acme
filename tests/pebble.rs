@@ -9,7 +9,7 @@
 //!
 //! Run with: `cargo test --test pebble -- --ignored`
 
-use std::{convert::TryFrom, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{convert::TryFrom, io, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use rustls::{
@@ -508,4 +508,148 @@ async fn test_multi_domain_san() {
         );
     }
     eprintln!("multi-domain SANs: {sans:?}");
+}
+
+const TEST_IP: &str = "10.30.50.1";
+
+/// Helper: run ACME state machine for given identifiers until cert is deployed.
+async fn acquire_cert_for(
+    client_config: Arc<ClientConfig>,
+    identifiers: &[&str],
+) -> Arc<ResolvesServerCertAcme> {
+    let config: AcmeConfig<io::Error> =
+        AcmeConfig::new_with_client_tls_config(identifiers, client_config)
+            .directory(PEBBLE_DIRECTORY)
+            .cache(NoCache::new());
+
+    let mut state = config.state();
+    let resolver = state.resolver();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match state.next().await {
+                Some(Ok(EventOk::DeployedNewCert)) => return,
+                Some(Ok(_)) => {}
+                Some(Err(err)) => panic!("ACME error: {:?}", err),
+                None => panic!("state stream ended unexpectedly"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for certificate deployment");
+
+    resolver
+}
+
+/// Do an in-process TLS handshake using an IP address as the server name.
+async fn verify_tls_handshake_ip(
+    resolver: Arc<ResolvesServerCertAcme>,
+    root_store: RootCertStore,
+    ip: IpAddr,
+) -> Vec<CertificateDer<'static>> {
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver),
+    );
+    let acceptor = TlsAcceptor::from(server_config);
+
+    let client_config = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    );
+    let connector = tokio_rustls::TlsConnector::from(client_config);
+
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let server_name = ServerName::from(ip);
+
+    let (client_result, server_result) = tokio::join!(
+        connector.connect(server_name, client_io),
+        acceptor.accept(server_io),
+    );
+
+    let _ = server_result.expect("TLS server handshake failed");
+    let client_tls = client_result.expect("TLS client handshake failed");
+    let (_, conn) = client_tls.get_ref();
+    conn.peer_certificates()
+        .expect("no peer certificates")
+        .to_vec()
+}
+
+/// Issue a certificate for an IP address and verify TLS works with an IP SAN.
+#[tokio::test]
+#[ignore]
+async fn test_ip_certificate() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let client_config = pebble_client_config();
+    let resolver = acquire_cert_for(client_config, &[TEST_IP]).await;
+
+    let root_store = pebble_acme_root_store().await;
+    let ip: IpAddr = TEST_IP.parse().unwrap();
+    let peer_certs = verify_tls_handshake_ip(resolver, root_store, ip).await;
+    assert!(!peer_certs.is_empty(), "should have received certificates");
+
+    // Verify the leaf certificate contains an IP SAN.
+    let (_, leaf) = x509_parser::parse_x509_certificate(peer_certs[0].as_ref()).unwrap();
+    let san = leaf
+        .subject_alternative_name()
+        .expect("SAN extension missing")
+        .expect("SAN extension empty");
+    let has_ip = san
+        .value
+        .general_names
+        .iter()
+        .any(|name| matches!(name, x509_parser::extensions::GeneralName::IPAddress(_)));
+    assert!(has_ip, "certificate should contain an IP SAN");
+    eprintln!("IP certificate issued successfully for {TEST_IP}");
+}
+
+/// Issue a certificate with both IP and DNS identifiers in a single order.
+#[tokio::test]
+#[ignore]
+async fn test_mixed_ip_and_domain() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let mixed_ip = "10.30.50.2";
+    let mixed_domain = "mixed.example.com";
+
+    let client_config = pebble_client_config();
+    let resolver = acquire_cert_for(client_config, &[mixed_ip, mixed_domain]).await;
+
+    let root_store = pebble_acme_root_store().await;
+
+    // Verify TLS handshake using the IP address.
+    let ip: IpAddr = mixed_ip.parse().unwrap();
+    let peer_certs = verify_tls_handshake_ip(resolver.clone(), root_store, ip).await;
+    assert!(!peer_certs.is_empty());
+
+    // Verify TLS handshake using the domain name.
+    let root_store = pebble_acme_root_store().await;
+    let peer_certs = verify_tls_handshake_for(resolver, root_store, mixed_domain).await;
+    assert!(!peer_certs.is_empty());
+
+    // Parse leaf and check both SAN types are present.
+    let (_, leaf) = x509_parser::parse_x509_certificate(peer_certs[0].as_ref()).unwrap();
+    let san = leaf
+        .subject_alternative_name()
+        .expect("SAN extension missing")
+        .expect("SAN extension empty");
+
+    let has_ip = san
+        .value
+        .general_names
+        .iter()
+        .any(|name| matches!(name, x509_parser::extensions::GeneralName::IPAddress(_)));
+    let has_dns = san.value.general_names.iter().any(|name| {
+        matches!(name, x509_parser::extensions::GeneralName::DNSName(d) if *d == mixed_domain)
+    });
+    assert!(has_ip, "certificate should contain an IP SAN");
+    assert!(
+        has_dns,
+        "certificate should contain a DNS SAN for {}",
+        mixed_domain
+    );
+    eprintln!("mixed IP+domain certificate issued successfully");
 }

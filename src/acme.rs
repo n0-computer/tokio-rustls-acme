@@ -126,7 +126,7 @@ impl Account {
         client_config: &Arc<ClientConfig>,
         domains: Vec<String>,
     ) -> Result<(String, Order), AcmeError> {
-        let domains: Vec<Identifier> = domains.into_iter().map(Identifier::Dns).collect();
+        let domains: Vec<Identifier> = domains.into_iter().map(Identifier::from_str).collect();
         let payload = format!("{{\"identifiers\":{}}}", serde_json::to_string(&domains)?);
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
@@ -296,10 +296,33 @@ pub enum AuthStatus {
     Deactivated,
 }
 
+/// ACME identifier per RFC 8555 §9.7.7.
+///
+/// Serializes as `{"type":"dns","value":"..."}` or `{"type":"ip","value":"..."}`.
+/// IP identifier support is defined in RFC 8738.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 pub enum Identifier {
     Dns(String),
+    Ip(String),
+}
+
+impl Identifier {
+    /// Auto-detect whether the string is an IP address or DNS name.
+    pub fn from_str(s: impl Into<String>) -> Self {
+        let s = s.into();
+        if s.parse::<std::net::IpAddr>().is_ok() {
+            Identifier::Ip(s)
+        } else {
+            Identifier::Dns(s)
+        }
+    }
+    /// Extract the inner value regardless of variant.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Identifier::Dns(v) | Identifier::Ip(v) => v,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
