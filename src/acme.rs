@@ -190,7 +190,7 @@ impl Account {
             alternate_urls,
         })
     }
-    pub async fn certificate_from_url(
+    pub async fn certificate(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
