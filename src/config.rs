@@ -11,6 +11,42 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
+
+/// Controls which certificate chain to serve to clients.
+///
+/// ACME servers like Let's Encrypt may offer multiple certificate chains with different root
+/// certificates. This enum allows selecting which chain(s) to use.
+///
+/// # Note
+///
+/// For [`DualChain`](CertChainPreference::DualChain), chain selection is currently based on the
+/// client's advertised signature schemes.
+#[derive(Clone, Debug, Default)]
+pub enum CertChainPreference {
+    /// Use the default chain from the ACME server (typically cross-signed for broad compatibility).
+    #[default]
+    Default,
+    /// Prefer an alternate chain whose root certificate's subject common name matches the given
+    /// string. Falls back to the default chain if no matching alternate is found.
+    PreferredChain(String),
+    /// Serve two chains, selecting per-client based on TLS capabilities. The string specifies the
+    /// alternate chain's root issuer common name. The default ACME chain is used as the primary.
+    DualChain(String),
+}
+
+impl CertChainPreference {
+    /// Use Let's Encrypt ISRG Root X2 (ECDSA-only chain, no RSA).
+    pub fn letsencrypt_x2() -> Self {
+        Self::PreferredChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
+    }
+    /// Serve both Let's Encrypt X1 (RSA cross-signed, broad compatibility) and X2 (ECDSA-only)
+    /// chains, selecting per-client based on advertised signature schemes.
+    pub fn letsencrypt_dual_chain() -> Self {
+        Self::DualChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
+    }
+}
+
 /// Configuration for an ACME resolver.
 ///
 /// The type parameters represent the error types for the certificate cache and account cache.
@@ -21,6 +57,7 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
+    pub(crate) cert_chain: CertChainPreference,
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -79,6 +116,7 @@ impl AcmeConfig<Infallible, Infallible> {
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
+            cert_chain: CertChainPreference::Default,
         }
     }
 }
@@ -131,6 +169,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
+    /// Set the certificate chain preference. See [`CertChainPreference`] for details.
+    pub fn cert_chain(mut self, preference: CertChainPreference) -> Self {
+        self.cert_chain = preference;
+        self
+    }
     pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> {
         AcmeConfig {
             client_config: self.client_config,
@@ -139,6 +182,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             contact: self.contact,
             cache: Box::new(cache),
             eab: self.eab,
+            cert_chain: self.cert_chain,
         }
     }
     pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(

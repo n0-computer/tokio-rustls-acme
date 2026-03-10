@@ -1,4 +1,4 @@
-use crate::{AccountCache, CertCache};
+use crate::{AccountCache, CertCache, CertChainKind};
 use async_trait::async_trait;
 
 pub struct CompositeCache<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> {
@@ -25,18 +25,22 @@ impl<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> CertCache for Co
         &self,
         domains: &[String],
         directory_url: &str,
+        chain: CertChainKind,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
-        self.cert_cache.load_cert(domains, directory_url).await
+        self.cert_cache
+            .load_cert(domains, directory_url, chain)
+            .await
     }
 
     async fn store_cert(
         &self,
         domains: &[String],
         directory_url: &str,
+        chain: CertChainKind,
         cert: &[u8],
     ) -> Result<(), Self::EC> {
         self.cert_cache
-            .store_cert(domains, directory_url, cert)
+            .store_cert(domains, directory_url, chain, cert)
             .await
     }
 }

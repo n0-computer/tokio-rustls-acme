@@ -1,4 +1,4 @@
-use crate::{AccountCache, CertCache};
+use crate::{AccountCache, CertCache, CertChainKind};
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -48,7 +48,11 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
         let hash = URL_SAFE_NO_PAD.encode(ctx.finish());
         format!("cached_account_{hash}")
     }
-    fn cached_cert_file_name(domains: &[String], directory_url: impl AsRef<str>) -> String {
+    fn cached_cert_file_name(
+        domains: &[String],
+        directory_url: impl AsRef<str>,
+        chain: CertChainKind,
+    ) -> String {
         let mut ctx = Context::new(&SHA256);
         for domain in domains {
             ctx.update(domain.as_ref());
@@ -56,7 +60,10 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
         }
         ctx.update(directory_url.as_ref().as_bytes());
         let hash = URL_SAFE_NO_PAD.encode(ctx.finish());
-        format!("cached_cert_{hash}")
+        match chain {
+            CertChainKind::Default => format!("cached_cert_{hash}"),
+            CertChainKind::Alternate => format!("cached_cert_{hash}_alt"),
+        }
     }
 }
 
@@ -67,17 +74,19 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         &self,
         domains: &[String],
         directory_url: &str,
+        chain: CertChainKind,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
-        let file_name = Self::cached_cert_file_name(domains, directory_url);
+        let file_name = Self::cached_cert_file_name(domains, directory_url, chain);
         self.read_if_exist(file_name).await
     }
     async fn store_cert(
         &self,
         domains: &[String],
         directory_url: &str,
+        chain: CertChainKind,
         cert: &[u8],
     ) -> Result<(), Self::EC> {
-        let file_name = Self::cached_cert_file_name(domains, directory_url);
+        let file_name = Self::cached_cert_file_name(domains, directory_url, chain);
         self.write(file_name, cert).await
     }
 }

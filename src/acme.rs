@@ -5,6 +5,7 @@ use crate::jose::{key_authorization_sha256, sign, sign_eab, JoseError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rcgen::{CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
+use reqwest::header::HeaderMap;
 use ring::error::{KeyRejected, Unspecified};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, ECDSA_P256_SHA256_FIXED_SIGNING};
@@ -107,7 +108,7 @@ impl Account {
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
         payload: &str,
-    ) -> Result<(Option<String>, String), AcmeError> {
+    ) -> Result<ApiResponse, AcmeError> {
         let body = sign(
             &self.key_pair,
             Some(&self.kid),
@@ -117,9 +118,14 @@ impl Account {
         )?;
         let response = https(client_config, url.as_ref(), Method::Post, Some(body)).await?;
         let location = get_header(&response, "Location").ok();
+        let headers = response.headers().clone();
         let body = response.text().await.map_err(HttpsRequestError::from)?;
         log::debug!("response: {body:?}");
-        Ok((location, body))
+        Ok(ApiResponse {
+            body,
+            location,
+            headers,
+        })
     }
     pub async fn new_order(
         &self,
@@ -131,8 +137,10 @@ impl Account {
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
             .await?;
-        let url = response.0.ok_or(AcmeError::MissingHeader("Location"))?;
-        let order = serde_json::from_str(&response.1)?;
+        let url = response
+            .location
+            .ok_or(AcmeError::MissingHeader("Location"))?;
+        let order = serde_json::from_str(&response.body)?;
         Ok((url, order))
     }
     pub async fn auth(
@@ -142,7 +150,7 @@ impl Account {
     ) -> Result<Auth, AcmeError> {
         let payload = "".to_string();
         let response = self.request(client_config, url, &payload).await?;
-        Ok(serde_json::from_str(&response.1)?)
+        Ok(serde_json::from_str(&response.body)?)
     }
     pub async fn challenge(
         &self,
@@ -158,7 +166,7 @@ impl Account {
         url: impl AsRef<str>,
     ) -> Result<Order, AcmeError> {
         let response = self.request(client_config, &url, "").await?;
-        Ok(serde_json::from_str(&response.1)?)
+        Ok(serde_json::from_str(&response.body)?)
     }
     pub async fn finalize(
         &self,
@@ -168,14 +176,26 @@ impl Account {
     ) -> Result<Order, AcmeError> {
         let payload = format!("{{\"csr\":\"{}\"}}", URL_SAFE_NO_PAD.encode(csr),);
         let response = self.request(client_config, &url, &payload).await?;
-        Ok(serde_json::from_str(&response.1)?)
+        Ok(serde_json::from_str(&response.body)?)
+    }
+    pub async fn certificate_with_alternate_urls(
+        &self,
+        client_config: &Arc<ClientConfig>,
+        url: impl AsRef<str>,
+    ) -> Result<CertificateWithAlternateUrls, AcmeError> {
+        let response = self.request(client_config, url, "").await?;
+        let alternate_urls = parse_link_alternate(&response.headers);
+        Ok(CertificateWithAlternateUrls {
+            pem: response.body,
+            alternate_urls,
+        })
     }
     pub async fn certificate(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<String, AcmeError> {
-        Ok(self.request(client_config, &url, "").await?.1)
+        Ok(self.request(client_config, &url, "").await?.body)
     }
     pub fn tls_alpn_01<'a>(
         &self,
@@ -341,6 +361,47 @@ pub enum AcmeError {
     MissingHeader(&'static str),
     #[error("no tls-alpn-01 challenge found")]
     NoTlsAlpn01Challenge,
+}
+
+struct ApiResponse {
+    body: String,
+    location: Option<String>,
+    headers: HeaderMap,
+}
+
+/// The response from downloading a certificate, including any alternate chain URLs.
+pub struct CertificateWithAlternateUrls {
+    /// The PEM-encoded certificate chain.
+    pub pem: String,
+    /// URLs of alternate certificate chains (from `Link: <url>;rel="alternate"` headers).
+    pub alternate_urls: Vec<String>,
+}
+
+/// Parse `Link` headers for `rel="alternate"` URLs (RFC 8555 Section 7.4.2).
+fn parse_link_alternate(headers: &HeaderMap) -> Vec<String> {
+    let mut urls = Vec::new();
+    for value in headers.get_all("Link").iter() {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        // Handle comma-separated Link values and individual headers.
+        // Format: <https://...>;rel="alternate"
+        for part in value.split(',') {
+            let part = part.trim();
+            if !part.contains("rel=\"alternate\"") {
+                continue;
+            }
+            if let Some(url) = part
+                .split(';')
+                .next()
+                .and_then(|s| s.trim().strip_prefix('<'))
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                urls.push(url.to_string());
+            }
+        }
+    }
+    urls
 }
 
 fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeError> {
