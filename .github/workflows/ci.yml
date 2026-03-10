@@ -2,11 +2,9 @@ name: tests
 
 on:
   pull_request:
-
-
-concurrency:
-  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  push:
+    branches:
+      - main
 
 env:
   MSRV: "1.63"

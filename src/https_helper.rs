@@ -29,6 +29,7 @@ pub(crate) async fn https(
     let method: reqwest::Method = method.into();
     let client = reqwest::ClientBuilder::new()
         .use_preconfigured_tls(client_config.clone())
+        .user_agent(concat!("tokio-rustls-acme/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let mut request = client.request(method, url.as_ref());
     if let Some(body) = body {
