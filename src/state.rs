@@ -20,9 +20,7 @@ use tokio::time::Sleep;
 use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
-use crate::acme::{
-    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
-};
+use crate::acme::{Account, AcmeError, Auth, AuthStatus, Directory, Order, OrderStatus};
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
 type Timer = std::pin::Pin<Box<Sleep>>;
@@ -310,7 +308,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let auth = account.auth(&config.client_config, url).await?;
         let (domain, challenge_url) = match auth.status {
             AuthStatus::Pending => {
-                let Identifier::Dns(domain) = auth.identifier;
+                let domain = auth.identifier.as_str().to_string();
                 log::info!("trigger challenge for {}", &domain);
                 let (challenge, auth_key) =
                     account.tls_alpn_01(&auth.challenges, domain.clone())?;
