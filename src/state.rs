@@ -11,6 +11,7 @@ use futures::future::try_join_all;
 use futures::{FutureExt, Stream, ready};
 use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
 use rustls::ServerConfig;
+use rustls::crypto::CryptoProvider;
 use rustls::crypto::ring::sign::any_ecdsa_type;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
@@ -131,6 +132,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
     pub fn acceptor(&self) -> AcmeAcceptor {
         AcmeAcceptor::new(self.resolver())
+    }
+
+    pub fn acceptor_with_crypto_provider(
+        &self,
+        crypto_provider: Arc<CryptoProvider>,
+    ) -> AcmeAcceptor {
+        AcmeAcceptor::new_with_crypto_provider(self.resolver(), crypto_provider)
     }
 
     #[cfg(feature = "axum")]
