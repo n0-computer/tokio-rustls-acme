@@ -13,6 +13,12 @@
 //!
 //! ## Crypto provider
 //!
+//! The crate uses one [`rustls::crypto::CryptoProvider`] end-to-end: for
+//! the HTTPS client, the TLS handshake, and key parsing. It is taken from
+//! the [`rustls::ClientConfig`] passed to [`AcmeConfig`] (or built from
+//! the chosen crate feature when [`AcmeConfig::new`] is used). The crate
+//! never reads or installs the process-wide default provider.
+//!
 //! The default `tls-ring` feature selects [ring] as rustls's crypto
 //! backend. To use [aws-lc-rs] instead, disable default features and
 //! enable `tls-aws-lc-rs`:
@@ -21,11 +27,10 @@
 //! tokio-rustls-acme = { version = "*", default-features = false, features = ["tls-aws-lc-rs", "tls-webpki-roots"] }
 //! ```
 //!
-//! Both features can be enabled together; in that case rustls has no
-//! auto-installable default and the caller must either install one with
-//! [`rustls::crypto::CryptoProvider::install_default`] or pass it via
-//! [`AcmeConfig::crypto_provider`]. The same applies when neither feature
-//! is enabled.
+//! With both features (or neither) enabled, [`AcmeConfig::new`] panics
+//! because the provider is ambiguous; use
+//! [`AcmeConfig::new_with_crypto_provider`] or
+//! [`AcmeConfig::new_with_client_tls_config`] to pick one explicitly.
 //!
 //! To use tokio-rustls-acme add the following lines to your `Cargo.toml`:
 //!

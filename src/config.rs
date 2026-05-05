@@ -28,13 +28,14 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
 }
 
 impl AcmeConfig<Infallible, Infallible> {
-    /// Creates a new [AcmeConfig] instance.
+    /// Creates an [`AcmeConfig`] backed by webpki-roots trust anchors.
     ///
-    /// The new [AcmeConfig] instance will initially have no cache, and its type parameters for
-    /// error types will be `Infallible` since the cache cannot return an error. The methods to set
-    /// a cache will change the error types to match those returned by the supplied cache.
+    /// Uses the [`CryptoProvider`] selected by the enabled crate feature
+    /// (`tls-ring` or `tls-aws-lc-rs`). When both or neither feature is
+    /// enabled the provider is ambiguous; use
+    /// [`AcmeConfig::new_with_crypto_provider`] in that case.
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tokio_rustls_acme::AcmeConfig;
     /// use tokio_rustls_acme::caches::DirCache;
     /// let config = AcmeConfig::new(["example.com"]).cache(DirCache::new("./rustls_acme_cache"));
@@ -42,11 +43,11 @@ impl AcmeConfig<Infallible, Infallible> {
     ///
     /// Due to limited support for type parameter inference in Rust (see
     /// [RFC213](https://github.com/rust-lang/rfcs/blob/master/text/0213-defaulted-type-params.md)),
-    /// [AcmeConfig::new] is not (yet) generic over the [AcmeConfig]'s type parameters.
-    /// An uncached instance of [AcmeConfig] with particular type parameters can be created using
-    /// [NoCache].
+    /// [`AcmeConfig::new`] is not (yet) generic over the [`AcmeConfig`]'s type parameters.
+    /// An uncached instance of [`AcmeConfig`] with particular type parameters can be created using
+    /// [`NoCache`](crate::caches::NoCache).
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tokio_rustls_acme::AcmeConfig;
     /// use tokio_rustls_acme::caches::NoCache;
     /// # type EC = std::io::Error;
@@ -54,24 +55,21 @@ impl AcmeConfig<Infallible, Infallible> {
     /// let config: AcmeConfig<EC, EA> = AcmeConfig::new(["example.com"]).cache(NoCache::new());
     /// ```
     ///
+    /// # Panics
+    ///
+    /// Panics if both `tls-ring` and `tls-aws-lc-rs` are enabled, or if
+    /// neither is. Both cases leave the provider undetermined; reach for
+    /// [`AcmeConfig::new_with_crypto_provider`] instead.
     #[cfg(feature = "tls-webpki-roots")]
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
-        let client_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(Self::webpki_root_store())
-                .with_no_client_auth(),
-        );
-        Self::new_with_client_tls_config(domains, client_config)
+        Self::new_with_crypto_provider(domains, Self::default_crypto_provider())
     }
 
-    /// Same as [AcmeConfig::new] but with an explicit [`CryptoProvider`].
+    /// Same as [`AcmeConfig::new`] but with an explicit [`CryptoProvider`].
     ///
-    /// Builds the internal [`ClientConfig`] with `crypto_provider` instead of
-    /// rustls's process-wide default, and stores it on the config so the
-    /// state machine and acceptor use the same provider end-to-end. Use this
-    /// when you want the convenience of webpki-roots trust anchors without
-    /// relying on rustls's default-provider lookup (e.g. when both the `ring`
-    /// and `aws-lc-rs` features are on, or when neither is).
+    /// Lets the caller pick the provider regardless of which crate features
+    /// are enabled. The same provider is used for the HTTPS client, the
+    /// TLS handshake, and key parsing.
     #[cfg(feature = "tls-webpki-roots")]
     pub fn new_with_crypto_provider(
         domains: impl IntoIterator<Item = impl AsRef<str>>,
@@ -85,6 +83,29 @@ impl AcmeConfig<Infallible, Infallible> {
                 .with_no_client_auth(),
         );
         Self::new_with_client_tls_config(domains, client_config)
+    }
+
+    #[cfg(feature = "tls-webpki-roots")]
+    fn default_crypto_provider() -> Arc<CryptoProvider> {
+        #[cfg(all(feature = "tls-ring", not(feature = "tls-aws-lc-rs")))]
+        {
+            Arc::new(rustls::crypto::ring::default_provider())
+        }
+        #[cfg(all(feature = "tls-aws-lc-rs", not(feature = "tls-ring")))]
+        {
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+        }
+        #[cfg(any(
+            all(feature = "tls-ring", feature = "tls-aws-lc-rs"),
+            not(any(feature = "tls-ring", feature = "tls-aws-lc-rs")),
+        ))]
+        {
+            panic!(
+                "AcmeConfig::new requires exactly one of the `tls-ring` or \
+                 `tls-aws-lc-rs` crate features to be enabled; use \
+                 AcmeConfig::new_with_crypto_provider to choose explicitly"
+            )
+        }
     }
 
     #[cfg(feature = "tls-webpki-roots")]
