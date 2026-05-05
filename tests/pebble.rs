@@ -65,8 +65,16 @@ fn pebble_client_config() -> Arc<ClientConfig> {
     )
 }
 
-/// Insecure reqwest client for Pebble management API calls.
+/// Reqwest client that talks to Pebble's management API.
+///
+/// Installs ring as the process-wide default `CryptoProvider` so reqwest's
+/// `rustls-no-provider` build path can construct its own TLS config without
+/// panicking. This is fine for the pebble tests because the only crypto
+/// provider in scope here is ring (pinned via the `rustls` dev-dependency)
+/// and the assertion in `tests/crypto_provider.rs` runs in a separate test
+/// binary.
 fn http_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
