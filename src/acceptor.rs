@@ -11,6 +11,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{Accept, LazyConfigAcceptor, StartHandshake};
 
+/// Accepts incoming TLS connections, handling `tls-alpn-01` validation
+/// inline and forwarding application traffic to the caller.
 #[derive(Clone)]
 pub struct AcmeAcceptor {
     config: Arc<ServerConfig>,
@@ -31,11 +33,18 @@ impl AcmeAcceptor {
             config: Arc::new(config),
         }
     }
+
+    /// Starts handshake processing on `io`.
+    ///
+    /// The returned future resolves to `Some(handshake)` for application
+    /// traffic the caller should finish, or `None` when the connection was
+    /// a `tls-alpn-01` validation already handled internally.
     pub fn accept<IO: AsyncRead + AsyncWrite + Unpin>(&self, io: IO) -> AcmeAccept<IO> {
         AcmeAccept::new(io, self.config.clone())
     }
 }
 
+/// Future returned by [`AcmeAcceptor::accept`].
 pub struct AcmeAccept<IO: AsyncRead + AsyncWrite + Unpin> {
     acceptor: LazyConfigAcceptor<IO>,
     config: Arc<ServerConfig>,

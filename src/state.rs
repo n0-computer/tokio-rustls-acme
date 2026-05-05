@@ -32,6 +32,10 @@ pub fn after(d: std::time::Duration) -> Timer {
     Box::pin(tokio::time::sleep(d))
 }
 
+/// Drives ACME orders and renewals, surfacing lifecycle events as a [`Stream`].
+///
+/// Owns the [`ResolvesServerCertAcme`] populated as new certificates are
+/// issued. Construct one from [`AcmeConfig::state`].
 #[allow(clippy::type_complexity)]
 pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
@@ -103,6 +107,11 @@ pub enum CertParseError {
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
+    /// Wraps `tcp_incoming` so each connection is dispatched to ACME
+    /// validation or to application TLS, returning an [`Incoming`] stream.
+    ///
+    /// `alpn_protocols` lists application protocols offered to clients,
+    /// most preferred first. Pass an empty `Vec` to disable ALPN.
     pub fn incoming<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
@@ -116,6 +125,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Incoming::new(tcp_incoming, self, acceptor, alpn_protocols)
     }
 
+    /// Like [`AcmeState::incoming`] but uses `server_config` for the
+    /// application TLS handshake.
+    ///
+    /// Use this when the caller needs to customize the rustls
+    /// [`ServerConfig`] beyond ALPN (e.g. session storage, mTLS).
     pub fn incoming_with_server<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
@@ -129,6 +143,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Incoming::new_with_server(tcp_incoming, self, acceptor, server_config)
     }
 
+    /// Returns an [`AcmeAcceptor`] for use with custom TCP accept loops.
     pub fn acceptor(&self) -> AcmeAcceptor {
         AcmeAcceptor::new(self.resolver(), self.crypto_provider())
     }
@@ -160,9 +175,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     ) -> crate::axum::AxumAcceptor {
         crate::axum::AxumAcceptor::new(self.acceptor(), rustls_config)
     }
+    /// Returns the certificate resolver populated by this state machine.
     pub fn resolver(&self) -> Arc<ResolvesServerCertAcme> {
         self.resolver.clone()
     }
+
+    /// Creates a state machine from `config`. Equivalent to
+    /// [`AcmeConfig::state`].
     pub fn new(config: AcmeConfig<EC, EA>) -> Self {
         let config = Arc::new(config);
         Self {
