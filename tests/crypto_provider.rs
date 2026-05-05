@@ -6,10 +6,10 @@
 //! `parse_cert` path (which uses `provider.key_provider.load_private_key`)
 //! and the runtime handshake.
 //!
-//! Skipped entirely when the crate is built without a built-in provider:
-//! the tests need one or both of `ring`/`aws-lc-rs` to construct a provider.
-
-#![cfg(any(feature = "ring", feature = "aws-lc-rs"))]
+//! `rustls` is also a dev-dependency with the `ring` feature on, so tests
+//! can construct a provider even when the crate is built without either of
+//! the `ring`/`aws-lc-rs` crate features. That mirrors how a downstream
+//! user would integrate a third-party provider.
 
 use std::{convert::TryFrom, io, sync::Arc, time::Duration};
 
@@ -143,4 +143,23 @@ async fn ring_server_aws_lc_rs_client() {
     let (resolver, ca_pem) = deploy_test_cert(server_provider.clone()).await;
     let leaf = tls_handshake(resolver, server_provider, client_provider, &ca_pem).await;
     assert!(!leaf.as_ref().is_empty());
+}
+
+/// Verifies the crate works when neither `ring` nor `aws-lc-rs` crate
+/// features are enabled and no default provider has been installed. The
+/// caller must supply a `CryptoProvider` explicitly via
+/// `AcmeConfig::crypto_provider`.
+///
+/// Compiled only in that configuration. The `rustls` dev-dependency carries
+/// the `ring` feature so the test can still construct a provider, just as
+/// a downstream user would do with their own provider crate.
+#[cfg(not(any(feature = "ring", feature = "aws-lc-rs")))]
+#[tokio::test]
+async fn no_built_in_provider() {
+    assert!(
+        rustls::crypto::CryptoProvider::get_default().is_none(),
+        "no provider should be installed in this configuration",
+    );
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    roundtrip(provider).await;
 }
