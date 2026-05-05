@@ -11,6 +11,8 @@
 //! the `ring`/`aws-lc-rs` crate features. That mirrors how a downstream
 //! user would integrate a third-party provider.
 
+#![cfg(feature = "rustls-tls-webpki-roots")]
+
 use std::{convert::TryFrom, io, sync::Arc, time::Duration};
 
 use futures::StreamExt;
@@ -39,26 +41,14 @@ fn client_config_with_roots(provider: Arc<CryptoProvider>, ca_pem: &[u8]) -> Arc
     )
 }
 
-fn empty_client_config(provider: Arc<CryptoProvider>) -> Arc<ClientConfig> {
-    Arc::new(
-        ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(DEFAULT_VERSIONS)
-            .unwrap()
-            .with_root_certificates(RootCertStore::empty())
-            .with_no_client_auth(),
-    )
-}
-
 /// Run the state machine against `TestCache` until a cached cert is deployed.
 async fn deploy_test_cert(provider: Arc<CryptoProvider>) -> (Arc<ResolvesServerCertAcme>, String) {
     let test_cache = TestCache::<io::Error, io::Error>::new();
     let ca_pem = test_cache.ca_pem().to_string();
 
-    let mut state =
-        AcmeConfig::new_with_client_tls_config([DOMAIN], empty_client_config(provider.clone()))
-            .crypto_provider(provider)
-            .cache(test_cache)
-            .state();
+    let mut state = AcmeConfig::new_with_crypto_provider([DOMAIN], provider)
+        .cache(test_cache)
+        .state();
     let resolver = state.resolver();
 
     tokio::time::timeout(Duration::from_secs(5), async {
