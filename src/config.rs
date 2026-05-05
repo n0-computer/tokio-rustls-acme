@@ -5,6 +5,7 @@ use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
 use futures::Stream;
+use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, ServerConfig};
 use std::convert::Infallible;
 use std::fmt::Debug;
@@ -21,6 +22,7 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
+    pub(crate) crypto_provider: Option<Arc<CryptoProvider>>,
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -79,6 +81,7 @@ impl AcmeConfig<Infallible, Infallible> {
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
+            crypto_provider: None,
         }
     }
 }
@@ -139,6 +142,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             contact: self.contact,
             cache: Box::new(cache),
             eab: self.eab,
+            crypto_provider: self.crypto_provider,
         }
     }
     pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(
@@ -157,6 +161,23 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             None => self.cache(NoCache::<C::EC, C::EA>::new()),
         }
     }
+
+    /// Sets the [`CryptoProvider`] used for the TLS handshake and for parsing
+    /// private keys from issued certificates.
+    ///
+    /// When unset, the process-wide default returned by
+    /// [`CryptoProvider::get_default`] is used. If no default has been
+    /// installed, the resolver panics on first use; install one beforehand
+    /// (e.g. with [`rustls::crypto::ring::default_provider()`] followed by
+    /// [`CryptoProvider::install_default`]) or call this method.
+    ///
+    /// Setting an explicit provider is required to use this crate without any
+    /// of rustls's built-in crypto features (`ring`, `aws-lc-rs`) enabled.
+    pub fn crypto_provider(mut self, crypto_provider: Arc<CryptoProvider>) -> Self {
+        self.crypto_provider = Some(crypto_provider);
+        self
+    }
+
     pub fn state(self) -> AcmeState<EC, EA> {
         AcmeState::new(self)
     }

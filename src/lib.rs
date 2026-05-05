@@ -1,4 +1,4 @@
-//! An easy-to-use, async compatible [ACME] client library using [rustls] with [ring].
+//! An easy-to-use, async compatible [ACME] client library using [rustls].
 //! The validation mechanism used is tls-alpn-01, which allows serving acme challenge responses and
 //! regular TLS traffic on the same port.
 //!
@@ -11,9 +11,20 @@
 //! The goal is to provide a [Let's Encrypt](https://letsencrypt.org/) compatible TLS serving and
 //! certificate management using a simple and flexible stream based API.
 //!
-//! This crate uses [ring] as [rustls]'s backend, instead of [aws-lc-rs]. This generally makes it
-//! much easier to compile. If you'd like to use [aws-lc-rs] as [rustls]'s backend, we're open to
-//! contributions with the necessary `Cargo.toml` changes and feature-flags to enable you to do so.
+//! ## Crypto provider
+//!
+//! The default `ring` feature selects [ring] as rustls's crypto backend. To
+//! use [aws-lc-rs] instead, disable default features and enable `aws-lc-rs`:
+//!
+//! ```toml
+//! tokio-rustls-acme = { version = "*", default-features = false, features = ["aws-lc-rs", "rustls-tls-webpki-roots"] }
+//! ```
+//!
+//! Both features can be enabled together; in that case rustls has no
+//! auto-installable default and the caller must either install one with
+//! [`rustls::crypto::CryptoProvider::install_default`] or pass it via
+//! [`AcmeConfig::crypto_provider`]. The same applies when neither feature
+//! is enabled.
 //!
 //! To use tokio-rustls-acme add the following lines to your `Cargo.toml`:
 //!
