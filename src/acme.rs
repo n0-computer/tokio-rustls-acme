@@ -8,8 +8,9 @@ use rcgen::{CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
 use ring::error::{KeyRejected, Unspecified};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{crypto::ring::sign::any_ecdsa_type, sign::CertifiedKey};
+use rustls::sign::CertifiedKey;
 use rustls::{
+    crypto::CryptoProvider,
     pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
     ClientConfig,
 };
@@ -179,6 +180,7 @@ impl Account {
     }
     pub fn tls_alpn_01<'a>(
         &self,
+        crypto_provider: &CryptoProvider,
         challenges: &'a [Challenge],
         domain: String,
     ) -> Result<(&'a Challenge, CertifiedKey), AcmeError> {
@@ -198,9 +200,12 @@ impl Account {
         let cert = params.self_signed(&key_pair)?;
 
         let pk_bytes = key_pair.serialize_der();
-        let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
-        let pk_der: PrivateKeyDer = pk_der.into();
-        let pk = any_ecdsa_type(&pk_der).unwrap();
+        let pk_der: PrivatePkcs8KeyDer<'static> = pk_bytes.into();
+        let pk_der: PrivateKeyDer<'static> = pk_der.into();
+        let pk = crypto_provider
+            .key_provider
+            .load_private_key(pk_der)
+            .expect("rcgen-generated ECDSA P-256 key must load via the rustls crypto provider");
         let certified_key = CertifiedKey::new(vec![cert.der().clone()], pk);
         Ok((challenge, certified_key))
     }

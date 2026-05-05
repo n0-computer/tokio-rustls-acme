@@ -10,7 +10,6 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::future::try_join_all;
 use futures::{ready, FutureExt, Stream};
 use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
-use rustls::crypto::ring::sign::any_ecdsa_type;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
@@ -131,14 +130,27 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     }
 
     pub fn acceptor(&self) -> AcmeAcceptor {
-        AcmeAcceptor::new(self.resolver())
+        AcmeAcceptor::new(self.resolver(), self.crypto_provider())
     }
 
-    pub fn acceptor_with_crypto_provider(
-        &self,
-        crypto_provider: Arc<CryptoProvider>,
-    ) -> AcmeAcceptor {
-        AcmeAcceptor::new_with_crypto_provider(self.resolver(), crypto_provider)
+    /// Returns the [`CryptoProvider`] configured on the [`AcmeConfig`], or the
+    /// process-wide default if none was set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no provider was configured and no default has been installed
+    /// with [`CryptoProvider::install_default`]. See
+    /// [`AcmeConfig::crypto_provider`](crate::AcmeConfig::crypto_provider).
+    pub fn crypto_provider(&self) -> Arc<CryptoProvider> {
+        self.config
+            .crypto_provider
+            .clone()
+            .or_else(|| CryptoProvider::get_default().cloned())
+            .expect(
+                "no rustls CryptoProvider available; \
+                 set one with AcmeConfig::crypto_provider() or \
+                 CryptoProvider::install_default()",
+            )
     }
 
     #[cfg(feature = "axum")]
@@ -181,15 +193,18 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             wait: None,
         }
     }
-    fn parse_cert(pem: &[u8]) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertParseError> {
+    fn parse_cert(
+        crypto_provider: &CryptoProvider,
+        pem: &[u8],
+    ) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertParseError> {
         let mut pems = pem::parse_many(pem)?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
         }
         let pk_bytes = pems.remove(0).into_contents();
-        let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
-        let pk: PrivateKeyDer = pk_der.into();
-        let pk = match any_ecdsa_type(&pk) {
+        let pk_der: PrivatePkcs8KeyDer<'static> = pk_bytes.into();
+        let pk_der: PrivateKeyDer<'static> = pk_der.into();
+        let pk = match crypto_provider.key_provider.load_private_key(pk_der) {
             Ok(pk) => pk,
             Err(_) => return Err(CertParseError::InvalidPrivateKey),
         };
@@ -209,7 +224,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
     #[allow(clippy::result_large_err)]
     fn process_cert(&mut self, pem: Vec<u8>, cached: bool) -> Event<EC, EA> {
-        let (cert, validity) = match (Self::parse_cert(&pem), cached) {
+        let provider = self.crypto_provider();
+        let (cert, validity) = match (Self::parse_cert(&provider, &pem), cached) {
             (Ok(r), _) => r,
             (Err(err), cached) => {
                 return match cached {
@@ -242,6 +258,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     }
     async fn order(
         config: Arc<AcmeConfig<EC, EA>>,
+        crypto_provider: Arc<CryptoProvider>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
     ) -> Result<Vec<u8>, OrderError> {
@@ -265,10 +282,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         loop {
             match order.status {
                 OrderStatus::Pending => {
-                    let auth_futures = order
-                        .authorizations
-                        .iter()
-                        .map(|url| Self::authorize(&config, &resolver, &account, url));
+                    let auth_futures = order.authorizations.iter().map(|url| {
+                        Self::authorize(&config, &crypto_provider, &resolver, &account, url)
+                    });
                     try_join_all(auth_futures).await?;
                     log::info!("completed all authorizations");
                     order = account.order(&config.client_config, &order_url).await?;
@@ -311,6 +327,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     }
     async fn authorize(
         config: &AcmeConfig<EC, EA>,
+        crypto_provider: &CryptoProvider,
         resolver: &ResolvesServerCertAcme,
         account: &Account,
         url: &String,
@@ -321,7 +338,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let Identifier::Dns(domain) = auth.identifier;
                 log::info!("trigger challenge for {}", &domain);
                 let (challenge, auth_key) =
-                    account.tls_alpn_01(&auth.challenges, domain.clone())?;
+                    account.tls_alpn_01(crypto_provider, &auth.challenges, domain.clone())?;
                 resolver.set_auth_key(domain.clone(), Arc::new(auth_key));
                 account
                     .challenge(&config.client_config, &challenge.url)
@@ -431,8 +448,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             };
             let config = self.config.clone();
             let resolver = self.resolver.clone();
+            let crypto_provider = self.crypto_provider();
             self.order = Some(Box::pin({
-                Self::order(config.clone(), resolver.clone(), account_key)
+                Self::order(config, crypto_provider, resolver, account_key)
             }));
         }
     }

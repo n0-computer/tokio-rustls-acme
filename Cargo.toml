@@ -27,7 +27,7 @@ thiserror = "2.0"
 x509-parser = "0.18"
 chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 async-trait = "0.1.53"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false }
 time = "0.3.36"                                                                 # force the transitive dependency to a more recent minimal version. The build fails with 0.3.20
 
 tokio = { version = "1.20.1", default-features = false }
@@ -62,6 +62,7 @@ tokio-stream = { version = "0.1.9", features = ["net"] }
 tokio-util = { version = "0.7.3", features = ["compat"] }
 warp = "0.3"
 tempfile = "3"
+pem = "3.0"
 x509-parser = "0.18"
 
 [package.metadata.docs.rs]
@@ -69,9 +70,16 @@ all-features = true
 rustdoc-args = ["--cfg", "doc_auto_cfg"]
 
 [features]
-default = ["rustls-tls-webpki-roots"]
+default = ["rustls-tls-webpki-roots", "ring"]
 axum = ["dep:axum-server"]
 rustls-tls-webpki-roots = ["dep:webpki-roots"]
+# Enables the ring rustls crypto provider. When enabled, rustls auto-installs
+# ring as the default provider; otherwise the user must call
+# `AcmeConfig::crypto_provider` or `CryptoProvider::install_default`.
+ring = ["rustls/ring", "tokio-rustls/ring"]
+# Enables the aws-lc-rs rustls crypto provider. When this is the only crypto
+# feature enabled, rustls auto-installs aws-lc-rs as the default provider.
+aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 
 [[example]]
 name = "low_level_axum"
