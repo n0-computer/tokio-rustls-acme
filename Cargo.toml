@@ -78,11 +78,11 @@ rustdoc-args = ["--cfg", "doc_auto_cfg"]
 default = ["tls-webpki-roots", "tls-ring"]
 axum = ["dep:axum-server"]
 tls-webpki-roots = ["dep:webpki-roots"]
-# Picks the ring rustls crypto provider for `AcmeConfig::new`. With both
-# `tls-ring` and `tls-aws-lc-rs` (or neither), the caller must use
-# `AcmeConfig::new_with_crypto_provider` to disambiguate.
+# Picks the ring rustls crypto provider for `AcmeConfig::new`. Takes
+# precedence over `tls-aws-lc-rs` when both are enabled.
 tls-ring = ["rustls/ring", "tokio-rustls/ring"]
-# Picks the aws-lc-rs rustls crypto provider for `AcmeConfig::new`.
+# Picks the aws-lc-rs rustls crypto provider for `AcmeConfig::new` when
+# `tls-ring` is not also enabled.
 tls-aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 
 [[example]]

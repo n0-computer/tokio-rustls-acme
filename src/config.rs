@@ -30,10 +30,11 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
 impl AcmeConfig<Infallible, Infallible> {
     /// Creates an [`AcmeConfig`] backed by webpki-roots trust anchors.
     ///
-    /// Uses the [`CryptoProvider`] selected by the enabled crate feature
-    /// (`tls-ring` or `tls-aws-lc-rs`). When both or neither feature is
-    /// enabled the provider is ambiguous; use
-    /// [`AcmeConfig::new_with_crypto_provider`] in that case.
+    /// Picks ring when the `tls-ring` feature is enabled (the default),
+    /// otherwise aws-lc-rs. The same provider is used for the HTTPS client,
+    /// the TLS handshake, and key parsing. Available only when at least one
+    /// of `tls-ring` or `tls-aws-lc-rs` is enabled; if neither is, use
+    /// [`AcmeConfig::new_with_crypto_provider`].
     ///
     /// ```rust,no_run
     /// # use tokio_rustls_acme::AcmeConfig;
@@ -54,13 +55,10 @@ impl AcmeConfig<Infallible, Infallible> {
     /// # type EA = EC;
     /// let config: AcmeConfig<EC, EA> = AcmeConfig::new(["example.com"]).cache(NoCache::new());
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if both `tls-ring` and `tls-aws-lc-rs` are enabled, or if
-    /// neither is. Both cases leave the provider undetermined; reach for
-    /// [`AcmeConfig::new_with_crypto_provider`] instead.
-    #[cfg(feature = "tls-webpki-roots")]
+    #[cfg(all(
+        feature = "tls-webpki-roots",
+        any(feature = "tls-ring", feature = "tls-aws-lc-rs")
+    ))]
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         Self::new_with_crypto_provider(domains, Self::default_crypto_provider())
     }
@@ -85,26 +83,18 @@ impl AcmeConfig<Infallible, Infallible> {
         Self::new_with_client_tls_config(domains, client_config)
     }
 
-    #[cfg(feature = "tls-webpki-roots")]
+    #[cfg(all(
+        feature = "tls-webpki-roots",
+        any(feature = "tls-ring", feature = "tls-aws-lc-rs")
+    ))]
     fn default_crypto_provider() -> Arc<CryptoProvider> {
-        #[cfg(all(feature = "tls-ring", not(feature = "tls-aws-lc-rs")))]
+        #[cfg(feature = "tls-ring")]
         {
             Arc::new(rustls::crypto::ring::default_provider())
         }
         #[cfg(all(feature = "tls-aws-lc-rs", not(feature = "tls-ring")))]
         {
             Arc::new(rustls::crypto::aws_lc_rs::default_provider())
-        }
-        #[cfg(any(
-            all(feature = "tls-ring", feature = "tls-aws-lc-rs"),
-            not(any(feature = "tls-ring", feature = "tls-aws-lc-rs")),
-        ))]
-        {
-            panic!(
-                "AcmeConfig::new requires exactly one of the `tls-ring` or \
-                 `tls-aws-lc-rs` crate features to be enabled; use \
-                 AcmeConfig::new_with_crypto_provider to choose explicitly"
-            )
         }
     }
 
