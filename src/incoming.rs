@@ -10,6 +10,10 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{server::TlsStream, Accept};
 
+/// [`Stream`] of accepted application TLS connections.
+///
+/// Folds ACME order and renewal work into the same poll loop, so polling
+/// this stream advances both the certificate state machine and TCP accept.
 pub struct Incoming<
     TCP: AsyncRead + AsyncWrite + Unpin,
     ETCP,

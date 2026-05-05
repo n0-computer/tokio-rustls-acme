@@ -102,6 +102,12 @@ impl AcmeConfig<Infallible, Infallible> {
         root_store
     }
 
+    /// Creates a config that uses `client_config` for ACME directory and
+    /// order requests.
+    ///
+    /// Use this when you need to control the trust store or crypto provider
+    /// of the HTTPS client. Otherwise prefer [`AcmeConfig::new`] or
+    /// [`AcmeConfig::new_with_crypto_provider`].
     pub fn new_with_client_tls_config(
         domains: impl IntoIterator<Item = impl AsRef<str>>,
         client_config: Arc<ClientConfig>,
@@ -210,6 +216,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
+    /// Returns the [`AcmeState`] that drives ordering, renewal, and caching.
     pub fn state(self) -> AcmeState<EC, EA> {
         AcmeState::new(self)
     }
