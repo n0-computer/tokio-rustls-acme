@@ -148,24 +148,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         AcmeAcceptor::new(self.resolver(), self.crypto_provider())
     }
 
-    /// Returns the [`CryptoProvider`] configured on the [`AcmeConfig`], or the
-    /// process-wide default if none was set.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no provider was configured and no default has been installed
-    /// with [`CryptoProvider::install_default`]. See
-    /// [`AcmeConfig::crypto_provider`](crate::AcmeConfig::crypto_provider).
+    /// Returns the [`CryptoProvider`] used by this state machine.
     pub fn crypto_provider(&self) -> Arc<CryptoProvider> {
-        self.config
-            .crypto_provider
-            .clone()
-            .or_else(|| CryptoProvider::get_default().cloned())
-            .expect(
-                "no rustls CryptoProvider available; \
-                 set one with AcmeConfig::crypto_provider() or \
-                 CryptoProvider::install_default()",
-            )
+        self.config.crypto_provider.clone()
     }
 
     #[cfg(feature = "axum")]
