@@ -6,6 +6,8 @@ use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
 use futures::Stream;
 use rustls::crypto::CryptoProvider;
+#[cfg(feature = "rustls-tls-webpki-roots")]
+use rustls::DEFAULT_VERSIONS;
 use rustls::{ClientConfig, ServerConfig};
 use std::convert::Infallible;
 use std::fmt::Debug;
@@ -54,6 +56,41 @@ impl AcmeConfig<Infallible, Infallible> {
     ///
     #[cfg(feature = "rustls-tls-webpki-roots")]
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let client_config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(Self::webpki_root_store())
+                .with_no_client_auth(),
+        );
+        Self::new_with_client_tls_config(domains, client_config)
+    }
+
+    /// Same as [AcmeConfig::new] but with an explicit [`CryptoProvider`].
+    ///
+    /// Builds the internal [`ClientConfig`] with `crypto_provider` instead of
+    /// rustls's process-wide default, and stores it on the config so the
+    /// state machine and acceptor use the same provider end-to-end. Use this
+    /// when you want the convenience of webpki-roots trust anchors without
+    /// relying on rustls's default-provider lookup (e.g. when both the `ring`
+    /// and `aws-lc-rs` features are on, or when neither is).
+    #[cfg(feature = "rustls-tls-webpki-roots")]
+    pub fn new_with_crypto_provider(
+        domains: impl IntoIterator<Item = impl AsRef<str>>,
+        crypto_provider: Arc<CryptoProvider>,
+    ) -> Self {
+        let client_config = Arc::new(
+            ClientConfig::builder_with_provider(crypto_provider.clone())
+                .with_protocol_versions(DEFAULT_VERSIONS)
+                .expect("rustls DEFAULT_VERSIONS is always valid")
+                .with_root_certificates(Self::webpki_root_store())
+                .with_no_client_auth(),
+        );
+        let mut config = Self::new_with_client_tls_config(domains, client_config);
+        config.crypto_provider = Some(crypto_provider);
+        config
+    }
+
+    #[cfg(feature = "rustls-tls-webpki-roots")]
+    fn webpki_root_store() -> rustls::RootCertStore {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
             rustls::pki_types::TrustAnchor {
@@ -62,12 +99,7 @@ impl AcmeConfig<Infallible, Infallible> {
                 name_constraints: ta.name_constraints.clone(),
             }
         }));
-        let client_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
-        Self::new_with_client_tls_config(domains, client_config)
+        root_store
     }
 
     pub fn new_with_client_tls_config(
