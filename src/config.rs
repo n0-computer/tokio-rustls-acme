@@ -24,7 +24,7 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
-    pub(crate) crypto_provider: Option<Arc<CryptoProvider>>,
+    pub(crate) crypto_provider: Arc<CryptoProvider>,
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -78,15 +78,13 @@ impl AcmeConfig<Infallible, Infallible> {
         crypto_provider: Arc<CryptoProvider>,
     ) -> Self {
         let client_config = Arc::new(
-            ClientConfig::builder_with_provider(crypto_provider.clone())
+            ClientConfig::builder_with_provider(crypto_provider)
                 .with_protocol_versions(DEFAULT_VERSIONS)
                 .expect("rustls DEFAULT_VERSIONS is always valid")
                 .with_root_certificates(Self::webpki_root_store())
                 .with_no_client_auth(),
         );
-        let mut config = Self::new_with_client_tls_config(domains, client_config);
-        config.crypto_provider = Some(crypto_provider);
-        config
+        Self::new_with_client_tls_config(domains, client_config)
     }
 
     #[cfg(feature = "tls-webpki-roots")]
@@ -105,6 +103,10 @@ impl AcmeConfig<Infallible, Infallible> {
     /// Creates a config that uses `client_config` for ACME directory and
     /// order requests.
     ///
+    /// The [`CryptoProvider`] is read from `client_config` and reused for
+    /// the TLS handshake and key parsing, so the whole crate runs on the
+    /// same provider as the HTTPS client.
+    ///
     /// Use this when you need to control the trust store or crypto provider
     /// of the HTTPS client. Otherwise prefer [`AcmeConfig::new`] or
     /// [`AcmeConfig::new_with_crypto_provider`].
@@ -112,6 +114,7 @@ impl AcmeConfig<Infallible, Infallible> {
         domains: impl IntoIterator<Item = impl AsRef<str>>,
         client_config: Arc<ClientConfig>,
     ) -> Self {
+        let crypto_provider = client_config.crypto_provider().clone();
         AcmeConfig {
             client_config,
             directory_url: LETS_ENCRYPT_STAGING_DIRECTORY.into(),
@@ -119,14 +122,19 @@ impl AcmeConfig<Infallible, Infallible> {
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
-            crypto_provider: None,
+            crypto_provider,
         }
     }
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
-    /// Set custom `rustls::ClientConfig` for ACME API calls.
+    /// Sets a custom [`ClientConfig`] for ACME API calls.
+    ///
+    /// The [`CryptoProvider`] is read from `client_config` and reused for
+    /// the TLS handshake and key parsing, keeping the whole crate on a
+    /// single provider.
     pub fn client_tls_config(mut self, client_config: Arc<ClientConfig>) -> Self {
+        self.crypto_provider = client_config.crypto_provider().clone();
         self.client_config = client_config;
         self
     }
@@ -198,22 +206,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             Some(cache) => self.cache(cache),
             None => self.cache(NoCache::<C::EC, C::EA>::new()),
         }
-    }
-
-    /// Sets the [`CryptoProvider`] used for the TLS handshake and for parsing
-    /// private keys from issued certificates.
-    ///
-    /// When unset, the process-wide default returned by
-    /// [`CryptoProvider::get_default`] is used. If no default has been
-    /// installed, the resolver panics on first use; install one beforehand
-    /// (e.g. with [`rustls::crypto::ring::default_provider()`] followed by
-    /// [`CryptoProvider::install_default`]) or call this method.
-    ///
-    /// Setting an explicit provider is required to use this crate without any
-    /// of rustls's built-in crypto features (`ring`, `aws-lc-rs`) enabled.
-    pub fn crypto_provider(mut self, crypto_provider: Arc<CryptoProvider>) -> Self {
-        self.crypto_provider = Some(crypto_provider);
-        self
     }
 
     /// Returns the [`AcmeState`] that drives ordering, renewal, and caching.
