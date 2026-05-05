@@ -75,16 +75,16 @@ all-features = true
 rustdoc-args = ["--cfg", "doc_auto_cfg"]
 
 [features]
-default = ["rustls-tls-webpki-roots", "ring"]
+default = ["tls-webpki-roots", "tls-ring"]
 axum = ["dep:axum-server"]
-rustls-tls-webpki-roots = ["dep:webpki-roots"]
+tls-webpki-roots = ["dep:webpki-roots"]
 # Enables the ring rustls crypto provider. When enabled, rustls auto-installs
 # ring as the default provider; otherwise the user must call
 # `AcmeConfig::crypto_provider` or `CryptoProvider::install_default`.
-ring = ["rustls/ring", "tokio-rustls/ring"]
+tls-ring = ["rustls/ring", "tokio-rustls/ring"]
 # Enables the aws-lc-rs rustls crypto provider. When this is the only crypto
 # feature enabled, rustls auto-installs aws-lc-rs as the default provider.
-aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
+tls-aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 
 [[example]]
 name = "low_level_axum"

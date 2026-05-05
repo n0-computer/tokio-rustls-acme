@@ -68,13 +68,13 @@ jobs:
       matrix:
         include:
           - name: "ring only"
-            features: "rustls-tls-webpki-roots,ring"
+            features: "tls-webpki-roots,tls-ring"
           - name: "aws-lc-rs only"
-            features: "rustls-tls-webpki-roots,aws-lc-rs"
+            features: "tls-webpki-roots,tls-aws-lc-rs"
           - name: "ring and aws-lc-rs"
-            features: "rustls-tls-webpki-roots,ring,aws-lc-rs"
+            features: "tls-webpki-roots,tls-ring,tls-aws-lc-rs"
           - name: "no built-in provider"
-            features: "rustls-tls-webpki-roots"
+            features: "tls-webpki-roots"
     env:
       RUSTC_WRAPPER: "sccache"
     steps:

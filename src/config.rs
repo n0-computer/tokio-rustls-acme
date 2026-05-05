@@ -6,7 +6,7 @@ use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
 use futures::Stream;
 use rustls::crypto::CryptoProvider;
-#[cfg(feature = "rustls-tls-webpki-roots")]
+#[cfg(feature = "tls-webpki-roots")]
 use rustls::DEFAULT_VERSIONS;
 use rustls::{ClientConfig, ServerConfig};
 use std::convert::Infallible;
@@ -54,7 +54,7 @@ impl AcmeConfig<Infallible, Infallible> {
     /// let config: AcmeConfig<EC, EA> = AcmeConfig::new(["example.com"]).cache(NoCache::new());
     /// ```
     ///
-    #[cfg(feature = "rustls-tls-webpki-roots")]
+    #[cfg(feature = "tls-webpki-roots")]
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         let client_config = Arc::new(
             ClientConfig::builder()
@@ -72,7 +72,7 @@ impl AcmeConfig<Infallible, Infallible> {
     /// when you want the convenience of webpki-roots trust anchors without
     /// relying on rustls's default-provider lookup (e.g. when both the `ring`
     /// and `aws-lc-rs` features are on, or when neither is).
-    #[cfg(feature = "rustls-tls-webpki-roots")]
+    #[cfg(feature = "tls-webpki-roots")]
     pub fn new_with_crypto_provider(
         domains: impl IntoIterator<Item = impl AsRef<str>>,
         crypto_provider: Arc<CryptoProvider>,
@@ -89,7 +89,7 @@ impl AcmeConfig<Infallible, Infallible> {
         config
     }
 
-    #[cfg(feature = "rustls-tls-webpki-roots")]
+    #[cfg(feature = "tls-webpki-roots")]
     fn webpki_root_store() -> rustls::RootCertStore {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
