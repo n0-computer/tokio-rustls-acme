@@ -64,6 +64,11 @@ warp = "0.3"
 tempfile = "3"
 pem = "3.0"
 x509-parser = "0.18"
+# Pulled in only for the integration tests so they can construct a
+# `CryptoProvider` regardless of which crate features are enabled. Cargo
+# applies dev-dep features to test/example/bench builds only, so this does
+# not enable rustls's `ring` feature in downstream library builds.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [package.metadata.docs.rs]
 all-features = true

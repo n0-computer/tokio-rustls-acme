@@ -84,9 +84,6 @@ jobs:
       - name: cargo check
         run: cargo check --no-default-features --features ${{ matrix.features }} --lib --tests
       - name: cargo test
-        # The no-built-in-provider build can't run the in-process handshake
-        # tests (they install ring or aws-lc-rs explicitly), so skip them.
-        if: matrix.name != 'no built-in provider'
         run: cargo test --no-default-features --features ${{ matrix.features }} --tests
 
   # Checks correct runtime deps and features are requested by not including dev-dependencies.
