@@ -57,7 +57,7 @@ args = [
     "test",
     "--no-default-features",
     "--features",
-    "rustls-tls-webpki-roots,ring",
+    "tls-webpki-roots,tls-ring",
     "--tests",
 ]
 
@@ -68,7 +68,7 @@ args = [
     "test",
     "--no-default-features",
     "--features",
-    "rustls-tls-webpki-roots,aws-lc-rs",
+    "tls-webpki-roots,tls-aws-lc-rs",
     "--tests",
 ]
 
@@ -79,7 +79,7 @@ args = [
     "test",
     "--no-default-features",
     "--features",
-    "rustls-tls-webpki-roots,ring,aws-lc-rs",
+    "tls-webpki-roots,tls-ring,tls-aws-lc-rs",
     "--tests",
 ]
 
@@ -90,7 +90,7 @@ args = [
     "test",
     "--no-default-features",
     "--features",
-    "rustls-tls-webpki-roots",
+    "tls-webpki-roots",
     "--tests",
 ]
 

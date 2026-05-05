@@ -13,11 +13,12 @@
 //!
 //! ## Crypto provider
 //!
-//! The default `ring` feature selects [ring] as rustls's crypto backend. To
-//! use [aws-lc-rs] instead, disable default features and enable `aws-lc-rs`:
+//! The default `tls-ring` feature selects [ring] as rustls's crypto
+//! backend. To use [aws-lc-rs] instead, disable default features and
+//! enable `tls-aws-lc-rs`:
 //!
 //! ```toml
-//! tokio-rustls-acme = { version = "*", default-features = false, features = ["aws-lc-rs", "rustls-tls-webpki-roots"] }
+//! tokio-rustls-acme = { version = "*", default-features = false, features = ["tls-aws-lc-rs", "tls-webpki-roots"] }
 //! ```
 //!
 //! Both features can be enabled together; in that case rustls has no

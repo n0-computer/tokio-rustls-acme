@@ -11,7 +11,7 @@
 //! the `ring`/`aws-lc-rs` crate features. That mirrors how a downstream
 //! user would integrate a third-party provider.
 
-#![cfg(feature = "rustls-tls-webpki-roots")]
+#![cfg(feature = "tls-webpki-roots")]
 
 use std::{convert::TryFrom, io, sync::Arc, time::Duration};
 
@@ -108,14 +108,14 @@ async fn roundtrip(provider: Arc<CryptoProvider>) {
     assert!(!leaf.as_ref().is_empty(), "leaf cert must not be empty");
 }
 
-#[cfg(feature = "ring")]
+#[cfg(feature = "tls-ring")]
 #[tokio::test]
 async fn ring_provider_explicit() {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     roundtrip(provider).await;
 }
 
-#[cfg(feature = "aws-lc-rs")]
+#[cfg(feature = "tls-aws-lc-rs")]
 #[tokio::test]
 async fn aws_lc_rs_provider_explicit() {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -124,7 +124,7 @@ async fn aws_lc_rs_provider_explicit() {
 
 /// Mixed handshake: server runs ring, client runs aws-lc-rs. Confirms the
 /// `CertifiedKey` resolved by `AcmeState` interoperates across providers.
-#[cfg(all(feature = "ring", feature = "aws-lc-rs"))]
+#[cfg(all(feature = "tls-ring", feature = "tls-aws-lc-rs"))]
 #[tokio::test]
 async fn ring_server_aws_lc_rs_client() {
     let server_provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -135,15 +135,15 @@ async fn ring_server_aws_lc_rs_client() {
     assert!(!leaf.as_ref().is_empty());
 }
 
-/// Verifies the crate works when neither `ring` nor `aws-lc-rs` crate
-/// features are enabled and no default provider has been installed. The
-/// caller must supply a `CryptoProvider` explicitly via
+/// Verifies the crate works when neither `tls-ring` nor `tls-aws-lc-rs`
+/// crate features are enabled and no default provider has been installed.
+/// The caller must supply a `CryptoProvider` explicitly via
 /// `AcmeConfig::crypto_provider`.
 ///
 /// Compiled only in that configuration. The `rustls` dev-dependency carries
 /// the `ring` feature so the test can still construct a provider, just as
 /// a downstream user would do with their own provider crate.
-#[cfg(not(any(feature = "ring", feature = "aws-lc-rs")))]
+#[cfg(not(any(feature = "tls-ring", feature = "tls-aws-lc-rs")))]
 #[tokio::test]
 async fn no_built_in_provider() {
     assert!(
