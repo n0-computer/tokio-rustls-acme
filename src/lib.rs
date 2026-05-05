@@ -27,10 +27,10 @@
 //! tokio-rustls-acme = { version = "*", default-features = false, features = ["tls-aws-lc-rs", "tls-webpki-roots"] }
 //! ```
 //!
-//! With both features (or neither) enabled, [`AcmeConfig::new`] panics
-//! because the provider is ambiguous; use
+//! With both features enabled, [`AcmeConfig::new`] picks ring. When
+//! neither is enabled it is unavailable; use
 //! [`AcmeConfig::new_with_crypto_provider`] or
-//! [`AcmeConfig::new_with_client_tls_config`] to pick one explicitly.
+//! [`AcmeConfig::new_with_client_tls_config`] in that case.
 //!
 //! To use tokio-rustls-acme add the following lines to your `Cargo.toml`:
 //!
@@ -46,6 +46,8 @@
 //! well as accepting TLS connections, which are handed over to the caller on success.
 //!
 //! ```rust,no_run
+//! # #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc-rs"))]
+//! # mod example {
 //! use tokio::io::AsyncWriteExt;
 //! use futures::StreamExt;
 //! use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
@@ -77,6 +79,8 @@
 //! Content-Type: text/plain; charset=utf-8
 //!
 //! Hello Tls!"#;
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! `examples/high_level.rs` implements a "Hello Tls!" server similar to the one above, which accepts
