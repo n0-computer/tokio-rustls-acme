@@ -1,5 +1,5 @@
 use clap::Parser;
-use rustls::ServerConfig;
+use rustls::{ServerConfig, DEFAULT_VERSIONS};
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,7 +41,9 @@ async fn main() {
         .cache_option(args.cache.clone().map(DirCache::new))
         .directory_lets_encrypt(args.prod)
         .state();
-    let rustls_config = ServerConfig::builder()
+    let rustls_config = ServerConfig::builder_with_provider(state.crypto_provider())
+        .with_protocol_versions(DEFAULT_VERSIONS)
+        .unwrap()
         .with_no_client_auth()
         .with_cert_resolver(state.resolver());
     let acceptor = state.acceptor();

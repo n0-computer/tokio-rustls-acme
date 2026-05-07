@@ -39,3 +39,56 @@ args = ["test", "--test", "pebble", "--", "--ignored", "--nocapture"]
 clear = true
 description = "Run Pebble integration tests e2e (start server, test, stop)"
 run_task = { name = ["pebble-test-run"], fork = true, cleanup_task = "pebble-down" }
+
+[tasks.test-ring]
+description = "Run tests with only the ring crypto provider feature enabled"
+command = "cargo"
+args = [
+    "test",
+    "--no-default-features",
+    "--features",
+    "tls-webpki-roots,tls-ring",
+    "--tests",
+]
+
+[tasks.test-aws-lc-rs]
+description = "Run tests with only the aws-lc-rs crypto provider feature enabled"
+command = "cargo"
+args = [
+    "test",
+    "--no-default-features",
+    "--features",
+    "tls-webpki-roots,tls-aws-lc-rs",
+    "--tests",
+]
+
+[tasks.test-both-providers]
+description = "Run tests with both ring and aws-lc-rs crypto provider features enabled"
+command = "cargo"
+args = [
+    "test",
+    "--no-default-features",
+    "--features",
+    "tls-webpki-roots,tls-ring,tls-aws-lc-rs",
+    "--tests",
+]
+
+[tasks.test-no-provider]
+description = "Run tests with neither crypto provider feature enabled"
+command = "cargo"
+args = [
+    "test",
+    "--no-default-features",
+    "--features",
+    "tls-webpki-roots",
+    "--tests",
+]
+
+[tasks.test-feature-combos]
+description = "Run the full crypto provider feature matrix the CI uses"
+dependencies = [
+    "test-ring",
+    "test-aws-lc-rs",
+    "test-both-providers",
+    "test-no-provider",
+]

@@ -58,6 +58,34 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-features --bins --tests --examples
 
+  # Verifies the crate compiles and tests pass under each crypto provider
+  # feature combo, including the "no built-in provider" mode where the caller
+  # must inject one via AcmeConfig::crypto_provider.
+  feature-combos:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "ring only"
+            features: "tls-webpki-roots,tls-ring"
+          - name: "aws-lc-rs only"
+            features: "tls-webpki-roots,tls-aws-lc-rs"
+          - name: "ring and aws-lc-rs"
+            features: "tls-webpki-roots,tls-ring,tls-aws-lc-rs"
+          - name: "no built-in provider"
+            features: "tls-webpki-roots"
+    env:
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: cargo check
+        run: cargo check --no-default-features --features ${{ matrix.features }} --lib --tests
+      - name: cargo test
+        run: cargo test --no-default-features --features ${{ matrix.features }} --tests
+
   # Checks correct runtime deps and features are requested by not including dev-dependencies.
   check-deps:
     runs-on: ubuntu-latest
