@@ -23,6 +23,12 @@ pub const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
     "https://acme-v02.api.letsencrypt.org/directory";
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
+/// The DNS label under which a `dns-persist-01` validation record is published.
+///
+/// The full record name for a domain is `_validation-persist.<domain>`, see
+/// [`dns_persist_01_record_name`].
+pub const DNS_PERSIST_01_LABEL: &str = "_validation-persist";
+
 #[derive(Debug)]
 pub struct Account {
     pub key_pair: EcdsaKeyPair,
@@ -204,6 +210,75 @@ impl Account {
         let certified_key = CertifiedKey::new(vec![cert.der().clone()], pk);
         Ok((challenge, certified_key))
     }
+
+    /// Selects the `dns-persist-01` challenge from a list of challenges.
+    ///
+    /// Unlike [`Account::tls_alpn_01`], this returns no key material: a
+    /// `dns-persist-01` challenge is satisfied by a standing DNS TXT record that
+    /// the domain operator publishes out of band, not by anything the client
+    /// serves during the handshake. See [`dns_persist_01_record_name`] and
+    /// [`dns_persist_01_record_value`] for constructing that record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcmeError::NoDnsPersist01Challenge`] if the authorization does
+    /// not offer a `dns-persist-01` challenge.
+    pub fn dns_persist_01<'a>(
+        &self,
+        challenges: &'a [Challenge],
+    ) -> Result<&'a Challenge, AcmeError> {
+        challenges
+            .iter()
+            .find(|c| c.typ == ChallengeType::DnsPersist01)
+            .ok_or(AcmeError::NoDnsPersist01Challenge)
+    }
+}
+
+/// Returns the DNS name at which a `dns-persist-01` validation record must be
+/// published for `domain`.
+///
+/// The returned name has no trailing dot, for example
+/// `_validation-persist.example.com`.
+pub fn dns_persist_01_record_name(domain: &str) -> String {
+    format!("{DNS_PERSIST_01_LABEL}.{domain}")
+}
+
+/// Builds the TXT record value for a `dns-persist-01` validation record.
+///
+/// The value follows the `issue-value` syntax of RFC 8659 section 4.2, as
+/// required by the `dns-persist-01` draft: the issuer domain name followed by a
+/// mandatory `accounturi` parameter. When `wildcard` is set, a `policy=wildcard`
+/// parameter is appended, which the draft requires for authorizing wildcard
+/// certificates.
+///
+/// `issuer_domain_name` must be one of the issuer domain names advertised by the
+/// CA (see [`Challenge::issuer_domain_names`]), and `account_uri` must be the
+/// URI of the ACME account that will request issuance (see [`Account::kid`]).
+///
+/// # Examples
+///
+/// ```
+/// # use tokio_rustls_acme::acme::dns_persist_01_record_value;
+/// let value = dns_persist_01_record_value(
+///     "letsencrypt.org",
+///     "https://acme-v02.api.letsencrypt.org/acme/acct/1234567890",
+///     false,
+/// );
+/// assert_eq!(
+///     value,
+///     "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/1234567890",
+/// );
+/// ```
+pub fn dns_persist_01_record_value(
+    issuer_domain_name: &str,
+    account_uri: &str,
+    wildcard: bool,
+) -> String {
+    let mut value = format!("{issuer_domain_name}; accounturi={account_uri}");
+    if wildcard {
+        value.push_str("; policy=wildcard");
+    }
+    value
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,14 +320,31 @@ impl ExternalAccountKey {
     }
 }
 
-#[derive(Debug, Deserialize, Eq, PartialEq)]
+/// An ACME challenge type.
+///
+/// Used both for deserializing the `type` field of challenge objects and for
+/// selecting the challenge this crate uses to prove domain control (see
+/// [`AcmeConfig::challenge_type`]). Only [`ChallengeType::TlsAlpn01`] and
+/// [`ChallengeType::DnsPersist01`] are supported as a selection.
+///
+/// [`AcmeConfig::challenge_type`]: crate::AcmeConfig::challenge_type
+#[derive(Debug, Clone, Copy, Deserialize, Default, Eq, PartialEq)]
 pub enum ChallengeType {
     #[serde(rename = "http-01")]
     Http01,
     #[serde(rename = "dns-01")]
     Dns01,
+    /// The `tls-alpn-01` challenge, served on the same port as regular TLS
+    /// traffic. This is the default and requires no external setup.
+    #[default]
     #[serde(rename = "tls-alpn-01")]
     TlsAlpn01,
+    /// The `dns-persist-01` challenge, validated against a standing
+    /// `_validation-persist` DNS TXT record that binds the domain to an ACME
+    /// account. The operator must publish this record out of band; see
+    /// [`dns_persist_01_record_value`].
+    #[serde(rename = "dns-persist-01")]
+    DnsPersist01,
     #[serde(other)]
     Unknown,
 }
@@ -283,6 +375,13 @@ pub struct Auth {
     pub status: AuthStatus,
     pub identifier: Identifier,
     pub challenges: Vec<Challenge>,
+    /// Whether this authorization is for a wildcard identifier.
+    ///
+    /// Set by the server (RFC 8555 section 7.1.4) when the order requested a
+    /// `*.` name. A `dns-persist-01` record authorizing such an order needs a
+    /// `policy=wildcard` parameter, see [`dns_persist_01_record_value`].
+    #[serde(default)]
+    pub wildcard: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,6 +409,22 @@ pub struct Challenge {
     pub url: String,
     #[serde(default)]
     pub token: String,
+    /// The URI of the ACME account, as echoed by the CA on a `dns-persist-01`
+    /// challenge.
+    ///
+    /// When present, it is the value the CA expects as the `accounturi`
+    /// parameter of the `_validation-persist` TXT record, and it matches the
+    /// account's [`Account::kid`]. It is informational and may be empty (not all
+    /// CAs populate it); clients should use their own [`Account::kid`] when
+    /// building the record.
+    #[serde(rename = "accounturi", default)]
+    pub account_uri: String,
+    /// The issuer domain names the CA accepts in a `dns-persist-01` record.
+    ///
+    /// The TXT record must lead with one of these names. Present only on
+    /// `dns-persist-01` challenges.
+    #[serde(rename = "issuer-domain-names", default)]
+    pub issuer_domain_names: Vec<String>,
     pub error: Option<Problem>,
 }
 
@@ -341,6 +456,8 @@ pub enum AcmeError {
     MissingHeader(&'static str),
     #[error("no tls-alpn-01 challenge found")]
     NoTlsAlpn01Challenge,
+    #[error("no dns-persist-01 challenge found")]
+    NoDnsPersist01Challenge,
 }
 
 fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeError> {

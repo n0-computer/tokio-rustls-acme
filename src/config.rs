@@ -1,5 +1,6 @@
 use crate::acme::{
-    ExternalAccountKey, LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY,
+    ChallengeType, ExternalAccountKey, LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+    LETS_ENCRYPT_STAGING_DIRECTORY,
 };
 use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
@@ -21,6 +22,7 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
+    pub(crate) challenge_type: ChallengeType,
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -79,6 +81,7 @@ impl AcmeConfig<Infallible, Infallible> {
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
+            challenge_type: ChallengeType::default(),
         }
     }
 }
@@ -87,6 +90,27 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     /// Set custom `rustls::ClientConfig` for ACME API calls.
     pub fn client_tls_config(mut self, client_config: Arc<ClientConfig>) -> Self {
         self.client_config = client_config;
+        self
+    }
+    /// Selects the ACME challenge type used to prove control of the domains.
+    ///
+    /// Defaults to [`ChallengeType::TlsAlpn01`], which is served on the same
+    /// port as regular TLS traffic and needs no external setup.
+    ///
+    /// Set [`ChallengeType::DnsPersist01`] to validate against a standing
+    /// `_validation-persist` DNS TXT record instead. That record binds the
+    /// domain to this client's ACME account, so it must be published out of band
+    /// before issuance and the account must be reused across runs (configure a
+    /// persistent [`cache`](Self::cache)). The required record name and value
+    /// are logged at info level on each authorization; build them directly with
+    /// [`dns_persist_01_record_name`](crate::acme::dns_persist_01_record_name)
+    /// and
+    /// [`dns_persist_01_record_value`](crate::acme::dns_persist_01_record_value).
+    ///
+    /// Only [`ChallengeType::TlsAlpn01`] and [`ChallengeType::DnsPersist01`] are
+    /// supported; selecting any other variant fails the order.
+    pub fn challenge_type(mut self, challenge_type: ChallengeType) -> Self {
+        self.challenge_type = challenge_type;
         self
     }
     pub fn directory(mut self, directory_url: impl AsRef<str>) -> Self {
@@ -139,6 +163,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             contact: self.contact,
             cache: Box::new(cache),
             eab: self.eab,
+            challenge_type: self.challenge_type,
         }
     }
     pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(

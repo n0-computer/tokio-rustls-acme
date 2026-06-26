@@ -1,6 +1,7 @@
 //! An easy-to-use, async compatible [ACME] client library using [rustls] with [ring].
-//! The validation mechanism used is tls-alpn-01, which allows serving acme challenge responses and
-//! regular TLS traffic on the same port.
+//! The default validation mechanism is tls-alpn-01, which allows serving acme challenge responses
+//! and regular TLS traffic on the same port. The dns-persist-01 challenge is also supported, see
+//! [Challenge types](#challenge-types).
 //!
 //! Is designed to use the tokio runtime, if you need support for other runtimes take a look
 //! at the original implementation [rustls-acme](https://github.com/FlorianUekermann/rustls-acme).
@@ -94,6 +95,23 @@
 //! If you want to avoid different specializations based on cache type use the
 //! [AcmeConfig::cache_with_boxed_err] method to construct the an [AcmeConfig] object.
 //!
+//!
+//! ## Challenge types
+//!
+//! By default this crate proves domain control with the tls-alpn-01 challenge, which needs no
+//! setup beyond serving TLS on the configured port.
+//!
+//! Alternatively, [AcmeConfig::challenge_type] can select [acme::ChallengeType::DnsPersist01]
+//! ([dns-persist-01](https://datatracker.ietf.org/doc/draft-ietf-acme-dns-persist/)). That
+//! challenge is satisfied by a standing `_validation-persist` DNS TXT record that binds the domain
+//! to this client's ACME account, rather than by anything served during the handshake. Because the
+//! record must be published out of band before issuance, two things are required:
+//!
+//! - A persistent account, so the account URI the record is bound to stays stable across runs.
+//!   Configure a [Cache] (such as [caches::DirCache]).
+//! - The `_validation-persist.<domain>` TXT record, published through your DNS provider. The
+//!   required name and value are logged on each authorization and can be built directly with
+//!   [acme::dns_persist_01_record_name] and [acme::dns_persist_01_record_value].
 //!
 //! ## The acme module
 //!

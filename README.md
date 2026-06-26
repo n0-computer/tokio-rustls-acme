@@ -37,8 +37,10 @@
 > Original implementation based on https://github.com/FlorianUekermann/rustls-acme. 
 
 An easy-to-use, async compatible [ACME] client library using [rustls] with [ring].
-The validation mechanism used is tls-alpn-01, which allows serving acme challenge responses and
-regular TLS traffic on the same port.
+The default validation mechanism is tls-alpn-01, which allows serving acme challenge responses and
+regular TLS traffic on the same port. The dns-persist-01 challenge is also supported via
+`AcmeConfig::challenge_type`, validated against a standing `_validation-persist` DNS TXT record that
+binds the domain to the client's ACME account (the record must be published out of band).
 
 Is designed to use the tokio runtime, if you need support for other runtimes take a look
 at the original implementation [rustls-acme](https://github.com/FlorianUekermann/rustls-acme).

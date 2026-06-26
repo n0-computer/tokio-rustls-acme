@@ -21,7 +21,8 @@ use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
-    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
+    dns_persist_01_record_name, dns_persist_01_record_value, Account, AcmeError, Auth, AuthStatus,
+    ChallengeType, Directory, Identifier, Order, OrderStatus,
 };
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
@@ -88,6 +89,8 @@ pub enum OrderError {
     TooManyAttemptsAuth(String),
     #[error("order status stayed on processing too long")]
     ProcessingTimeout(Order),
+    #[error("unsupported challenge type: {0:?}")]
+    UnsupportedChallengeType(ChallengeType),
 }
 
 #[derive(Error, Debug)]
@@ -312,13 +315,36 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             AuthStatus::Pending => {
                 let Identifier::Dns(domain) = auth.identifier;
                 log::info!("trigger challenge for {}", &domain);
-                let (challenge, auth_key) =
-                    account.tls_alpn_01(&auth.challenges, domain.clone())?;
-                resolver.set_auth_key(domain.clone(), Arc::new(auth_key));
+                let challenge_url = match config.challenge_type {
+                    ChallengeType::TlsAlpn01 => {
+                        let (challenge, auth_key) =
+                            account.tls_alpn_01(&auth.challenges, domain.clone())?;
+                        resolver.set_auth_key(domain.clone(), Arc::new(auth_key));
+                        challenge.url.clone()
+                    }
+                    ChallengeType::DnsPersist01 => {
+                        let challenge = account.dns_persist_01(&auth.challenges)?;
+                        // The validation record is published out of band by the
+                        // operator. Log exactly what it must contain so it can be
+                        // provisioned for this account. The account URI is our own
+                        // kid (the CA's `accounturi` field is only informational),
+                        // and the issuer domain name comes from the challenge.
+                        if let Some(issuer) = challenge.issuer_domain_names.first() {
+                            log::info!(
+                                "dns-persist-01 for {} requires TXT record {} with value {:?}",
+                                &domain,
+                                dns_persist_01_record_name(&domain),
+                                dns_persist_01_record_value(issuer, &account.kid, auth.wildcard),
+                            );
+                        }
+                        challenge.url.clone()
+                    }
+                    other => return Err(OrderError::UnsupportedChallengeType(other)),
+                };
                 account
-                    .challenge(&config.client_config, &challenge.url)
+                    .challenge(&config.client_config, &challenge_url)
                     .await?;
-                (domain, challenge.url.clone())
+                (domain, challenge_url)
             }
             AuthStatus::Valid => return Ok(()),
             _ => return Err(OrderError::BadAuth(auth)),
