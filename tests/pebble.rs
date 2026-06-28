@@ -18,12 +18,25 @@ use rustls::{
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls_acme::{
+    acme::{
+        dns_persist_01_record_name, dns_persist_01_record_value, Account, AuthStatus,
+        ChallengeType, Directory,
+    },
     caches::{DirCache, NoCache},
     AccountCache, AcmeConfig, CertCache, EventOk, ResolvesServerCertAcme,
 };
 
 const PEBBLE_DIRECTORY: &str = "https://localhost:14000/dir";
 const PEBBLE_MGMT: &str = "https://localhost:15000";
+/// Directory of the second Pebble instance, which performs real validation
+/// against challtestsrv. Used by the dns-persist-01 tests.
+const PEBBLE_DNS_DIRECTORY: &str = "https://localhost:14001/dir";
+const PEBBLE_DNS_MGMT: &str = "https://localhost:15001";
+/// Management API of the mock DNS server (pebble-challtestsrv).
+const CHALLTESTSRV: &str = "http://localhost:8055";
+/// Issuer domain name advertised by Pebble (its `caaIdentities`), which must
+/// lead the dns-persist-01 TXT record value.
+const PEBBLE_ISSUER_DOMAIN: &str = "pebble.letsencrypt.org";
 const TEST_DOMAIN: &str = "pebble-test.example.com";
 const TEST_DOMAINS: &[&str] = &[
     "pebble-multi-1.example.com",
@@ -66,6 +79,15 @@ fn http_client() -> reqwest::Client {
 /// Fetch Pebble's ACME-issued root + intermediate certs and build a root store
 /// for verifying certs issued by Pebble's CA.
 async fn pebble_acme_root_store() -> RootCertStore {
+    pebble_acme_root_store_at(PEBBLE_MGMT).await
+}
+
+/// Like [`pebble_acme_root_store`] but for a specific management API endpoint.
+///
+/// Each Pebble instance generates its own CA at startup, so certs issued by
+/// `pebble-dns` must be verified against roots fetched from its own management
+/// API (port 15001), not the default instance's.
+async fn pebble_acme_root_store_at(mgmt: &str) -> RootCertStore {
     let client = http_client();
     let mut root_store = RootCertStore::empty();
 
@@ -73,7 +95,7 @@ async fn pebble_acme_root_store() -> RootCertStore {
     // PEBBLE_ALTERNATE_ROOTS is enabled). 404s are expected and skipped.
     for kind in &["roots", "intermediates"] {
         for index in 0..2 {
-            let url = format!("{PEBBLE_MGMT}/{kind}/{index}");
+            let url = format!("{mgmt}/{kind}/{index}");
             let resp = client.get(&url).send().await.unwrap_or_else(|e| {
                 panic!("failed to reach Pebble management API at {}: {}", url, e)
             });
@@ -508,4 +530,256 @@ async fn test_multi_domain_san() {
         );
     }
     eprintln!("multi-domain SANs: {sans:?}");
+}
+
+// --- dns-persist-01 -------------------------------------------------------
+//
+// These tests run against the `pebble-dns` instance, which performs real
+// validation (PEBBLE_VA_ALWAYS_VALID is not set) and resolves DNS through
+// challtestsrv. We publish the `_validation-persist` TXT record via
+// challtestsrv's management API and let the VA verify it.
+
+/// Publish a TXT record at `host` (with trailing dot) via challtestsrv.
+async fn set_txt(host: &str, value: &str) {
+    let client = http_client();
+    let body = serde_json::json!({ "host": host, "value": value }).to_string();
+    let resp = client
+        .post(format!("{CHALLTESTSRV}/set-txt"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("challtestsrv set-txt request failed");
+    assert!(
+        resp.status().is_success(),
+        "challtestsrv set-txt returned {}",
+        resp.status()
+    );
+}
+
+/// Remove the TXT record at `host` (with trailing dot) via challtestsrv.
+async fn clear_txt(host: &str) {
+    let client = http_client();
+    let body = serde_json::json!({ "host": host }).to_string();
+    let _ = client
+        .post(format!("{CHALLTESTSRV}/clear-txt"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await;
+}
+
+/// Register a fresh ACME account against `pebble-dns` and return it.
+async fn new_dns_account(client_config: &Arc<ClientConfig>) -> Account {
+    let directory = Directory::discover(client_config, PEBBLE_DNS_DIRECTORY)
+        .await
+        .expect("directory discovery failed");
+    let key_pair = Account::generate_key_pair();
+    Account::create_with_keypair(
+        client_config,
+        directory,
+        &Vec::<String>::new(),
+        &key_pair,
+        &None,
+    )
+    .await
+    .expect("account creation failed")
+}
+
+/// Poll an authorization until it leaves the pending state, returning the
+/// terminal status.
+async fn poll_auth_status(
+    client_config: &Arc<ClientConfig>,
+    account: &Account,
+    auth_url: &str,
+) -> AuthStatus {
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let auth = account
+            .auth(client_config, auth_url)
+            .await
+            .expect("auth fetch failed");
+        match auth.status {
+            AuthStatus::Pending => continue,
+            other => return other,
+        }
+    }
+    panic!("authorization did not reach a terminal state in time");
+}
+
+/// A correctly provisioned `_validation-persist` record satisfies the challenge.
+///
+/// Drives the low-level `acme` module: order, read the dns-persist-01 challenge,
+/// publish the matching TXT record, respond, and confirm the VA marks the
+/// authorization valid. This exercises the real wire format end to end.
+#[tokio::test]
+#[ignore]
+async fn test_dns_persist_01_validates() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+    let domain = "dns-persist-ok.example.com";
+
+    let client_config = pebble_client_config();
+    let account = new_dns_account(&client_config).await;
+    let (_order_url, order) = account
+        .new_order(&client_config, vec![domain.to_string()])
+        .await
+        .expect("new_order failed");
+
+    let auth_url = &order.authorizations[0];
+    let auth = account
+        .auth(&client_config, auth_url)
+        .await
+        .expect("auth fetch failed");
+
+    let challenge = account
+        .dns_persist_01(&auth.challenges)
+        .expect("no dns-persist-01 challenge offered");
+
+    // The challenge advertises the accepted issuer domains. The accounturi field
+    // is informational and may be empty; when present it must equal our kid.
+    assert!(
+        challenge
+            .issuer_domain_names
+            .contains(&PEBBLE_ISSUER_DOMAIN.to_string()),
+        "expected issuer {} in {:?}",
+        PEBBLE_ISSUER_DOMAIN,
+        challenge.issuer_domain_names
+    );
+    assert!(
+        challenge.account_uri.is_empty() || challenge.account_uri == account.kid,
+        "challenge accounturi {:?} should be empty or equal the account kid {:?}",
+        challenge.account_uri,
+        account.kid
+    );
+
+    let record_name = format!("{}.", dns_persist_01_record_name(domain));
+    let record_value = dns_persist_01_record_value(PEBBLE_ISSUER_DOMAIN, &account.kid, false);
+    set_txt(&record_name, &record_value).await;
+
+    account
+        .challenge(&client_config, &challenge.url)
+        .await
+        .expect("challenge response failed");
+
+    let status = poll_auth_status(&client_config, &account, auth_url).await;
+    clear_txt(&record_name).await;
+    assert!(
+        matches!(status, AuthStatus::Valid),
+        "authorization should be valid, got {:?}",
+        status
+    );
+}
+
+/// A missing `_validation-persist` record fails validation.
+///
+/// The mirror of [`test_dns_persist_01_validates`] without publishing the
+/// record, confirming the VA actually checks DNS rather than rubber-stamping.
+#[tokio::test]
+#[ignore]
+async fn test_dns_persist_01_missing_record_fails() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+    let domain = "dns-persist-missing.example.com";
+
+    let client_config = pebble_client_config();
+    let account = new_dns_account(&client_config).await;
+
+    // Make sure no stale record lingers from a previous run.
+    clear_txt(&format!("{}.", dns_persist_01_record_name(domain))).await;
+
+    let (_order_url, order) = account
+        .new_order(&client_config, vec![domain.to_string()])
+        .await
+        .expect("new_order failed");
+    let auth_url = &order.authorizations[0];
+    let auth = account
+        .auth(&client_config, auth_url)
+        .await
+        .expect("auth fetch failed");
+    let challenge = account
+        .dns_persist_01(&auth.challenges)
+        .expect("no dns-persist-01 challenge offered");
+
+    account
+        .challenge(&client_config, &challenge.url)
+        .await
+        .expect("challenge response failed");
+
+    let status = poll_auth_status(&client_config, &account, auth_url).await;
+    assert!(
+        matches!(status, AuthStatus::Invalid),
+        "authorization should be invalid without a record, got {:?}",
+        status
+    );
+}
+
+/// The high-level state machine issues a certificate via dns-persist-01.
+///
+/// Registers the account up front to learn its kid, publishes the matching
+/// record, seeds the account into a cache so the state machine reuses it, then
+/// runs `AcmeConfig` with `ChallengeType::DnsPersist01` and verifies the
+/// resulting certificate serves a TLS handshake.
+#[tokio::test]
+#[ignore]
+async fn test_dns_persist_01_state_machine() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+    let domain = "dns-persist-hl.example.com";
+
+    let client_config = pebble_client_config();
+
+    // Register the account first so we know its kid, then publish the record.
+    // We keep the raw key bytes so the same account can be seeded into the cache
+    // and reused by the state machine.
+    let key_pair = Account::generate_key_pair();
+    let directory = Directory::discover(&client_config, PEBBLE_DNS_DIRECTORY)
+        .await
+        .expect("directory discovery failed");
+    let account = Account::create_with_keypair(
+        &client_config,
+        directory,
+        &Vec::<String>::new(),
+        &key_pair,
+        &None,
+    )
+    .await
+    .expect("account creation failed");
+
+    let record_name = format!("{}.", dns_persist_01_record_name(domain));
+    let record_value = dns_persist_01_record_value(PEBBLE_ISSUER_DOMAIN, &account.kid, false);
+    set_txt(&record_name, &record_value).await;
+
+    // Seed the account key into a cache so the state machine reuses the same
+    // account (and therefore the same kid the record is bound to).
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path: PathBuf = cache_dir.path().into();
+    DirCache::new(cache_path.clone())
+        .store_account(&[], PEBBLE_DNS_DIRECTORY, &key_pair)
+        .await
+        .expect("seeding account cache failed");
+
+    let config: AcmeConfig<io::Error> =
+        AcmeConfig::new_with_client_tls_config([domain], client_config)
+            .directory(PEBBLE_DNS_DIRECTORY)
+            .challenge_type(ChallengeType::DnsPersist01)
+            .cache(DirCache::new(cache_path));
+
+    let mut state = config.state();
+    let resolver = state.resolver();
+
+    let deploy = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match state.next().await {
+                Some(Ok(EventOk::DeployedNewCert)) => return,
+                Some(Ok(event)) => eprintln!("event: {event:?}"),
+                Some(Err(err)) => panic!("ACME error: {:?}", err),
+                None => panic!("state stream ended unexpectedly"),
+            }
+        }
+    })
+    .await;
+    clear_txt(&record_name).await;
+    deploy.expect("timed out waiting for dns-persist-01 certificate");
+
+    let root_store = pebble_acme_root_store_at(PEBBLE_DNS_MGMT).await;
+    let peer_certs = verify_tls_handshake_for(resolver, root_store, domain).await;
+    assert!(!peer_certs.is_empty(), "should have received certificates");
 }

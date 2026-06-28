@@ -1,4 +1,7 @@
 services:
+  # Default Pebble instance with validation bypassed (PEBBLE_VA_ALWAYS_VALID).
+  # The tls-alpn-01 tests run the resolver in-process and never expose a port to
+  # Pebble, so real validation could not reach them.
   pebble:
     image: ghcr.io/letsencrypt/pebble:latest
     command: ["-config", "/test/config/pebble-config.json"]
@@ -11,3 +14,32 @@ services:
       PEBBLE_VA_NOSLEEP: "1"
       PEBBLE_VA_ALWAYS_VALID: "1"
       PEBBLE_WFE_NONCEREJECT: "0"
+
+  # Second Pebble instance that performs real validation, using challtestsrv as
+  # its DNS resolver. The dns-persist-01 tests use this instance so the VA
+  # actually queries the _validation-persist TXT record we publish.
+  pebble-dns:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command:
+      - "-config"
+      - "/test/config/pebble-config.json"
+      - "-dnsserver"
+      - "challtestsrv:8053"
+    ports:
+      - "14001:14000"
+      - "15001:15000"
+    volumes:
+      - ./test/pebble-config.json:/test/config/pebble-config.json:ro
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_WFE_NONCEREJECT: "0"
+    depends_on:
+      - challtestsrv
+
+  # Mock DNS server with an HTTP management API on port 8055, used to publish the
+  # dns-persist-01 validation records that pebble-dns checks.
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    command: ["-defaultIPv6", "", "-defaultIPv4", ""]
+    ports:
+      - "8055:8055"
