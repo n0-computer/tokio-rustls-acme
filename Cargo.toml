@@ -51,7 +51,7 @@ version = "1.0.78"
 # This is a transitive dependency, we specify it to make sure we have
 # a recent-enough version so that -Z minimal-versions crate resolution
 # works.
-version = "0.4.4"
+version = "0.5.1"
 
 [dev-dependencies]
 simple_logger = "5.0"
