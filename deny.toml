@@ -1,0 +1,24 @@
+[bans]
+multiple-versions = "allow"
+deny = ["native-tls", "openssl"]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",            # Community Data License Agreement Permissive 2.0 due to webpki-root-certs
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",                      # https://unlicense.org/
+]
+
+[advisories]
+yanked = "deny"
+ignore = [
+  "RUSTSEC-2026-0258", # dev-only: warp -> hyper 0.14 -> h2 0.3; remove once warp moves to hyper 1.x
+]
+
+[sources]
+allow-git = []

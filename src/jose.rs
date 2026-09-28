@@ -19,7 +19,7 @@ pub(crate) fn sign(
     };
     let protected = Protected::base64(jwk, kid, Some(nonce.as_ref()), url)?;
     let payload = URL_SAFE_NO_PAD.encode(payload);
-    let combined = format!("{}.{}", &protected, &payload);
+    let combined = format!("{}.{}", protected, payload);
     let signature = key.sign(&SystemRandom::new(), combined.as_bytes())?;
     let signature = URL_SAFE_NO_PAD.encode(signature.as_ref());
     let body = Body {
@@ -38,7 +38,7 @@ pub(crate) fn sign_eab(
 ) -> Result<Body, JoseError> {
     let protected = Protected::hmac_base64(kid, url)?;
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Jwk::new(key))?);
-    let combined = format!("{}.{}", &protected, &payload);
+    let combined = format!("{}.{}", protected, payload);
     let signature = ring::hmac::sign(eab_key, combined.as_bytes());
     let signature = URL_SAFE_NO_PAD.encode(signature.as_ref());
     let body = Body {
