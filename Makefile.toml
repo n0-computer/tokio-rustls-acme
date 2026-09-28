@@ -39,3 +39,13 @@ args = ["test", "--locked", "--test", "pebble", "--", "--ignored", "--nocapture"
 clear = true
 description = "Run Pebble integration tests e2e (start server, test, stop)"
 run_task = { name = ["pebble-test-run"], fork = true, cleanup_task = "pebble-down" }
+
+[tasks.check-external-types]
+description = "Run cargo check-external-types on workspace crates"
+workspace = true
+# cargo check-external-types needs a specific nightly toolchain,
+# see https://github.com/awslabs/cargo-check-external-types#how-to-use
+toolchain = "${TOOLCHAIN:nightly-2026-03-20}"
+command = "cargo"
+install_crate = false
+args = ["check-external-types", "--all-features"]
