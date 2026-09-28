@@ -68,6 +68,23 @@ x509-parser = "0.18"
 all-features = true
 rustdoc-args = ["--cfg", "doc_auto_cfg"]
 
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "axum_server::*",
+    "futures_core::*",
+    "nom::*",
+    "pem::*",
+    "rcgen::*",
+    "ring::*",
+    "rustls::*",
+    "serde_core::*",
+    "serde_json::*",
+    "tokio::*",
+    "tokio_rustls",
+    "tokio_rustls::*",
+    "x509_parser::*",
+]
+
 [features]
 default = ["rustls-tls-webpki-roots"]
 axum = ["dep:axum-server"]
