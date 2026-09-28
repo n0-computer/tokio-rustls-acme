@@ -1,3 +1,0 @@
-Name   Project  Compat  Latest  Kind    Platform
-----   -------  ------  ------  ----    --------
-rcgen  0.12.1   ---     0.13.1  Normal  ---
