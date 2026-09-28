@@ -33,7 +33,7 @@ description = "Run Pebble integration tests"
 dependencies = ["pebble-cert"]
 env = { "PEBBLE_MINICA_CERT" = "./pebble.minica.pem" }
 command = "cargo"
-args = ["test", "--test", "pebble", "--", "--ignored", "--nocapture"]
+args = ["test", "--locked", "--test", "pebble", "--", "--ignored", "--nocapture"]
 
 [tasks.test]
 clear = true

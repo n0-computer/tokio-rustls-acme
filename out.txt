@@ -1,0 +1,216 @@
+    Checking tokio-rustls-acme v0.5.0 (/Users/arqu/dev/n0/tokio-rustls-acme)
+warning: unused import: `Display`
+ --> src/caches/boxed.rs:3:23
+  |
+3 | use std::fmt::{Debug, Display};
+  |                       ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+error[E0277]: `(dyn std::fmt::Debug + 'static)` doesn't implement `std::fmt::Display`
+  --> src/caches/boxed.rs:27:15
+   |
+27 |     type EC = Box<dyn Debug>;
+   |               ^^^^^^^^^^^^^^ `(dyn std::fmt::Debug + 'static)` cannot be formatted with the default formatter
+   |
+   = help: the trait `std::fmt::Display` is not implemented for `(dyn std::fmt::Debug + 'static)`, which is required by `Box<(dyn std::fmt::Debug + 'static)>: std::fmt::Display`
+   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   = help: the following other types implement trait `std::fmt::Display`:
+             (dyn tracing_core::field::Value + 'static)
+             dyn Expected
+   = note: required for `Box<(dyn std::fmt::Debug + 'static)>` to implement `std::fmt::Display`
+note: required by a bound in `cache::CertCache::EC`
+  --> src/cache.rs:11:22
+   |
+11 |     type EC: Debug + Display;
+   |                      ^^^^^^^ required by this bound in `CertCache::EC`
+
+error[E0277]: `<C as cache::AccountCache>::EA` doesn't implement `std::fmt::Display`
+   --> src/config.rs:120:57
+    |
+120 |     pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> {
+    |                                                         ^^^^^^^^^^^^^^^^^^^^^^^^ `<C as cache::AccountCache>::EA` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `<C as cache::AccountCache>::EA`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+note: required by a bound in `config::AcmeConfig`
+   --> src/config.rs:16:56
+    |
+16  | pub struct AcmeConfig<EC: Debug + Display, EA: Debug + Display = EC> {
+    |                                                        ^^^^^^^ required by this bound in `AcmeConfig`
+help: consider further restricting the associated type
+    |
+120 |     pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> where <C as cache::AccountCache>::EA: std::fmt::Display {
+    |                                                                                  +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: `<CA as cache::AccountCache>::EA` doesn't implement `std::fmt::Display`
+   --> src/config.rs:133:10
+    |
+133 |     ) -> AcmeConfig<CC::EC, CA::EA> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^ `<CA as cache::AccountCache>::EA` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `<CA as cache::AccountCache>::EA`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+note: required by a bound in `config::AcmeConfig`
+   --> src/config.rs:16:56
+    |
+16  | pub struct AcmeConfig<EC: Debug + Display, EA: Debug + Display = EC> {
+    |                                                        ^^^^^^^ required by this bound in `AcmeConfig`
+help: consider further restricting the associated type
+    |
+133 |     ) -> AcmeConfig<CC::EC, CA::EA> where <CA as cache::AccountCache>::EA: std::fmt::Display {
+    |                                     ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: `(dyn std::fmt::Debug + 'static)` doesn't implement `std::fmt::Display`
+   --> src/config.rs:136:72
+    |
+136 |     pub fn cache_with_boxed_err<C: 'static + Cache>(self, cache: C) -> AcmeConfig<Box<dyn Debug>> {
+    |                                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ `(dyn std::fmt::Debug + 'static)` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `(dyn std::fmt::Debug + 'static)`, which is required by `Box<(dyn std::fmt::Debug + 'static)>: std::fmt::Display`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = help: the following other types implement trait `std::fmt::Display`:
+              (dyn tracing_core::field::Value + 'static)
+              dyn Expected
+    = note: required for `Box<(dyn std::fmt::Debug + 'static)>` to implement `std::fmt::Display`
+note: required by a bound in `config::AcmeConfig`
+   --> src/config.rs:16:35
+    |
+16  | pub struct AcmeConfig<EC: Debug + Display, EA: Debug + Display = EC> {
+    |                                   ^^^^^^^ required by this bound in `AcmeConfig`
+
+error[E0277]: `<C as cache::AccountCache>::EA` doesn't implement `std::fmt::Display`
+   --> src/config.rs:139:72
+    |
+139 |     pub fn cache_option<C: 'static + Cache>(self, cache: Option<C>) -> AcmeConfig<C::EC, C::EA> {
+    |                                                                        ^^^^^^^^^^^^^^^^^^^^^^^^ `<C as cache::AccountCache>::EA` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `<C as cache::AccountCache>::EA`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+note: required by a bound in `config::AcmeConfig`
+   --> src/config.rs:16:56
+    |
+16  | pub struct AcmeConfig<EC: Debug + Display, EA: Debug + Display = EC> {
+    |                                                        ^^^^^^^ required by this bound in `AcmeConfig`
+help: consider further restricting the associated type
+    |
+139 |     pub fn cache_option<C: 'static + Cache>(self, cache: Option<C>) -> AcmeConfig<C::EC, C::EA> where <C as cache::AccountCache>::EA: std::fmt::Display {
+    |                                                                                                 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: `<C as cache::AccountCache>::EA` doesn't implement `std::fmt::Display`
+   --> src/config.rs:126:20
+    |
+126 |             cache: Box::new(cache),
+    |                    ^^^^^^^^^^^^^^^ `<C as cache::AccountCache>::EA` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `<C as cache::AccountCache>::EA`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+note: required by a bound in `config::AcmeConfig`
+   --> src/config.rs:16:56
+    |
+16  | pub struct AcmeConfig<EC: Debug + Display, EA: Debug + Display = EC> {
+    |                                                        ^^^^^^^ required by this bound in `AcmeConfig`
+help: consider further restricting the associated type
+    |
+120 |     pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> where <C as cache::AccountCache>::EA: std::fmt::Display {
+    |                                                                                  +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: `<CA as cache::AccountCache>::EA` doesn't implement `std::fmt::Display`
+   --> src/config.rs:134:14
+    |
+134 |         self.cache(CompositeCache::new(cert_cache, account_cache))
+    |              ^^^^^ `<CA as cache::AccountCache>::EA` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `<CA as cache::AccountCache>::EA`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+note: required by a bound in `config::AcmeConfig`
+   --> src/config.rs:16:56
+    |
+16  | pub struct AcmeConfig<EC: Debug + Display, EA: Debug + Display = EC> {
+    |                                                        ^^^^^^^ required by this bound in `AcmeConfig`
+help: consider further restricting the associated type
+    |
+133 |     ) -> AcmeConfig<CC::EC, CA::EA> where <CA as cache::AccountCache>::EA: std::fmt::Display {
+    |                                     ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: `(dyn std::fmt::Debug + 'static)` doesn't implement `std::fmt::Display`
+   --> src/config.rs:137:14
+    |
+137 |         self.cache(BoxedErrCache::new(cache))
+    |              ^^^^^ `(dyn std::fmt::Debug + 'static)` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `(dyn std::fmt::Debug + 'static)`, which is required by `Box<(dyn std::fmt::Debug + 'static)>: std::fmt::Display`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+    = help: the following other types implement trait `std::fmt::Display`:
+              (dyn tracing_core::field::Value + 'static)
+              dyn Expected
+    = note: required for `Box<(dyn std::fmt::Debug + 'static)>` to implement `std::fmt::Display`
+note: required by a bound in `config::AcmeConfig`
+   --> src/config.rs:16:35
+    |
+16  | pub struct AcmeConfig<EC: Debug + Display, EA: Debug + Display = EC> {
+    |                                   ^^^^^^^ required by this bound in `AcmeConfig`
+
+error[E0277]: `<C as cache::AccountCache>::EA` doesn't implement `std::fmt::Display`
+   --> src/config.rs:141:33
+    |
+141 |             Some(cache) => self.cache(cache),
+    |                                 ^^^^^ `<C as cache::AccountCache>::EA` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `<C as cache::AccountCache>::EA`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+note: required by a bound in `config::AcmeConfig`
+   --> src/config.rs:16:56
+    |
+16  | pub struct AcmeConfig<EC: Debug + Display, EA: Debug + Display = EC> {
+    |                                                        ^^^^^^^ required by this bound in `AcmeConfig`
+help: consider further restricting the associated type
+    |
+139 |     pub fn cache_option<C: 'static + Cache>(self, cache: Option<C>) -> AcmeConfig<C::EC, C::EA> where <C as cache::AccountCache>::EA: std::fmt::Display {
+    |                                                                                                 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0599]: the function or associated item `new` exists for struct `NoCache<<C as CertCache>::EC, <C as AccountCache>::EA>`, but its trait bounds were not satisfied
+   --> src/config.rs:142:57
+    |
+142 |             None => self.cache(NoCache::<C::EC, C::EA>::new()),
+    |                                                         ^^^ function or associated item cannot be called due to unsatisfied trait bounds
+    |
+   ::: src/caches/no.rs:16:1
+    |
+16  | pub struct NoCache<EC:  Display + Debug = Infallible, EA: Display + Debug = Infallible> {
+    | --------------------------------------------------------------------------------------- function or associated item `new` not found for this struct
+    |
+note: trait bound `<C as cache::AccountCache>::EA: std::fmt::Display` was not satisfied
+   --> src/caches/no.rs:30:39
+    |
+30  | impl<EC: Debug + Display, EA: Debug + Display> NoCache<EC, EA> {
+    |                                       ^^^^^^^  ---------------
+    |                                       |
+    |                                       unsatisfied trait bound introduced here
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following traits define an item `new`, perhaps you need to implement one of them:
+            candidate #1: `BoundKey`
+            candidate #2: `parking_lot_core::thread_parker::ThreadParkerT`
+
+error[E0277]: `<C as cache::AccountCache>::EA` doesn't implement `std::fmt::Display`
+   --> src/config.rs:142:32
+    |
+142 |             None => self.cache(NoCache::<C::EC, C::EA>::new()),
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^ `<C as cache::AccountCache>::EA` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `<C as cache::AccountCache>::EA`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+note: required by a bound in `no::NoCache`
+   --> src/caches/no.rs:16:59
+    |
+16  | pub struct NoCache<EC:  Display + Debug = Infallible, EA: Display + Debug = Infallible> {
+    |                                                           ^^^^^^^ required by this bound in `NoCache`
+help: consider further restricting the associated type
+    |
+139 |     pub fn cache_option<C: 'static + Cache>(self, cache: Option<C>) -> AcmeConfig<C::EC, C::EA> where <C as cache::AccountCache>::EA: std::fmt::Display {
+    |                                                                                                 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Some errors have detailed explanations: E0277, E0599.
+For more information about an error, try `rustc --explain E0277`.
+warning: `tokio-rustls-acme` (lib) generated 1 warning
+error: could not compile `tokio-rustls-acme` (lib) due to 11 previous errors; 1 warning emitted

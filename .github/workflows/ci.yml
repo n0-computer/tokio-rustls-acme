@@ -24,7 +24,7 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features
+        run: cargo clippy --locked --workspace --all-targets --all-features
 
   test:
     runs-on: ${{ matrix.target.os }}
@@ -56,7 +56,7 @@ jobs:
           targets: ${{ matrix.target.toolchain }}
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo test
-        run: cargo test --workspace --all-features --bins --tests --examples
+        run: cargo test --locked --workspace --all-features --bins --tests --examples
 
   # Checks correct runtime deps and features are requested by not including dev-dependencies.
   check-deps:
@@ -68,7 +68,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo check
-        run: cargo check --workspace --all-features --lib --bins
+        run: cargo check --locked --workspace --all-features --lib --bins
 
   minimal-crates:
     runs-on: ubuntu-latest
@@ -81,4 +81,6 @@ jobs:
       - name: cargo check
         run: |
           rm -f Cargo.lock
-          cargo +nightly check -Z minimal-versions --workspace --all-features --lib --bins
+          cargo +nightly check -Z minimal-versions -Z min-publish-age \
+            --config 'registry.global-min-publish-age="3 days"' \
+            --workspace --all-features --lib --bins
