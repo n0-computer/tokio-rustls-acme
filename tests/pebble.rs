@@ -13,8 +13,9 @@ use std::{convert::TryFrom, io, path::PathBuf, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use rustls::{
+    crypto::CryptoProvider,
     pki_types::{CertificateDer, ServerName},
-    ClientConfig, RootCertStore, ServerConfig,
+    ClientConfig, RootCertStore, ServerConfig, DEFAULT_VERSIONS,
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls_acme::{
@@ -37,6 +38,13 @@ fn load_minica_cert() -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {}", path, e))
 }
 
+/// Returns a fresh ring crypto provider. The pebble tests pin themselves to
+/// ring (via the dev-dependency) regardless of which crate features are on,
+/// so they never depend on the process-wide default provider.
+fn test_crypto_provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
 /// Build a rustls ClientConfig that trusts Pebble's minica root (for ACME API calls).
 fn pebble_client_config() -> Arc<ClientConfig> {
     let minica_pem = load_minica_cert();
@@ -49,14 +57,24 @@ fn pebble_client_config() -> Arc<ClientConfig> {
             .expect("failed to add minica cert to root store");
     }
     Arc::new(
-        ClientConfig::builder()
+        ClientConfig::builder_with_provider(test_crypto_provider())
+            .with_protocol_versions(DEFAULT_VERSIONS)
+            .unwrap()
             .with_root_certificates(root_store)
             .with_no_client_auth(),
     )
 }
 
-/// Insecure reqwest client for Pebble management API calls.
+/// Reqwest client that talks to Pebble's management API.
+///
+/// Installs ring as the process-wide default `CryptoProvider` so reqwest's
+/// `rustls-no-provider` build path can construct its own TLS config without
+/// panicking. This is fine for the pebble tests because the only crypto
+/// provider in scope here is ring (pinned via the `rustls` dev-dependency)
+/// and the assertion in `tests/crypto_provider.rs` runs in a separate test
+/// binary.
 fn http_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -175,14 +193,18 @@ async fn verify_tls_handshake_for(
     domain: &str,
 ) -> Vec<CertificateDer<'static>> {
     let server_config = Arc::new(
-        ServerConfig::builder()
+        ServerConfig::builder_with_provider(test_crypto_provider())
+            .with_protocol_versions(DEFAULT_VERSIONS)
+            .unwrap()
             .with_no_client_auth()
             .with_cert_resolver(resolver),
     );
     let acceptor = TlsAcceptor::from(server_config);
 
     let client_config = Arc::new(
-        ClientConfig::builder()
+        ClientConfig::builder_with_provider(test_crypto_provider())
+            .with_protocol_versions(DEFAULT_VERSIONS)
+            .unwrap()
             .with_root_certificates(root_store)
             .with_no_client_auth(),
     );

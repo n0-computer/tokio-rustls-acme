@@ -2,7 +2,7 @@ use crate::acceptor::{AcmeAccept, AcmeAcceptor};
 use crate::AcmeState;
 use futures::stream::{FusedStream, FuturesUnordered};
 use futures::Stream;
-use rustls::ServerConfig;
+use rustls::{ServerConfig, DEFAULT_VERSIONS};
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,6 +10,10 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{server::TlsStream, Accept};
 
+/// [`Stream`] of accepted application TLS connections.
+///
+/// Folds ACME order and renewal work into the same poll loop, so polling
+/// this stream advances both the certificate state machine and TCP accept.
 pub struct Incoming<
     TCP: AsyncRead + AsyncWrite + Unpin,
     ETCP,
@@ -65,7 +69,9 @@ impl<
         acceptor: AcmeAcceptor,
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Self {
-        let mut server_config = ServerConfig::builder()
+        let mut server_config = ServerConfig::builder_with_provider(state.crypto_provider())
+            .with_protocol_versions(DEFAULT_VERSIONS)
+            .expect("rustls DEFAULT_VERSIONS is always valid")
             .with_no_client_auth()
             .with_cert_resolver(state.resolver());
         server_config.alpn_protocols = alpn_protocols;

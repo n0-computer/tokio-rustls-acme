@@ -27,7 +27,7 @@ thiserror = "2.0"
 x509-parser = "0.18"
 chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 async-trait = "0.1.53"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false }
 time = "0.3.36"                                                                 # force the transitive dependency to a more recent minimal version. The build fails with 0.3.20
 
 tokio = { version = "1.20.1", default-features = false }
@@ -62,16 +62,28 @@ tokio-stream = { version = "0.1.9", features = ["net"] }
 tokio-util = { version = "0.7.3", features = ["compat"] }
 warp = "0.3"
 tempfile = "3"
+pem = "3.0"
 x509-parser = "0.18"
+# Pulled in only for the integration tests so they can construct a
+# `CryptoProvider` regardless of which crate features are enabled. Cargo
+# applies dev-dep features to test/example/bench builds only, so this does
+# not enable rustls's `ring` feature in downstream library builds.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "doc_auto_cfg"]
 
 [features]
-default = ["rustls-tls-webpki-roots"]
+default = ["tls-webpki-roots", "tls-ring"]
 axum = ["dep:axum-server"]
-rustls-tls-webpki-roots = ["dep:webpki-roots"]
+tls-webpki-roots = ["dep:webpki-roots"]
+# Picks the ring rustls crypto provider for `AcmeConfig::new`. Takes
+# precedence over `tls-aws-lc-rs` when both are enabled.
+tls-ring = ["rustls/ring", "tokio-rustls/ring"]
+# Picks the aws-lc-rs rustls crypto provider for `AcmeConfig::new` when
+# `tls-ring` is not also enabled.
+tls-aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 
 [[example]]
 name = "low_level_axum"
