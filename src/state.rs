@@ -311,7 +311,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let (domain, challenge_url) = match auth.status {
             AuthStatus::Pending => {
                 let Identifier::Dns(domain) = auth.identifier;
-                log::info!("trigger challenge for {}", &domain);
+                log::info!("trigger challenge for {}", domain);
                 let (challenge, auth_key) =
                     account.tls_alpn_01(&auth.challenges, domain.clone())?;
                 resolver.set_auth_key(domain.clone(), Arc::new(auth_key));
@@ -328,7 +328,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             let auth = account.auth(&config.client_config, url).await?;
             match auth.status {
                 AuthStatus::Pending => {
-                    log::info!("authorization for {} still pending", &domain);
+                    log::info!("authorization for {} still pending", domain);
                     account
                         .challenge(&config.client_config, &challenge_url)
                         .await?
