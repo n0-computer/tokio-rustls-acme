@@ -5,7 +5,7 @@ authors = [
     "dignifiedquire <me@dignifiedquire.com>",
     "Florian Uekermann <florian@uekermann.me>",
 ]
-edition = "2018"
+edition = "2024"
 description = "Automatic TLS certificate management using rustls"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/n0-computer/tokio-rustls-acme"

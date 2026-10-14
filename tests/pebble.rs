@@ -13,13 +13,13 @@ use std::{convert::TryFrom, io, path::PathBuf, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use rustls::{
-    pki_types::{CertificateDer, ServerName},
     ClientConfig, RootCertStore, ServerConfig,
+    pki_types::{CertificateDer, ServerName},
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls_acme::{
-    caches::{DirCache, NoCache},
     AccountCache, AcmeConfig, CertCache, EventOk, ResolvesServerCertAcme,
+    caches::{DirCache, NoCache},
 };
 
 const PEBBLE_DIRECTORY: &str = "https://localhost:14000/dir";
