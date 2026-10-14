@@ -1,11 +1,11 @@
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use clap::Parser;
 use rustls::ServerConfig;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio_rustls_acme::caches::DirCache;
 use tokio_rustls_acme::AcmeConfig;
+use tokio_rustls_acme::caches::DirCache;
 use tokio_stream::StreamExt;
 
 #[derive(Parser, Debug)]

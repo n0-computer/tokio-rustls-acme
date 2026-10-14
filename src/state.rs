@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use futures::future::try_join_all;
-use futures::{ready, FutureExt, Stream};
+use futures::{FutureExt, Stream, ready};
 use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
+use rustls::ServerConfig;
 use rustls::crypto::ring::sign::any_ecdsa_type;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
-use rustls::ServerConfig;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
@@ -207,7 +207,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 return match cached {
                     true => Err(EventError::CachedCertParse(err)),
                     false => Err(EventError::NewCertParse(err)),
-                }
+                };
             }
         };
         self.resolver.set_cert(Arc::new(cert));

@@ -1,6 +1,6 @@
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ring::digest::{digest, Digest, SHA256};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ring::digest::{Digest, SHA256, digest};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair};
 use serde::Serialize;

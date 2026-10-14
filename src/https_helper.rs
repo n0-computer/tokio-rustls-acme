@@ -1,4 +1,4 @@
-use rustls::{pki_types::InvalidDnsNameError, ClientConfig};
+use rustls::{ClientConfig, pki_types::InvalidDnsNameError};
 use thiserror::Error;
 
 pub use reqwest::Response;

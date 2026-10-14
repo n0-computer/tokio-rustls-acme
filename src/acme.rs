@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
-use crate::https_helper::{https, HttpsRequestError, Method, Response};
-use crate::jose::{key_authorization_sha256, sign, sign_eab, JoseError};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use crate::https_helper::{HttpsRequestError, Method, Response, https};
+use crate::jose::{JoseError, key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rcgen::{CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
 use ring::error::{KeyRejected, Unspecified};
 use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, EcdsaSigningAlgorithm, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{crypto::ring::sign::any_ecdsa_type, sign::CertifiedKey};
+use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm};
 use rustls::{
-    pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
     ClientConfig,
+    pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
 };
+use rustls::{crypto::ring::sign::any_ecdsa_type, sign::CertifiedKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;

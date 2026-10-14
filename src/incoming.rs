@@ -1,14 +1,14 @@
-use crate::acceptor::{AcmeAccept, AcmeAcceptor};
 use crate::AcmeState;
-use futures::stream::{FusedStream, FuturesUnordered};
+use crate::acceptor::{AcmeAccept, AcmeAcceptor};
 use futures::Stream;
+use futures::stream::{FusedStream, FuturesUnordered};
 use rustls::ServerConfig;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::{server::TlsStream, Accept};
+use tokio_rustls::{Accept, server::TlsStream};
 
 pub struct Incoming<
     TCP: AsyncRead + AsyncWrite + Unpin,
@@ -26,22 +26,22 @@ pub struct Incoming<
 }
 
 impl<
-        TCP: AsyncRead + AsyncWrite + Unpin,
-        ETCP,
-        ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
-        EA: Debug + 'static,
-    > Unpin for Incoming<TCP, ETCP, ITCP, EC, EA>
+    TCP: AsyncRead + AsyncWrite + Unpin,
+    ETCP,
+    ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
+    EC: Debug + 'static,
+    EA: Debug + 'static,
+> Unpin for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
 }
 
 impl<
-        TCP: AsyncRead + AsyncWrite + Unpin,
-        ETCP,
-        ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
-        EA: Debug + 'static,
-    > Incoming<TCP, ETCP, ITCP, EC, EA>
+    TCP: AsyncRead + AsyncWrite + Unpin,
+    ETCP,
+    ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
+    EC: Debug + 'static,
+    EA: Debug + 'static,
+> Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     pub fn new_with_server(
         tcp_incoming: ITCP,
@@ -74,12 +74,12 @@ impl<
 }
 
 impl<
-        TCP: AsyncRead + AsyncWrite + Unpin,
-        ETCP,
-        ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
-        EA: Debug + 'static,
-    > Stream for Incoming<TCP, ETCP, ITCP, EC, EA>
+    TCP: AsyncRead + AsyncWrite + Unpin,
+    ETCP,
+    ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
+    EC: Debug + 'static,
+    EA: Debug + 'static,
+> Stream for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     type Item = Result<TlsStream<TCP>, ETCP>;
 
@@ -136,12 +136,12 @@ impl<
 }
 
 impl<
-        TCP: AsyncRead + AsyncWrite + Unpin,
-        ETCP,
-        ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
-        EC: Debug + 'static,
-        EA: Debug + 'static,
-    > FusedStream for Incoming<TCP, ETCP, ITCP, EC, EA>
+    TCP: AsyncRead + AsyncWrite + Unpin,
+    ETCP,
+    ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
+    EC: Debug + 'static,
+    EA: Debug + 'static,
+> FusedStream for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     fn is_terminated(&self) -> bool {
         self.tcp_incoming.is_none()
