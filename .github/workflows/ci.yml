@@ -85,13 +85,17 @@ jobs:
     env:
       RUSTC_WRAPPER: "sccache"
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: cargo check
-        run: cargo check --no-default-features --features ${{ matrix.features }} --lib --tests
+        run: cargo check --locked --no-default-features --features ${{ matrix.features }} --lib --tests
       - name: cargo test
-        run: cargo test --no-default-features --features ${{ matrix.features }} --tests
+        run: cargo test --locked --no-default-features --features ${{ matrix.features }} --tests
 
   # Checks correct runtime deps and features are requested by not including dev-dependencies.
   check-deps:
