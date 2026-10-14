@@ -124,13 +124,11 @@ fn chain_root_issuer(cert_pem: &str) -> Option<String> {
     let pems = pem::parse_many(cert_pem).ok()?;
     let last_der = pems.last()?.contents().to_vec();
     let (_, cert) = parse_x509_certificate(&last_der).ok()?;
-    let cn = cert
-        .issuer()
+    cert.issuer()
         .iter_common_name()
         .next()
         .and_then(|cn| cn.as_str().ok())
-        .map(|s| s.to_string());
-    cn
+        .map(|s| s.to_string())
 }
 
 /// Map an X.509 signature algorithm OID to the corresponding rustls SignatureScheme.
@@ -275,10 +273,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         .map(|t| Utc.timestamp_opt(t.timestamp(), 0).earliest().unwrap()),
                 );
             }
-            if let Some(scheme) = sig_oid_to_scheme(&cert.signature_algorithm.algorithm) {
-                if !required_schemes.contains(&scheme) {
-                    required_schemes.push(scheme);
-                }
+            if let Some(scheme) = sig_oid_to_scheme(&cert.signature_algorithm.algorithm)
+                && !required_schemes.contains(&scheme)
+            {
+                required_schemes.push(scheme);
             }
         }
 
