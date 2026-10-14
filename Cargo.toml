@@ -15,10 +15,11 @@ categories = ["asynchronous", "cryptography", "network-programming"]
 
 [dependencies]
 futures = "0.3.21"
-rcgen = { version = "0.14", features = ["x509-parser", "crypto"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem"] }
 serde_json = "1.0.81"
 serde = { version = "1.0.137", features = ["derive"] }
-ring = { version = "0.17.0", features = ["std"] }
+ring = { version = "0.17.0", features = ["std"], optional = true }
+aws-lc-rs = { version = "1.18", optional = true }
 base64 = "0.23"
 log = "0.4.17"
 webpki-roots = { version = "1", optional = true }
@@ -75,6 +76,7 @@ rustdoc-args = ["--cfg", "doc_auto_cfg"]
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
+    "aws_lc_rs::*",
     "axum_server::*",
     "futures_core::*",
     "nom::*",
@@ -94,12 +96,19 @@ allowed_external_types = [
 default = ["tls-webpki-roots", "tls-ring"]
 axum = ["dep:axum-server"]
 tls-webpki-roots = ["dep:webpki-roots"]
-# Picks the ring rustls crypto provider for `AcmeConfig::new`. Takes
-# precedence over `tls-aws-lc-rs` when both are enabled.
-tls-ring = ["rustls/ring", "tokio-rustls/ring"]
-# Picks the aws-lc-rs rustls crypto provider for `AcmeConfig::new` when
-# `tls-ring` is not also enabled.
-tls-aws-lc-rs = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
+# At least one of `tls-ring` or `tls-aws-lc-rs` must be enabled. The
+# selected backend signs ACME requests, generates keys, and provides the
+# rustls crypto provider for `AcmeConfig::new`.
+#
+# Selects ring. Takes precedence over `tls-aws-lc-rs` when both are enabled.
+tls-ring = ["dep:ring", "rcgen/ring", "rustls/ring", "tokio-rustls/ring"]
+# Selects aws-lc-rs when `tls-ring` is not also enabled.
+tls-aws-lc-rs = [
+    "dep:aws-lc-rs",
+    "rcgen/aws_lc_rs",
+    "rustls/aws-lc-rs",
+    "tokio-rustls/aws-lc-rs",
+]
 
 [[example]]
 name = "low_level_axum"

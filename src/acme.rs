@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
+use crate::crypto::error::{KeyRejected, Unspecified};
+use crate::crypto::hmac;
+use crate::crypto::rand::SystemRandom;
+use crate::crypto::signature::{
+    ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm,
+};
 use crate::https_helper::{HttpsRequestError, Method, Response, https};
 use crate::jose::{JoseError, key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rcgen::{CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
-use ring::error::{KeyRejected, Unspecified};
-use ring::rand::SystemRandom;
-use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm};
 use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig,
@@ -63,7 +66,7 @@ impl Account {
         S: AsRef<str> + 'a,
         I: IntoIterator<Item = &'a S>,
     {
-        let key_pair = EcdsaKeyPair::from_pkcs8(ALG, key_pair, &SystemRandom::new())?;
+        let key_pair = crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, key_pair)?;
         let contact: Vec<&'a str> = contact.into_iter().map(AsRef::<str>::as_ref).collect();
 
         let payload = if let Some(eab) = &eab.as_ref() {
@@ -238,14 +241,14 @@ impl Directory {
 /// See RFC 8555 section 7.3.4 for more information.
 pub struct ExternalAccountKey {
     pub kid: String,
-    pub key: ring::hmac::Key,
+    pub key: hmac::Key,
 }
 
 impl ExternalAccountKey {
     pub fn new(kid: String, key: &[u8]) -> Self {
         Self {
             kid,
-            key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key),
+            key: hmac::Key::new(hmac::HMAC_SHA256, key),
         }
     }
 }

@@ -83,22 +83,10 @@ args = [
     "--tests",
 ]
 
-[tasks.test-no-provider]
-description = "Run tests with neither crypto provider feature enabled"
-command = "cargo"
-args = [
-    "test",
-    "--no-default-features",
-    "--features",
-    "tls-webpki-roots",
-    "--tests",
-]
-
 [tasks.test-feature-combos]
 description = "Run the full crypto provider feature matrix the CI uses"
 dependencies = [
     "test-ring",
     "test-aws-lc-rs",
     "test-both-providers",
-    "test-no-provider",
 ]

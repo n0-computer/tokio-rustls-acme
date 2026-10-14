@@ -5,11 +5,6 @@
 //! TLS handshake succeeds against the resolver. This exercises both the
 //! `parse_cert` path (which uses `provider.key_provider.load_private_key`)
 //! and the runtime handshake.
-//!
-//! `rustls` is also a dev-dependency with the `ring` feature on, so tests
-//! can construct a provider even when the crate is built without either of
-//! the `ring`/`aws-lc-rs` crate features. That mirrors how a downstream
-//! user would integrate a third-party provider.
 
 #![cfg(feature = "tls-webpki-roots")]
 
@@ -133,23 +128,4 @@ async fn ring_server_aws_lc_rs_client() {
     let (resolver, ca_pem) = deploy_test_cert(server_provider.clone()).await;
     let leaf = tls_handshake(resolver, server_provider, client_provider, &ca_pem).await;
     assert!(!leaf.as_ref().is_empty());
-}
-
-/// Verifies the crate works when neither `tls-ring` nor `tls-aws-lc-rs`
-/// crate features are enabled and no default provider has been installed.
-/// The caller must supply a `CryptoProvider` explicitly via
-/// `AcmeConfig::crypto_provider`.
-///
-/// Compiled only in that configuration. The `rustls` dev-dependency carries
-/// the `ring` feature so the test can still construct a provider, just as
-/// a downstream user would do with their own provider crate.
-#[cfg(not(any(feature = "tls-ring", feature = "tls-aws-lc-rs")))]
-#[tokio::test]
-async fn no_built_in_provider() {
-    assert!(
-        rustls::crypto::CryptoProvider::get_default().is_none(),
-        "no provider should be installed in this configuration",
-    );
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    roundtrip(provider).await;
 }

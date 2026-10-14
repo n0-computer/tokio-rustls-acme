@@ -11,7 +11,6 @@ use std::sync::atomic::AtomicPtr;
 
 /// Test cache, which generates certificates for ACME incompatible test environments.
 /// ```rust
-/// # #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc-rs"))] {
 /// # use tokio_rustls_acme::{AcmeConfig};
 /// # use tokio_rustls_acme::caches::{DirCache, TestCache};
 /// # let test_environment = true;
@@ -20,7 +19,6 @@ use std::sync::atomic::AtomicPtr;
 /// if test_environment {
 ///     config = config.cache(TestCache::new());
 /// }
-/// # }
 /// ```
 #[derive(Clone)]
 pub struct TestCache<EC: Debug = std::io::Error, EA: Debug = std::io::Error> {

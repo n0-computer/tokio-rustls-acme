@@ -32,9 +32,8 @@ impl AcmeConfig<Infallible, Infallible> {
     ///
     /// Picks ring when the `tls-ring` feature is enabled (the default),
     /// otherwise aws-lc-rs. The same provider is used for the HTTPS client,
-    /// the TLS handshake, and key parsing. Available only when at least one
-    /// of `tls-ring` or `tls-aws-lc-rs` is enabled; if neither is, use
-    /// [`AcmeConfig::new_with_crypto_provider`].
+    /// the TLS handshake, and key parsing. Use
+    /// [`AcmeConfig::new_with_crypto_provider`] to pick a different provider.
     ///
     /// ```rust,no_run
     /// # use tokio_rustls_acme::AcmeConfig;
@@ -55,10 +54,7 @@ impl AcmeConfig<Infallible, Infallible> {
     /// # type EA = EC;
     /// let config: AcmeConfig<EC, EA> = AcmeConfig::new(["example.com"]).cache(NoCache::new());
     /// ```
-    #[cfg(all(
-        feature = "tls-webpki-roots",
-        any(feature = "tls-ring", feature = "tls-aws-lc-rs")
-    ))]
+    #[cfg(feature = "tls-webpki-roots")]
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         Self::new_with_crypto_provider(domains, Self::default_crypto_provider())
     }
@@ -67,7 +63,8 @@ impl AcmeConfig<Infallible, Infallible> {
     ///
     /// Lets the caller pick the provider regardless of which crate features
     /// are enabled. The same provider is used for the HTTPS client, the
-    /// TLS handshake, and key parsing.
+    /// TLS handshake, and key parsing. ACME request signing and key
+    /// generation still use the backend selected by the crate features.
     #[cfg(feature = "tls-webpki-roots")]
     pub fn new_with_crypto_provider(
         domains: impl IntoIterator<Item = impl AsRef<str>>,
@@ -83,10 +80,7 @@ impl AcmeConfig<Infallible, Infallible> {
         Self::new_with_client_tls_config(domains, client_config)
     }
 
-    #[cfg(all(
-        feature = "tls-webpki-roots",
-        any(feature = "tls-ring", feature = "tls-aws-lc-rs")
-    ))]
+    #[cfg(feature = "tls-webpki-roots")]
     fn default_crypto_provider() -> Arc<CryptoProvider> {
         #[cfg(feature = "tls-ring")]
         {

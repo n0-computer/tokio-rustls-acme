@@ -27,10 +27,12 @@
 //! tokio-rustls-acme = { version = "*", default-features = false, features = ["tls-aws-lc-rs", "tls-webpki-roots"] }
 //! ```
 //!
-//! With both features enabled, [`AcmeConfig::new`] picks ring. When
-//! neither is enabled it is unavailable; use
+//! One of the two features must be enabled; with both, ring is used. The
+//! selected backend also signs ACME requests and generates keys, so with
+//! `tls-aws-lc-rs` alone ring is not in the dependency tree. A different
+//! rustls provider can still be used for TLS via
 //! [`AcmeConfig::new_with_crypto_provider`] or
-//! [`AcmeConfig::new_with_client_tls_config`] in that case.
+//! [`AcmeConfig::new_with_client_tls_config`].
 //!
 //! To use tokio-rustls-acme add the following lines to your `Cargo.toml`:
 //!
@@ -46,8 +48,6 @@
 //! well as accepting TLS connections, which are handed over to the caller on success.
 //!
 //! ```rust,no_run
-//! # #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc-rs"))]
-//! # mod example {
 //! use tokio::io::AsyncWriteExt;
 //! use futures::StreamExt;
 //! use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
@@ -79,8 +79,6 @@
 //! Content-Type: text/plain; charset=utf-8
 //!
 //! Hello Tls!"#;
-//! # }
-//! # fn main() {}
 //! ```
 //!
 //! `examples/high_level.rs` implements a "Hello Tls!" server similar to the one above, which accepts
@@ -147,6 +145,7 @@ pub mod axum;
 mod cache;
 pub mod caches;
 mod config;
+mod crypto;
 mod https_helper;
 mod incoming;
 mod jose;
