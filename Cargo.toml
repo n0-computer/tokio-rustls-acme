@@ -76,13 +76,11 @@ rustdoc-args = ["--cfg", "doc_auto_cfg"]
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
-    "aws_lc_rs::*",
     "axum_server::*",
     "futures_core::*",
     "nom::*",
     "pem::*",
     "rcgen::*",
-    "ring::*",
     "rustls::*",
     "serde_core::*",
     "serde_json::*",

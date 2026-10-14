@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::crypto::error::{KeyRejected, Unspecified};
+pub use crate::crypto::CryptoError;
 use crate::crypto::hmac;
 use crate::crypto::rand::SystemRandom;
 use crate::crypto::signature::{
@@ -29,7 +29,7 @@ pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
 #[derive(Debug)]
 pub struct Account {
-    pub key_pair: EcdsaKeyPair,
+    pub(crate) key_pair: EcdsaKeyPair,
     pub directory: Directory,
     pub kid: String,
 }
@@ -66,7 +66,8 @@ impl Account {
         S: AsRef<str> + 'a,
         I: IntoIterator<Item = &'a S>,
     {
-        let key_pair = crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, key_pair)?;
+        let key_pair = crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, key_pair)
+            .map_err(AcmeError::KeyRejected)?;
         let contact: Vec<&'a str> = contact.into_iter().map(AsRef::<str>::as_ref).collect();
 
         let payload = if let Some(eab) = &eab.as_ref() {
@@ -241,7 +242,7 @@ impl Directory {
 /// See RFC 8555 section 7.3.4 for more information.
 pub struct ExternalAccountKey {
     pub kid: String,
-    pub key: hmac::Key,
+    pub(crate) key: hmac::Key,
 }
 
 impl ExternalAccountKey {
@@ -342,9 +343,9 @@ pub enum AcmeError {
     #[error("http request error: {0}")]
     HttpRequest(#[from] HttpsRequestError),
     #[error("invalid key pair: {0}")]
-    KeyRejected(#[from] KeyRejected),
+    KeyRejected(CryptoError),
     #[error("crypto error: {0}")]
-    Crypto(#[from] Unspecified),
+    Crypto(#[from] CryptoError),
     #[error("acme service response is missing {0} header")]
     MissingHeader(&'static str),
     #[error("no tls-alpn-01 challenge found")]

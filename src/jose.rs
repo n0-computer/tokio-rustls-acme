@@ -1,3 +1,4 @@
+use crate::crypto::CryptoError;
 use crate::crypto::digest::{Digest, SHA256, digest};
 use crate::crypto::hmac;
 use crate::crypto::rand::SystemRandom;
@@ -21,7 +22,9 @@ pub(crate) fn sign(
     let protected = Protected::base64(jwk, kid, Some(nonce.as_ref()), url)?;
     let payload = URL_SAFE_NO_PAD.encode(payload);
     let combined = format!("{}.{}", protected, payload);
-    let signature = key.sign(&SystemRandom::new(), combined.as_bytes())?;
+    let signature = key
+        .sign(&SystemRandom::new(), combined.as_bytes())
+        .map_err(CryptoError::new)?;
     let signature = URL_SAFE_NO_PAD.encode(signature.as_ref());
     let body = Body {
         protected,
@@ -158,7 +161,7 @@ pub enum JoseError {
     #[error("json serialization failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("crypto error: {0}")]
-    Crypto(#[from] crate::crypto::error::Unspecified),
+    Crypto(#[from] crate::crypto::CryptoError),
 }
 
 #[cfg(test)]
