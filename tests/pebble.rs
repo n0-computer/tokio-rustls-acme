@@ -1,29 +1,47 @@
-//! Integration tests against a Pebble ACME test server.
+//! Integration tests against Pebble ACME test servers.
 //!
-//! These tests require a running Pebble instance.
-//! Start it with: `docker compose -f docker-compose.pebble.yml up -d`
+//! These tests require two running Pebble instances, see `docker-compose.pebble.yml`:
+//! - `pebble` (port 14000) runs with `PEBBLE_VA_ALWAYS_VALID=1`, so challenges are never checked.
+//! - `pebble-validating` (port 14001) validates challenges for real. Its VA connects to
+//!   tls-alpn-01 port 5001 on the identifier's address, so the tests using it serve challenges
+//!   from a listener on `127.0.0.1:5001` and `[::1]:5001`. That requires the instance to share
+//!   the host's network namespace.
 //!
-//! Set `PEBBLE_MINICA_CERT` to the path of Pebble's minica root cert:
+//! Start them with: `docker compose -f docker-compose.pebble.yml up -d`
+//!
+//! Set `PEBBLE_MINICA_CERT` to the path of Pebble's minica root cert (the same for both):
 //!   `docker compose -f docker-compose.pebble.yml cp pebble:/test/certs/pebble.minica.pem ./pebble.minica.pem`
 //!   `export PEBBLE_MINICA_CERT=./pebble.minica.pem`
 //!
-//! Run with: `cargo test --test pebble -- --ignored`
+//! Run with: `cargo test --test pebble -- --ignored`, or all of the above with `cargo make test`.
 
-use std::{convert::TryFrom, io, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    convert::TryFrom,
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::StreamExt;
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, ServerName},
 };
-use tokio_rustls::TlsAcceptor;
+use tokio::{net::TcpListener, task::JoinSet};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_rustls_acme::{
-    AccountCache, AcmeConfig, CertCache, EventOk, ResolvesServerCertAcme,
+    AccountCache, AcmeConfig, CertCache, EventError, EventOk, ResolvesServerCertAcme,
     caches::{DirCache, NoCache},
 };
 
 const PEBBLE_DIRECTORY: &str = "https://localhost:14000/dir";
 const PEBBLE_MGMT: &str = "https://localhost:15000";
+const VALIDATING_DIRECTORY: &str = "https://localhost:14001/dir";
+const VALIDATING_MGMT: &str = "https://localhost:15001";
+/// `tlsPort` of the validating instance: where its VA connects for tls-alpn-01.
+const VALIDATING_TLS_PORT: u16 = 5001;
 const TEST_DOMAIN: &str = "pebble-test.example.com";
 const TEST_DOMAINS: &[&str] = &[
     "pebble-multi-1.example.com",
@@ -66,6 +84,11 @@ fn http_client() -> reqwest::Client {
 /// Fetch Pebble's ACME-issued root + intermediate certs and build a root store
 /// for verifying certs issued by Pebble's CA.
 async fn pebble_acme_root_store() -> RootCertStore {
+    pebble_acme_root_store_at(PEBBLE_MGMT).await
+}
+
+/// Like [`pebble_acme_root_store`], for the instance with management API at `mgmt`.
+async fn pebble_acme_root_store_at(mgmt: &str) -> RootCertStore {
     let client = http_client();
     let mut root_store = RootCertStore::empty();
 
@@ -73,7 +96,7 @@ async fn pebble_acme_root_store() -> RootCertStore {
     // PEBBLE_ALTERNATE_ROOTS is enabled). 404s are expected and skipped.
     for kind in &["roots", "intermediates"] {
         for index in 0..2 {
-            let url = format!("{PEBBLE_MGMT}/{kind}/{index}");
+            let url = format!("{mgmt}/{kind}/{index}");
             let resp = client.get(&url).send().await.unwrap_or_else(|e| {
                 panic!("failed to reach Pebble management API at {}: {}", url, e)
             });
@@ -591,18 +614,8 @@ async fn test_ip_certificate() {
     let peer_certs = verify_tls_handshake_ip(resolver, root_store, ip).await;
     assert!(!peer_certs.is_empty(), "should have received certificates");
 
-    // Verify the leaf certificate contains an IP SAN.
-    let (_, leaf) = x509_parser::parse_x509_certificate(peer_certs[0].as_ref()).unwrap();
-    let san = leaf
-        .subject_alternative_name()
-        .expect("SAN extension missing")
-        .expect("SAN extension empty");
-    let has_ip = san
-        .value
-        .general_names
-        .iter()
-        .any(|name| matches!(name, x509_parser::extensions::GeneralName::IPAddress(_)));
-    assert!(has_ip, "certificate should contain an IP SAN");
+    // Verify the leaf certificate contains exactly the requested IP SAN.
+    assert_eq!(ip_sans(&peer_certs[0]), [ip]);
     eprintln!("IP certificate issued successfully for {TEST_IP}");
 }
 
@@ -630,26 +643,232 @@ async fn test_mixed_ip_and_domain() {
     let peer_certs = verify_tls_handshake_for(resolver, root_store, mixed_domain).await;
     assert!(!peer_certs.is_empty());
 
-    // Parse leaf and check both SAN types are present.
+    // Parse leaf and check both SANs are present.
     let (_, leaf) = x509_parser::parse_x509_certificate(peer_certs[0].as_ref()).unwrap();
     let san = leaf
         .subject_alternative_name()
         .expect("SAN extension missing")
         .expect("SAN extension empty");
 
-    let has_ip = san
-        .value
-        .general_names
-        .iter()
-        .any(|name| matches!(name, x509_parser::extensions::GeneralName::IPAddress(_)));
     let has_dns = san.value.general_names.iter().any(|name| {
         matches!(name, x509_parser::extensions::GeneralName::DNSName(d) if *d == mixed_domain)
     });
-    assert!(has_ip, "certificate should contain an IP SAN");
+    assert_eq!(ip_sans(&peer_certs[0]), [ip]);
     assert!(
         has_dns,
         "certificate should contain a DNS SAN for {}",
         mixed_domain
     );
     eprintln!("mixed IP+domain certificate issued successfully");
+}
+
+/// Collect the IP address SANs of a DER certificate.
+fn ip_sans(cert: &CertificateDer<'_>) -> Vec<IpAddr> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
+    let san = cert
+        .subject_alternative_name()
+        .expect("SAN extension malformed")
+        .expect("SAN extension missing");
+    san.value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::IPAddress(bytes) => match bytes.len() {
+                4 => Some(IpAddr::from(<[u8; 4]>::try_from(*bytes).unwrap())),
+                16 => Some(IpAddr::from(<[u8; 16]>::try_from(*bytes).unwrap())),
+                n => panic!("IP SAN with {n} bytes"),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Serializes the tests using the validating instance: they all listen on its `tlsPort`.
+static VALIDATING_TLS_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Order a certificate for `ips` from the validating Pebble instance, answering its
+/// tls-alpn-01 challenges from a real listener, then fetch the deployed certificate chain over
+/// TCP from each IP.
+///
+/// Returns the order error if the order fails, and the chain served on the first IP otherwise.
+async fn acquire_validated_cert(
+    ips: &[IpAddr],
+    profile: Option<&str>,
+) -> Result<Vec<CertificateDer<'static>>, String> {
+    let _guard = VALIDATING_TLS_PORT_LOCK.lock().await;
+
+    let identifiers: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+    let mut config: AcmeConfig<io::Error> =
+        AcmeConfig::new_with_client_tls_config(&identifiers, pebble_client_config())
+            .directory(VALIDATING_DIRECTORY)
+            .cache(NoCache::new());
+    if let Some(profile) = profile {
+        config = config.profile(profile);
+    }
+    let mut state = config.state();
+
+    // Serve on both loopback addresses: Pebble's VA connects to the identifier's address.
+    let acceptor = state.acceptor();
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(state.resolver()),
+    );
+    let mut servers = JoinSet::new();
+    for addr in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let listener = TcpListener::bind((addr, VALIDATING_TLS_PORT))
+            .await
+            .unwrap_or_else(|e| panic!("failed to bind {addr}:{VALIDATING_TLS_PORT}: {e}"));
+        let acceptor = acceptor.clone();
+        let server_config = server_config.clone();
+        servers.spawn(async move {
+            loop {
+                let (tcp, peer) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                let server_config = server_config.clone();
+                tokio::spawn(async move {
+                    match acceptor.accept(tcp).await {
+                        Ok(None) => eprintln!("served tls-alpn-01 challenge to {peer}"),
+                        Ok(Some(start)) => {
+                            let _ = start.into_stream(server_config).await;
+                        }
+                        Err(err) => eprintln!("TLS accept from {peer} failed: {err}"),
+                    }
+                });
+            }
+        });
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match state.next().await {
+                Some(Ok(EventOk::DeployedNewCert)) => return Ok(()),
+                Some(Ok(_)) => {}
+                Some(Err(EventError::Order(err))) => return Err(err.to_string()),
+                Some(Err(err)) => panic!("ACME error: {:?}", err),
+                None => panic!("state stream ended unexpectedly"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for certificate deployment");
+
+    let chain = match result {
+        Ok(()) => {
+            let root_store = pebble_acme_root_store_at(VALIDATING_MGMT).await;
+            let connector = TlsConnector::from(Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth(),
+            ));
+            let mut chains = Vec::new();
+            for &ip in ips {
+                let tcp = tokio::net::TcpStream::connect((ip, VALIDATING_TLS_PORT))
+                    .await
+                    .unwrap();
+                let tls = connector
+                    .connect(ServerName::from(ip), tcp)
+                    .await
+                    .unwrap_or_else(|e| panic!("TLS handshake with {ip} failed: {e}"));
+                chains.push(tls.get_ref().1.peer_certificates().unwrap().to_vec());
+            }
+            Ok(chains.swap_remove(0))
+        }
+        Err(err) => Err(err),
+    };
+    servers.shutdown().await;
+    chain
+}
+
+/// Issue a certificate for an IPv4 address through real tls-alpn-01 validation.
+///
+/// The CA sends the reverse-DNS name `1.0.0.127.in-addr.arpa` as SNI (RFC 8738 §6), so this
+/// fails unless the resolver serves the challenge certificate under that name.
+#[tokio::test]
+#[ignore]
+async fn test_validated_ipv4_certificate() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let chain = acquire_validated_cert(&[ip], None)
+        .await
+        .expect("order failed");
+    assert_eq!(ip_sans(&chain[0]), [ip]);
+}
+
+/// Issue a certificate for an IPv6 address through real tls-alpn-01 validation, with the
+/// nibble-format reverse name under `ip6.arpa` as SNI.
+#[tokio::test]
+#[ignore]
+async fn test_validated_ipv6_certificate() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let chain = acquire_validated_cert(&[ip], None)
+        .await
+        .expect("order failed");
+    assert_eq!(ip_sans(&chain[0]), [ip]);
+}
+
+/// Issue one certificate for both an IPv4 and an IPv6 address.
+#[tokio::test]
+#[ignore]
+async fn test_validated_dual_stack_certificate() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let ips = [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ];
+    let chain = acquire_validated_cert(&ips, None)
+        .await
+        .expect("order failed");
+    assert_eq!(ip_sans(&chain[0]), ips);
+}
+
+/// Lifetime of a DER certificate (`notAfter - notBefore`) in seconds.
+fn lifetime_secs(cert: &CertificateDer<'_>) -> i64 {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
+    let validity = cert.validity();
+    validity.not_after.timestamp() - validity.not_before.timestamp()
+}
+
+/// Request certificates under specific ACME profiles and check that the CA applied them.
+///
+/// `test/pebble-validating-config.json` gives the profiles distinct validity periods. Pebble
+/// issues certificates valid for `validityPeriod - 1` seconds.
+#[tokio::test]
+#[ignore]
+async fn test_profile_selects_lifetime() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    for (profile, validity_period) in [("shortlived", 600), ("default", 7200)] {
+        let chain = acquire_validated_cert(&[ip], Some(profile))
+            .await
+            .unwrap_or_else(|e| panic!("order with profile {profile} failed: {e}"));
+        assert_eq!(
+            lifetime_secs(&chain[0]),
+            validity_period - 1,
+            "lifetime for profile {profile}"
+        );
+    }
+}
+
+/// Requesting a profile the CA doesn't offer fails the order.
+#[tokio::test]
+#[ignore]
+async fn test_unknown_profile_is_rejected() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let err = acquire_validated_cert(&[IpAddr::V4(Ipv4Addr::LOCALHOST)], Some("no-such-profile"))
+        .await
+        .expect_err("order with an unknown profile should fail");
+    assert!(
+        err.contains("invalidProfile"),
+        "expected an invalidProfile error, got: {err}"
+    );
 }

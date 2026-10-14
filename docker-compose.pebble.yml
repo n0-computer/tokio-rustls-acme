@@ -11,3 +11,18 @@ services:
       PEBBLE_VA_NOSLEEP: "1"
       PEBBLE_VA_ALWAYS_VALID: "1"
       PEBBLE_WFE_NONCEREJECT: "0"
+
+  # Pebble with real challenge validation. Its VA connects to the identifier's
+  # address on tlsPort 5001, and the tests issue certs for 127.0.0.1 and ::1
+  # served by a listener in the test process. So it must share the host's
+  # network namespace: with a bridge network, loopback would be the
+  # container's own. Ports 14001/15001 are bound directly on the host.
+  pebble-validating:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: ["-config", "/test/config/pebble-config.json"]
+    network_mode: host
+    volumes:
+      - ./test/pebble-validating-config.json:/test/config/pebble-config.json:ro
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_WFE_NONCEREJECT: "0"
