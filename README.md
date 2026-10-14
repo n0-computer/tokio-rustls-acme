@@ -51,7 +51,8 @@ certificate management using a simple and flexible stream based API.
 
 The default `tls-ring` feature selects [ring] as rustls's crypto backend.
 To use [aws-lc-rs] instead, disable default features and enable
-`tls-aws-lc-rs`. One of the two must be enabled. The selected backend
+`tls-aws-lc-rs` and `tls-webpki-roots`. One of the two backends must be
+enabled; with both, aws-lc-rs is used. The selected backend
 flows through to the HTTPS client, the TLS handshake, key parsing, and
 ACME request signing, so with `tls-aws-lc-rs` alone ring is not in the
 dependency tree. The crate never reads or installs the process-wide

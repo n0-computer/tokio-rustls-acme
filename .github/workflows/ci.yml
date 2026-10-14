@@ -69,7 +69,7 @@ jobs:
         run: cargo test --locked --workspace --all-features --bins --tests --examples
 
   # Verifies the crate compiles and tests pass under each crypto provider
-  # feature combo.
+  # feature combo, and that a single-backend build doesn't pull in the other.
   feature-combos:
     runs-on: ubuntu-latest
     strategy:
@@ -78,10 +78,13 @@ jobs:
         include:
           - name: "ring only"
             features: "tls-webpki-roots,tls-ring"
+            absent: "aws-lc-rs"
           - name: "aws-lc-rs only"
             features: "tls-webpki-roots,tls-aws-lc-rs"
+            absent: "ring"
           - name: "ring and aws-lc-rs"
             features: "tls-webpki-roots,tls-ring,tls-aws-lc-rs"
+            absent: ""
     env:
       RUSTC_WRAPPER: "sccache"
     steps:
@@ -92,10 +95,23 @@ jobs:
         with:
           toolchain: stable
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-      - name: cargo check
-        run: cargo check --locked --no-default-features --features ${{ matrix.features }} --lib --tests
+      # Checked on its own: with `--tests` in the same invocation, the rustls
+      # dev-dependency's `ring` feature would be visible to the lib too.
+      - name: cargo check (lib only)
+        run: cargo check --locked --no-default-features --features ${{ matrix.features }} --lib
+      - name: other backend absent from dependency tree
+        if: matrix.absent != ''
+        env:
+          FEATURES: ${{ matrix.features }}
+          ABSENT: ${{ matrix.absent }}
+        run: |
+          tree=$(cargo tree --locked -e normal,build --no-default-features --features "$FEATURES" --prefix none --format '{p}')
+          if awk '{print $1}' <<<"$tree" | grep -qx "$ABSENT"; then
+            echo "$ABSENT is in the dependency tree for features $FEATURES"
+            exit 1
+          fi
       - name: cargo test
-        run: cargo test --locked --no-default-features --features ${{ matrix.features }} --tests
+        run: cargo test --locked --no-default-features --features ${{ matrix.features }}
 
   # Checks correct runtime deps and features are requested by not including dev-dependencies.
   check-deps:

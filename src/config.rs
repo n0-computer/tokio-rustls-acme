@@ -30,8 +30,8 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
 impl AcmeConfig<Infallible, Infallible> {
     /// Creates an [`AcmeConfig`] backed by webpki-roots trust anchors.
     ///
-    /// Picks ring when the `tls-ring` feature is enabled (the default),
-    /// otherwise aws-lc-rs. The same provider is used for the HTTPS client,
+    /// Picks aws-lc-rs when the `tls-aws-lc-rs` feature is enabled,
+    /// otherwise ring (the default). The same provider is used for the HTTPS client,
     /// the TLS handshake, and key parsing. Use
     /// [`AcmeConfig::new_with_crypto_provider`] to pick a different provider.
     ///
@@ -65,6 +65,12 @@ impl AcmeConfig<Infallible, Infallible> {
     /// are enabled. The same provider is used for the HTTPS client, the
     /// TLS handshake, and key parsing. ACME request signing and key
     /// generation still use the backend selected by the crate features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `crypto_provider` is unusable for TLS 1.2 and 1.3, i.e. it
+    /// has no key exchange groups or no cipher suite for either version.
+    /// This is the same check rustls's `ClientConfig::builder` performs.
     #[cfg(feature = "tls-webpki-roots")]
     pub fn new_with_crypto_provider(
         domains: impl IntoIterator<Item = impl AsRef<str>>,
@@ -73,7 +79,7 @@ impl AcmeConfig<Infallible, Infallible> {
         let client_config = Arc::new(
             ClientConfig::builder_with_provider(crypto_provider)
                 .with_protocol_versions(DEFAULT_VERSIONS)
-                .expect("rustls DEFAULT_VERSIONS is always valid")
+                .expect("crypto provider has no usable cipher suites or key exchange groups")
                 .with_root_certificates(Self::webpki_root_store())
                 .with_no_client_auth(),
         );
@@ -82,11 +88,11 @@ impl AcmeConfig<Infallible, Infallible> {
 
     #[cfg(feature = "tls-webpki-roots")]
     fn default_crypto_provider() -> Arc<CryptoProvider> {
-        #[cfg(feature = "tls-ring")]
+        #[cfg(all(feature = "tls-ring", not(feature = "tls-aws-lc-rs")))]
         {
             Arc::new(rustls::crypto::ring::default_provider())
         }
-        #[cfg(all(feature = "tls-aws-lc-rs", not(feature = "tls-ring")))]
+        #[cfg(feature = "tls-aws-lc-rs")]
         {
             Arc::new(rustls::crypto::aws_lc_rs::default_provider())
         }

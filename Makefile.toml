@@ -1,3 +1,7 @@
+[env]
+# Crate features for the pebble tests. CI runs them once per crypto backend.
+PEBBLE_FEATURES = { value = "tls-webpki-roots,tls-ring", condition = { env_not_set = ["PEBBLE_FEATURES"] } }
+
 [tasks.pebble-up]
 description = "Start Pebble ACME test server"
 script = '''
@@ -33,7 +37,18 @@ description = "Run Pebble integration tests"
 dependencies = ["pebble-cert"]
 env = { "PEBBLE_MINICA_CERT" = "./pebble.minica.pem" }
 command = "cargo"
-args = ["test", "--locked", "--test", "pebble", "--", "--ignored", "--nocapture"]
+args = [
+    "test",
+    "--locked",
+    "--no-default-features",
+    "--features",
+    "${PEBBLE_FEATURES}",
+    "--test",
+    "pebble",
+    "--",
+    "--ignored",
+    "--nocapture",
+]
 
 [tasks.test]
 clear = true
@@ -55,6 +70,7 @@ description = "Run tests with only the ring crypto provider feature enabled"
 command = "cargo"
 args = [
     "test",
+    "--locked",
     "--no-default-features",
     "--features",
     "tls-webpki-roots,tls-ring",
@@ -66,6 +82,7 @@ description = "Run tests with only the aws-lc-rs crypto provider feature enabled
 command = "cargo"
 args = [
     "test",
+    "--locked",
     "--no-default-features",
     "--features",
     "tls-webpki-roots,tls-aws-lc-rs",
@@ -77,6 +94,7 @@ description = "Run tests with both ring and aws-lc-rs crypto provider features e
 command = "cargo"
 args = [
     "test",
+    "--locked",
     "--no-default-features",
     "--features",
     "tls-webpki-roots,tls-ring,tls-aws-lc-rs",

@@ -27,12 +27,15 @@
 //! tokio-rustls-acme = { version = "*", default-features = false, features = ["tls-aws-lc-rs", "tls-webpki-roots"] }
 //! ```
 //!
-//! One of the two features must be enabled; with both, ring is used. The
-//! selected backend also signs ACME requests and generates keys, so with
-//! `tls-aws-lc-rs` alone ring is not in the dependency tree. A different
-//! rustls provider can still be used for TLS via
+//! One of the two features must be enabled. With both, aws-lc-rs is used,
+//! matching what rcgen does. Cargo unifies features across the dependency
+//! graph, so another crate enabling `tls-aws-lc-rs` switches a ring-only
+//! build over. The selected backend also signs ACME requests and generates
+//! keys, so with `tls-aws-lc-rs` alone ring is not in the dependency tree.
+//! A different rustls provider can still be used for TLS via
 //! [`AcmeConfig::new_with_crypto_provider`] or
-//! [`AcmeConfig::new_with_client_tls_config`].
+//! [`AcmeConfig::new_with_client_tls_config`]; that pins the TLS side
+//! regardless of features.
 //!
 //! To use tokio-rustls-acme add the following lines to your `Cargo.toml`:
 //!

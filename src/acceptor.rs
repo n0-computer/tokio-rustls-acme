@@ -25,7 +25,7 @@ impl AcmeAcceptor {
     ) -> Self {
         let mut config = ServerConfig::builder_with_provider(crypto_provider)
             .with_protocol_versions(DEFAULT_VERSIONS)
-            .expect("rustls DEFAULT_VERSIONS is always valid")
+            .expect("provider already built the ACME ClientConfig, so it is valid")
             .with_no_client_auth()
             .with_cert_resolver(resolver);
         config.alpn_protocols.push(ACME_TLS_ALPN_NAME.to_vec());

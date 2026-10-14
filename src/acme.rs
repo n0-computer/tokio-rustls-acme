@@ -209,7 +209,7 @@ impl Account {
         let pk = crypto_provider
             .key_provider
             .load_private_key(pk_der)
-            .expect("rcgen-generated ECDSA P-256 key must load via the rustls crypto provider");
+            .map_err(|err| AcmeError::Crypto(CryptoError::new(err)))?;
         let certified_key = CertifiedKey::new(vec![cert.der().clone()], pk);
         Ok((challenge, certified_key))
     }
@@ -363,5 +363,53 @@ fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeE
     match h {
         None => Err(AcmeError::MissingHeader(header)),
         Some(value) => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::crypto::KeyProvider;
+    use rustls::sign::SigningKey;
+
+    #[derive(Debug)]
+    struct RejectingKeyProvider;
+
+    impl KeyProvider for RejectingKeyProvider {
+        fn load_private_key(
+            &self,
+            _key_der: PrivateKeyDer<'static>,
+        ) -> Result<Arc<dyn SigningKey>, rustls::Error> {
+            Err(rustls::Error::General("rejected".into()))
+        }
+    }
+
+    /// A provider that can't load the challenge key must fail the order,
+    /// not panic the task polling it.
+    #[test]
+    fn tls_alpn_01_reports_unloadable_key() {
+        let provider = CryptoProvider {
+            key_provider: &RejectingKeyProvider,
+            ..rustls::crypto::ring::default_provider()
+        };
+        let account = Account {
+            key_pair: crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, &Account::generate_key_pair())
+                .unwrap(),
+            directory: Directory {
+                new_nonce: String::new(),
+                new_account: String::new(),
+                new_order: String::new(),
+            },
+            kid: String::new(),
+        };
+        let challenges = [Challenge {
+            typ: ChallengeType::TlsAlpn01,
+            url: String::new(),
+            token: "token".into(),
+            error: None,
+        }];
+
+        let result = account.tls_alpn_01(&provider, &challenges, "example.com".into());
+        assert!(matches!(result, Err(AcmeError::Crypto(_))));
     }
 }
