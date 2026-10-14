@@ -16,7 +16,20 @@ pub(crate) use aws_lc_rs::{digest, hmac, rand, signature};
 #[cfg(all(feature = "tls-ring", not(feature = "tls-aws-lc-rs")))]
 pub(crate) use ring::{digest, hmac, rand, signature};
 
+#[cfg(feature = "tls-webpki-roots")]
+use rustls::crypto::CryptoProvider;
 use signature::{EcdsaKeyPair, EcdsaSigningAlgorithm};
+
+/// The rustls provider matching the selected backend, used by
+/// `AcmeConfig::new`.
+#[cfg(feature = "tls-webpki-roots")]
+pub(crate) fn default_provider() -> CryptoProvider {
+    #[cfg(all(feature = "tls-ring", not(feature = "tls-aws-lc-rs")))]
+    let provider = rustls::crypto::ring::default_provider();
+    #[cfg(feature = "tls-aws-lc-rs")]
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider
+}
 
 /// Error from the crypto backend.
 ///

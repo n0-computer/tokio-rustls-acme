@@ -99,15 +99,10 @@ tls-webpki-roots = ["dep:webpki-roots"]
 # rustls crypto provider for `AcmeConfig::new`.
 #
 # Selects ring when `tls-aws-lc-rs` is not also enabled.
-tls-ring = ["dep:ring", "rcgen/ring", "rustls/ring", "tokio-rustls/ring"]
+tls-ring = ["dep:ring", "rcgen/ring", "rustls/ring"]
 # Selects aws-lc-rs. Takes precedence over `tls-ring` when both are
 # enabled, because rcgen makes the same choice.
-tls-aws-lc-rs = [
-    "dep:aws-lc-rs",
-    "rcgen/aws_lc_rs",
-    "rustls/aws-lc-rs",
-    "tokio-rustls/aws-lc-rs",
-]
+tls-aws-lc-rs = ["dep:aws-lc-rs", "rcgen/aws_lc_rs", "rustls/aws-lc-rs"]
 
 [[example]]
 name = "low_level_axum"

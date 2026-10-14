@@ -24,7 +24,6 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
-    pub(crate) crypto_provider: Arc<CryptoProvider>,
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -56,7 +55,7 @@ impl AcmeConfig<Infallible, Infallible> {
     /// ```
     #[cfg(feature = "tls-webpki-roots")]
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
-        Self::new_with_crypto_provider(domains, Self::default_crypto_provider())
+        Self::new_with_crypto_provider(domains, Arc::new(crate::crypto::default_provider()))
     }
 
     /// Same as [`AcmeConfig::new`] but with an explicit [`CryptoProvider`].
@@ -87,18 +86,6 @@ impl AcmeConfig<Infallible, Infallible> {
     }
 
     #[cfg(feature = "tls-webpki-roots")]
-    fn default_crypto_provider() -> Arc<CryptoProvider> {
-        #[cfg(all(feature = "tls-ring", not(feature = "tls-aws-lc-rs")))]
-        {
-            Arc::new(rustls::crypto::ring::default_provider())
-        }
-        #[cfg(feature = "tls-aws-lc-rs")]
-        {
-            Arc::new(rustls::crypto::aws_lc_rs::default_provider())
-        }
-    }
-
-    #[cfg(feature = "tls-webpki-roots")]
     fn webpki_root_store() -> rustls::RootCertStore {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
@@ -125,7 +112,6 @@ impl AcmeConfig<Infallible, Infallible> {
         domains: impl IntoIterator<Item = impl AsRef<str>>,
         client_config: Arc<ClientConfig>,
     ) -> Self {
-        let crypto_provider = client_config.crypto_provider().clone();
         AcmeConfig {
             client_config,
             directory_url: LETS_ENCRYPT_STAGING_DIRECTORY.into(),
@@ -133,7 +119,6 @@ impl AcmeConfig<Infallible, Infallible> {
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
-            crypto_provider,
         }
     }
 }
@@ -145,7 +130,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     /// the TLS handshake and key parsing, keeping the whole crate on a
     /// single provider.
     pub fn client_tls_config(mut self, client_config: Arc<ClientConfig>) -> Self {
-        self.crypto_provider = client_config.crypto_provider().clone();
         self.client_config = client_config;
         self
     }
@@ -199,7 +183,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             contact: self.contact,
             cache: Box::new(cache),
             eab: self.eab,
-            crypto_provider: self.crypto_provider,
         }
     }
     pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(
@@ -217,6 +200,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             Some(cache) => self.cache(cache),
             None => self.cache(NoCache::<C::EC, C::EA>::new()),
         }
+    }
+
+    /// The provider of the ACME client config, used for everything TLS.
+    pub(crate) fn crypto_provider(&self) -> &Arc<CryptoProvider> {
+        self.client_config.crypto_provider()
     }
 
     /// Returns the [`AcmeState`] that drives ordering, renewal, and caching.

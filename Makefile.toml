@@ -74,7 +74,6 @@ args = [
     "--no-default-features",
     "--features",
     "tls-webpki-roots,tls-ring",
-    "--tests",
 ]
 
 [tasks.test-aws-lc-rs]
@@ -86,7 +85,6 @@ args = [
     "--no-default-features",
     "--features",
     "tls-webpki-roots,tls-aws-lc-rs",
-    "--tests",
 ]
 
 [tasks.test-both-providers]
@@ -98,7 +96,6 @@ args = [
     "--no-default-features",
     "--features",
     "tls-webpki-roots,tls-ring,tls-aws-lc-rs",
-    "--tests",
 ]
 
 [tasks.test-feature-combos]

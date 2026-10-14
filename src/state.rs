@@ -150,7 +150,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
     /// Returns the [`CryptoProvider`] used by this state machine.
     pub fn crypto_provider(&self) -> Arc<CryptoProvider> {
-        self.config.crypto_provider.clone()
+        self.config.crypto_provider().clone()
     }
 
     #[cfg(feature = "axum")]
@@ -262,7 +262,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     }
     async fn order(
         config: Arc<AcmeConfig<EC, EA>>,
-        crypto_provider: Arc<CryptoProvider>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
     ) -> Result<Vec<u8>, OrderError> {
@@ -286,9 +285,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         loop {
             match order.status {
                 OrderStatus::Pending => {
-                    let auth_futures = order.authorizations.iter().map(|url| {
-                        Self::authorize(&config, &crypto_provider, &resolver, &account, url)
-                    });
+                    let auth_futures = order
+                        .authorizations
+                        .iter()
+                        .map(|url| Self::authorize(&config, &resolver, &account, url));
                     try_join_all(auth_futures).await?;
                     log::info!("completed all authorizations");
                     order = account.order(&config.client_config, &order_url).await?;
@@ -331,7 +331,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     }
     async fn authorize(
         config: &AcmeConfig<EC, EA>,
-        crypto_provider: &CryptoProvider,
         resolver: &ResolvesServerCertAcme,
         account: &Account,
         url: &String,
@@ -341,8 +340,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             AuthStatus::Pending => {
                 let Identifier::Dns(domain) = auth.identifier;
                 log::info!("trigger challenge for {}", domain);
-                let (challenge, auth_key) =
-                    account.tls_alpn_01(crypto_provider, &auth.challenges, domain.clone())?;
+                let (challenge, auth_key) = account.tls_alpn_01(
+                    config.crypto_provider(),
+                    &auth.challenges,
+                    domain.clone(),
+                )?;
                 resolver.set_auth_key(domain.clone(), Arc::new(auth_key));
                 account
                     .challenge(&config.client_config, &challenge.url)
@@ -452,10 +454,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             };
             let config = self.config.clone();
             let resolver = self.resolver.clone();
-            let crypto_provider = self.crypto_provider();
-            self.order = Some(Box::pin({
-                Self::order(config, crypto_provider, resolver, account_key)
-            }));
+            self.order = Some(Box::pin(Self::order(config, resolver, account_key)));
         }
     }
 }

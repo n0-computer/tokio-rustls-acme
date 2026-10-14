@@ -1,8 +1,8 @@
 use crate::AcmeState;
-use crate::acceptor::{AcmeAccept, AcmeAcceptor};
+use crate::acceptor::{AcmeAccept, AcmeAcceptor, server_config};
 use futures::Stream;
 use futures::stream::{FusedStream, FuturesUnordered};
-use rustls::{DEFAULT_VERSIONS, ServerConfig};
+use rustls::ServerConfig;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -69,11 +69,7 @@ impl<
         acceptor: AcmeAcceptor,
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Self {
-        let mut server_config = ServerConfig::builder_with_provider(state.crypto_provider())
-            .with_protocol_versions(DEFAULT_VERSIONS)
-            .expect("provider already built the ACME ClientConfig, so it is valid")
-            .with_no_client_auth()
-            .with_cert_resolver(state.resolver());
+        let mut server_config = server_config(state.crypto_provider(), state.resolver());
         server_config.alpn_protocols = alpn_protocols;
         Self::new_with_server(tcp_incoming, state, acceptor, server_config)
     }
