@@ -72,6 +72,18 @@
 //! that allows TLS connections to servers signed by an untrusted CA (in Firefox click "Advanced..."
 //! -> "Accept the Risk and Continue").
 //!
+//! ## IP address certificates
+//!
+//! Identifiers that parse as IP addresses are requested as IP identifiers (RFC 8738) and
+//! validated with tls-alpn-01 like domains, so the server must be reachable on port 443 of
+//! each address. Let's Encrypt only issues IP address certificates under the `shortlived`
+//! certificate profile, so set it with [AcmeConfig::profile]:
+//!
+//! ```rust
+//! # use tokio_rustls_acme::AcmeConfig;
+//! let config = AcmeConfig::new(["192.0.2.1", "2001:db8::1"]).profile("shortlived");
+//! ```
+//!
 //! ## Low-level Rustls API
 //!
 //! For users who may want to interact with [rustls] or [tokio_rustls]

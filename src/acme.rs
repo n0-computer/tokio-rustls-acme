@@ -123,13 +123,23 @@ impl Account {
         log::debug!("response: {body:?}");
         Ok((location, body))
     }
+    /// Create a new order for `domains`, which may contain DNS names and IP addresses.
+    ///
+    /// If `profile` is set, it is sent as the order's certificate profile (see
+    /// [`AcmeConfig::profile`](crate::AcmeConfig::profile)).
     pub async fn new_order(
         &self,
         client_config: &Arc<ClientConfig>,
         domains: Vec<String>,
+        profile: Option<&str>,
     ) -> Result<(String, Order), AcmeError> {
-        let domains: Vec<Identifier> = domains.into_iter().map(Identifier::from).collect();
-        let payload = format!("{{\"identifiers\":{}}}", serde_json::to_string(&domains)?);
+        let identifiers: Vec<Identifier> = domains.into_iter().map(Identifier::from).collect();
+        let mut payload = json!({ "identifiers": identifiers });
+        if let Some(profile) = profile {
+            // draft-ietf-acme-profiles
+            payload["profile"] = profile.into();
+        }
+        let payload = payload.to_string();
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
             .await?;

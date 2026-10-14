@@ -250,7 +250,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
 
         let (order_url, mut order) = account
-            .new_order(&config.client_config, config.domains.clone())
+            .new_order(
+                &config.client_config,
+                config.domains.clone(),
+                config.profile.as_deref(),
+            )
             .await?;
         loop {
             match order.status {
