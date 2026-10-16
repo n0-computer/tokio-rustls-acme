@@ -91,6 +91,24 @@ async fn fetch_root_cn(index: usize) -> String {
     cn.expect("root cert has no CN")
 }
 
+/// Fetch Pebble's intermediate for chain `index` (0 = default, 1 = first alternate).
+///
+/// With alternate roots, every chain has the same intermediate key, signed
+/// by a different root, so the DER identifies the chain exactly.
+async fn fetch_intermediate(index: usize) -> CertificateDer<'static> {
+    let url = format!("{PEBBLE_MGMT}/intermediates/{index}");
+    let pem_text = http_client()
+        .get(&url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("failed to fetch {}: {}", url, e))
+        .text()
+        .await
+        .unwrap();
+    let pems = pem::parse_many(&pem_text).expect("failed to parse intermediate PEM");
+    CertificateDer::from(pems[0].contents().to_vec())
+}
+
 /// Fetch Pebble's ACME-issued root + intermediate certs and build a root store
 /// for verifying certs issued by Pebble's CA.
 async fn pebble_acme_root_store() -> RootCertStore {
@@ -591,18 +609,10 @@ async fn test_preferred_chain() {
     let peer_certs = verify_tls_handshake(resolver, root_store).await;
     assert!(!peer_certs.is_empty(), "should have received certificates");
 
-    let last_cert_der = peer_certs.last().unwrap();
-    let (_, last_cert) = x509_parser::parse_x509_certificate(last_cert_der.as_ref()).unwrap();
-    let issuer_cn = last_cert
-        .issuer()
-        .iter_common_name()
-        .next()
-        .and_then(|cn| cn.as_str().ok())
-        .unwrap_or("");
-    eprintln!("preferred chain root issuer: {issuer_cn}");
     assert_eq!(
-        issuer_cn, alt_root_cn,
-        "chain should be issued by the preferred alternate root"
+        peer_certs.last().unwrap(),
+        &fetch_intermediate(1).await,
+        "should serve the alternate chain's intermediate"
     );
 }
 
@@ -626,9 +636,32 @@ async fn test_dual_chain() {
     let root_store = pebble_acme_root_store().await;
     let peer_certs = verify_tls_handshake(resolver, root_store).await;
     assert!(!peer_certs.is_empty(), "should have received certificates");
-    eprintln!(
-        "dual chain: received {} certificates from primary",
-        peer_certs.len()
+    assert_eq!(
+        peer_certs.last().unwrap(),
+        &fetch_intermediate(0).await,
+        "a client that verifies the default chain should get it"
+    );
+}
+
+/// A PreferredChain that no offered chain matches falls back to the default.
+#[tokio::test]
+#[ignore]
+async fn test_preferred_chain_falls_back_to_default() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let client_config = pebble_client_config();
+    let resolver = acquire_cert(
+        client_config,
+        CertChainPreference::PreferredChain("No Such Root".into()),
+    )
+    .await;
+
+    let root_store = pebble_acme_root_store().await;
+    let peer_certs = verify_tls_handshake(resolver, root_store).await;
+    assert_eq!(
+        peer_certs.last().unwrap(),
+        &fetch_intermediate(0).await,
+        "should serve the default chain"
     );
 }
 
@@ -672,10 +705,16 @@ async fn test_dual_chain_cache() {
         "should have at least 2 cached cert files (default + alt), got {}",
         cert_files.len()
     );
-    let has_alt = cert_files
+    let alt_file = cert_files
         .iter()
-        .any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with("_alt")));
-    assert!(has_alt, "should have an alternate cert cache file");
+        .find(|e| e.file_name().to_str().is_some_and(|n| n.ends_with("_alt")))
+        .expect("should have an alternate cert cache file");
+    let alt_pems = pem::parse_many(std::fs::read(alt_file.path()).unwrap()).unwrap();
+    assert_eq!(
+        alt_pems.last().unwrap().contents(),
+        fetch_intermediate(1).await.as_ref(),
+        "the alternate cache file should hold the alternate chain"
+    );
 
     // Second run: should load both chains from cache.
     let (resolver, events2) = acquire_cert_with_cache(
