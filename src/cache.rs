@@ -6,18 +6,6 @@ pub trait Cache: CertCache + AccountCache {}
 
 impl<T> Cache for T where T: CertCache + AccountCache {}
 
-/// Identifies which certificate chain variant to load or store.
-///
-/// ACME servers may offer multiple certificate chains for the same certificate
-/// (see [RFC 8555 Section 7.4.2](https://datatracker.ietf.org/doc/html/rfc8555#section-7.4.2)).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CertChainKind {
-    /// The default (primary) certificate chain.
-    Default,
-    /// An alternate certificate chain (e.g., from `Link: rel="alternate"` headers).
-    Alternate,
-}
-
 #[async_trait]
 pub trait CertCache: Send + Sync {
     type EC: Debug;
@@ -25,15 +13,37 @@ pub trait CertCache: Send + Sync {
         &self,
         domains: &[String],
         directory_url: &str,
-        chain: CertChainKind,
     ) -> Result<Option<Vec<u8>>, Self::EC>;
     async fn store_cert(
         &self,
         domains: &[String],
         directory_url: &str,
-        chain: CertChainKind,
         cert: &[u8],
     ) -> Result<(), Self::EC>;
+
+    /// Loads the alternate certificate chain stored by [`CertCache::store_alt_cert`].
+    ///
+    /// Used with [`CertChainPreference::DualChain`](crate::CertChainPreference::DualChain),
+    /// which serves an alternate chain next to the default one (RFC 8555 §7.4.2).
+    /// The default implementation stores nothing, so the alternate is
+    /// fetched again with the next order.
+    async fn load_alt_cert(
+        &self,
+        _domains: &[String],
+        _directory_url: &str,
+    ) -> Result<Option<Vec<u8>>, Self::EC> {
+        Ok(None)
+    }
+
+    /// Stores the alternate certificate chain. See [`CertCache::load_alt_cert`].
+    async fn store_alt_cert(
+        &self,
+        _domains: &[String],
+        _directory_url: &str,
+        _cert: &[u8],
+    ) -> Result<(), Self::EC> {
+        Ok(())
+    }
 }
 
 #[async_trait]

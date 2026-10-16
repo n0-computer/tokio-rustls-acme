@@ -43,11 +43,34 @@ impl ResolvesServerCertAcme {
             required_schemes,
         });
     }
-    pub(crate) fn set_alt_cert(&self, cert: Option<(Arc<CertifiedKey>, Vec<SignatureScheme>)>) {
-        self.inner.lock().unwrap().alt_cert = cert.map(|(key, required_schemes)| CertWithSchemes {
+    /// Sets or clears the alternate chain served in DualChain mode.
+    ///
+    /// The alternate must carry the same leaf certificate as the current
+    /// primary: it's the same certificate, chained to a different root. A
+    /// mismatch (e.g. a cached alternate left over from an earlier
+    /// certificate) clears the alternate instead. Returns whether an
+    /// alternate is installed.
+    pub(crate) fn set_alt_cert(
+        &self,
+        cert: Option<(Arc<CertifiedKey>, Vec<SignatureScheme>)>,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let alt = cert.filter(|(key, _)| {
+            let primary_leaf = inner
+                .cert
+                .as_ref()
+                .and_then(|c| c.key.end_entity_cert().ok());
+            let matches = primary_leaf.is_some() && primary_leaf == key.end_entity_cert().ok();
+            if !matches {
+                log::warn!("alternate chain doesn't match the current certificate, not serving it");
+            }
+            matches
+        });
+        inner.alt_cert = alt.map(|(key, required_schemes)| CertWithSchemes {
             key,
             required_schemes,
         });
+        inner.alt_cert.is_some()
     }
     pub(crate) fn set_auth_key(&self, domain: String, cert: Arc<CertifiedKey>) {
         self.inner.lock().unwrap().auth_keys.insert(domain, cert);
@@ -111,11 +134,7 @@ mod tests {
         cache: &TestCache<Infallible, Infallible>,
     ) -> (Arc<CertifiedKey>, Vec<CertificateDer<'static>>) {
         let pem_bytes = cache
-            .load_cert(
-                &["test.example.com".to_string()],
-                "",
-                crate::CertChainKind::Default,
-            )
+            .load_cert(&["test.example.com".to_string()], "")
             .await
             .unwrap()
             .unwrap();
@@ -130,6 +149,16 @@ mod tests {
             .collect();
         let key = Arc::new(CertifiedKey::new(cert_chain.clone(), pk));
         (key, cert_chain)
+    }
+
+    /// The same certificate as `primary`, with a different chain: the leaf
+    /// alone, which the test CA verifies directly.
+    fn alternate_of(
+        primary: &Arc<CertifiedKey>,
+    ) -> (Arc<CertifiedKey>, Vec<CertificateDer<'static>>) {
+        let chain = vec![primary.cert[0].clone()];
+        let key = Arc::new(CertifiedKey::new(chain.clone(), primary.key.clone()));
+        (key, chain)
     }
 
     fn make_root_store(ca_pem: &str) -> rustls::RootCertStore {
@@ -201,7 +230,7 @@ mod tests {
     async fn dual_chain_fallback_to_alt() {
         let cache = TestCache::<Infallible, Infallible>::new();
         let (primary_key, _) = make_cert(&cache).await;
-        let (alt_key, alt_chain) = make_cert(&cache).await;
+        let (alt_key, alt_chain) = alternate_of(&primary_key);
 
         let resolver = ResolvesServerCertAcme::new();
         // Primary requires ED448 (not supported by ring clients).
@@ -216,7 +245,7 @@ mod tests {
         let peer_certs = do_handshake(resolver, root_store).await;
 
         assert_eq!(
-            peer_certs[0], alt_chain[0],
+            peer_certs, alt_chain,
             "should serve alt cert when client doesn't support primary's schemes"
         );
     }
@@ -227,7 +256,7 @@ mod tests {
     async fn dual_chain_serves_primary_when_supported() {
         let cache = TestCache::<Infallible, Infallible>::new();
         let (primary_key, primary_chain) = make_cert(&cache).await;
-        let (alt_key, _) = make_cert(&cache).await;
+        let (alt_key, _) = alternate_of(&primary_key);
 
         let resolver = ResolvesServerCertAcme::new();
         // Primary requires ECDSA P-256 (supported by ring clients).
@@ -241,7 +270,7 @@ mod tests {
         let peer_certs = do_handshake(resolver, root_store).await;
 
         assert_eq!(
-            peer_certs[0], primary_chain[0],
+            peer_certs, primary_chain,
             "should serve primary cert when client supports its schemes"
         );
     }
@@ -255,7 +284,7 @@ mod tests {
     async fn dual_chain_client_without_rsa_gets_alt() {
         let cache = TestCache::<Infallible, Infallible>::new();
         let (primary_key, _) = make_cert(&cache).await;
-        let (alt_key, alt_chain) = make_cert(&cache).await;
+        let (alt_key, alt_chain) = alternate_of(&primary_key);
 
         let resolver = ResolvesServerCertAcme::new();
         resolver.set_cert(
@@ -295,7 +324,7 @@ mod tests {
         let peer_certs = do_handshake_with(resolver, root_store, Arc::new(provider)).await;
 
         assert_eq!(
-            peer_certs[0], alt_chain[0],
+            peer_certs, alt_chain,
             "a client without RSA must get the alternate chain"
         );
     }
@@ -312,6 +341,27 @@ mod tests {
         let root_store = make_root_store(cache.ca_pem());
         let peer_certs = do_handshake(resolver, root_store).await;
 
-        assert_eq!(peer_certs[0], primary_chain[0]);
+        assert_eq!(peer_certs, primary_chain);
+    }
+
+    /// An alternate whose leaf differs from the primary's (e.g. cached from an
+    /// earlier certificate) is not served.
+    #[tokio::test]
+    async fn alt_with_other_leaf_is_rejected() {
+        let cache = TestCache::<Infallible, Infallible>::new();
+        let (primary_key, primary_chain) = make_cert(&cache).await;
+        let (other_key, _) = make_cert(&cache).await;
+
+        let resolver = ResolvesServerCertAcme::new();
+        resolver.set_cert(primary_key, vec![SignatureScheme::ED448]);
+        let installed = resolver.set_alt_cert(Some((
+            other_key,
+            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
+        )));
+        assert!(!installed);
+
+        let root_store = make_root_store(cache.ca_pem());
+        let peer_certs = do_handshake(resolver, root_store).await;
+        assert_eq!(peer_certs, primary_chain);
     }
 }

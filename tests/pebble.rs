@@ -677,9 +677,6 @@ async fn test_dual_chain_cache() {
         .any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with("_alt")));
     assert!(has_alt, "should have an alternate cert cache file");
 
-    // Give the background alt cert cache task time to complete.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // Second run: should load both chains from cache.
     let (resolver, events2) = acquire_cert_with_cache(
         client_config,

@@ -29,7 +29,6 @@ use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
     Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
 };
-use crate::cache::CertChainKind;
 use crate::config::CertChainPreference;
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
@@ -47,8 +46,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     account_key: Option<Vec<u8>>,
 
     early_action: Option<BoxFuture<Event<EC, EA>>>,
-    load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
-    load_alt_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
+    load_cert: Option<BoxFuture<Result<Option<CachedCert>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
     order: Option<BoxFuture<Result<OrderResult, OrderError>>>,
     backoff_cnt: usize,
@@ -112,6 +110,12 @@ pub enum CertParseError {
 }
 
 struct OrderResult {
+    primary: Vec<u8>,
+    alternate: Option<Vec<u8>>,
+}
+
+/// Certificate loaded from the cache, plus the alternate chain in DualChain mode.
+struct CachedCert {
     primary: Vec<u8>,
     alternate: Option<Vec<u8>>,
 }
@@ -215,27 +219,30 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             load_cert: Some(Box::pin({
                 let config = config.clone();
                 async move {
-                    config
+                    let Some(primary) = config
                         .cache
-                        .load_cert(
-                            &config.domains,
-                            &config.directory_url,
-                            CertChainKind::Default,
-                        )
-                        .await
-                }
-            })),
-            load_alt_cert: Some(Box::pin({
-                let config = config.clone();
-                async move {
-                    config
-                        .cache
-                        .load_cert(
-                            &config.domains,
-                            &config.directory_url,
-                            CertChainKind::Alternate,
-                        )
-                        .await
+                        .load_cert(&config.domains, &config.directory_url)
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    // Only DualChain serves an alternate. A cached one from an
+                    // earlier DualChain run is ignored in the other modes.
+                    let alternate = match config.cert_chain {
+                        CertChainPreference::DualChain(_) => match config
+                            .cache
+                            .load_alt_cert(&config.domains, &config.directory_url)
+                            .await
+                        {
+                            Ok(alternate) => alternate,
+                            Err(err) => {
+                                log::warn!("failed to load cached alternate cert: {err:?}");
+                                None
+                            }
+                        },
+                        _ => None,
+                    };
+                    Ok(Some(CachedCert { primary, alternate }))
                 }
             })),
             load_account: Some(Box::pin({
@@ -296,7 +303,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     }
 
     #[allow(clippy::result_large_err)]
-    fn process_cert(&mut self, pem: Vec<u8>, cached: bool) -> Event<EC, EA> {
+    fn process_cert(
+        &mut self,
+        pem: Vec<u8>,
+        alternate: Option<Vec<u8>>,
+        cached: bool,
+    ) -> Event<EC, EA> {
         let parsed = match (Self::parse_cert(&pem), cached) {
             (Ok(r), _) => r,
             (Err(err), cached) => {
@@ -308,6 +320,20 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         };
         self.resolver
             .set_cert(Arc::new(parsed.certified_key), parsed.signature_schemes);
+        // After the primary: the resolver only accepts an alternate with the
+        // primary's leaf, and clears a stale one.
+        let alternate = alternate.filter(|alt_pem| match Self::parse_cert(alt_pem) {
+            Ok(alt) => self
+                .resolver
+                .set_alt_cert(Some((Arc::new(alt.certified_key), alt.signature_schemes))),
+            Err(err) => {
+                log::warn!("failed to parse alternate cert chain: {err}");
+                false
+            }
+        });
+        if alternate.is_none() {
+            self.resolver.set_alt_cert(None);
+        }
         let validity = parsed.validity;
         let wait_duration = (validity[1] - (validity[1] - validity[0]) / 3 - Utc::now())
             .max(chrono::Duration::zero())
@@ -319,16 +345,20 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
         let config = self.config.clone();
         self.early_action = Some(Box::pin(async move {
-            match config
-                .cache
-                .store_cert(
-                    &config.domains,
-                    &config.directory_url,
-                    CertChainKind::Default,
-                    &pem,
-                )
-                .await
-            {
+            let stored = async {
+                config
+                    .cache
+                    .store_cert(&config.domains, &config.directory_url, &pem)
+                    .await?;
+                if let Some(alternate) = &alternate {
+                    config
+                        .cache
+                        .store_alt_cert(&config.domains, &config.directory_url, alternate)
+                        .await?;
+                }
+                Ok(())
+            };
+            match stored.await {
                 Ok(()) => Ok(EventOk::CertCacheStore),
                 Err(err) => Err(EventError::CertCacheStore(err)),
             }
@@ -537,34 +567,16 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let result = ready!(load_cert.poll_unpin(cx));
                 self.load_cert.take();
                 match result {
-                    Ok(Some(pem)) => {
-                        return Poll::Ready(Self::process_cert(self.get_mut(), pem, true));
+                    Ok(Some(cached)) => {
+                        return Poll::Ready(Self::process_cert(
+                            self.get_mut(),
+                            cached.primary,
+                            cached.alternate,
+                            true,
+                        ));
                     }
                     Ok(None) => {}
                     Err(err) => return Poll::Ready(Err(EventError::CertCacheLoad(err))),
-                }
-            }
-
-            // load alt cert from cache (for DualChain mode)
-            if let Some(load_alt_cert) = &mut self.load_alt_cert {
-                let result = ready!(load_alt_cert.poll_unpin(cx));
-                self.load_alt_cert.take();
-                match result {
-                    Ok(Some(pem)) => match Self::parse_cert(&pem) {
-                        Ok(parsed) => {
-                            self.resolver.set_alt_cert(Some((
-                                Arc::new(parsed.certified_key),
-                                parsed.signature_schemes,
-                            )));
-                        }
-                        Err(err) => {
-                            log::warn!("failed to parse cached alternate cert: {err}");
-                        }
-                    },
-                    Ok(None) => {}
-                    Err(err) => {
-                        log::warn!("failed to load cached alternate cert: {err:?}");
-                    }
                 }
             }
 
@@ -586,42 +598,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 match result {
                     Ok(order_result) => {
                         self.backoff_cnt = 0;
-                        // Set alternate cert if present (DualChain mode).
-                        if let Some(alt_pem) = &order_result.alternate {
-                            match Self::parse_cert(alt_pem) {
-                                Ok(parsed) => {
-                                    self.resolver.set_alt_cert(Some((
-                                        Arc::new(parsed.certified_key),
-                                        parsed.signature_schemes,
-                                    )));
-                                    // Store alt cert in cache.
-                                    let alt_pem = alt_pem.clone();
-                                    let config = self.config.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(err) = config
-                                            .cache
-                                            .store_cert(
-                                                &config.domains,
-                                                &config.directory_url,
-                                                CertChainKind::Alternate,
-                                                &alt_pem,
-                                            )
-                                            .await
-                                        {
-                                            log::warn!("failed to cache alternate cert: {err:?}");
-                                        }
-                                    });
-                                }
-                                Err(err) => {
-                                    log::warn!("failed to parse alternate cert chain: {err}");
-                                }
-                            }
-                        } else {
-                            self.resolver.set_alt_cert(None);
-                        }
                         return Poll::Ready(Self::process_cert(
                             self.get_mut(),
                             order_result.primary,
+                            order_result.alternate,
                             false,
                         ));
                     }
