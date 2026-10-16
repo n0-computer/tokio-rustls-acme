@@ -379,29 +379,62 @@ pub struct CertificateWithAlternateUrls {
 
 /// Parse `Link` headers for `rel="alternate"` URLs (RFC 8555 Section 7.4.2).
 fn parse_link_alternate(headers: &HeaderMap) -> Vec<String> {
-    let mut urls = Vec::new();
-    for value in headers.get_all("Link").iter() {
-        let Ok(value) = value.to_str() else {
-            continue;
-        };
-        // Handle comma-separated Link values and individual headers.
-        // Format: <https://...>;rel="alternate"
-        for part in value.split(',') {
-            let part = part.trim();
-            if !part.contains("rel=\"alternate\"") {
-                continue;
-            }
-            if let Some(url) = part
-                .split(';')
-                .next()
-                .and_then(|s| s.trim().strip_prefix('<'))
-                .and_then(|s| s.strip_suffix('>'))
-            {
-                urls.push(url.to_string());
+    headers
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(split_unquoted(','))
+        .filter_map(|link| {
+            let (target, mut params) = parse_link_value(link)?;
+            params
+                .any(|(name, value)| {
+                    name.eq_ignore_ascii_case("rel")
+                        && value
+                            .split_ascii_whitespace()
+                            .any(|rel| rel.eq_ignore_ascii_case("alternate"))
+                })
+                .then(|| target.to_string())
+        })
+        .collect()
+}
+
+/// Splits `s` on `sep`, except inside `<…>` and `"…"` (RFC 8288 link values).
+fn split_unquoted(sep: char) -> impl Fn(&str) -> Vec<&str> {
+    move |s| {
+        let mut parts = Vec::new();
+        let (mut start, mut in_uri, mut in_quotes) = (0, false, false);
+        for (i, c) in s.char_indices() {
+            match c {
+                '<' if !in_quotes => in_uri = true,
+                '>' if !in_quotes => in_uri = false,
+                '"' if !in_uri => in_quotes = !in_quotes,
+                c if c == sep && !in_uri && !in_quotes => {
+                    parts.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
             }
         }
+        parts.push(&s[start..]);
+        parts
     }
-    urls
+}
+
+/// Parses one link value, `<target>; name=value; name="value"`, into the
+/// target and its parameters (names as written, values unquoted).
+fn parse_link_value(link: &str) -> Option<(&str, impl Iterator<Item = (&str, &str)>)> {
+    let link = link.trim().strip_prefix('<')?;
+    let (target, params) = link.split_once('>')?;
+    let params = split_unquoted(';')(params).into_iter().filter_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        Some((name.trim(), value))
+    });
+    Some((target, params))
 }
 
 fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeError> {
@@ -415,5 +448,59 @@ fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeE
     match h {
         None => Err(AcmeError::MissingHeader(header)),
         Some(value) => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderValue, LINK};
+
+    fn alternates(values: &[&str]) -> Vec<String> {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(LINK, HeaderValue::from_str(value).unwrap());
+        }
+        parse_link_alternate(&headers)
+    }
+
+    #[test]
+    fn link_alternate_boulder_format() {
+        assert_eq!(
+            alternates(&[
+                r#"<https://ca.example/acme/issuer>;rel="up""#,
+                r#"<https://ca.example/acme/cert/1/1>;rel="alternate""#,
+                r#"<https://ca.example/acme/cert/1/2>;rel="alternate""#,
+            ]),
+            [
+                "https://ca.example/acme/cert/1/1",
+                "https://ca.example/acme/cert/1/2"
+            ],
+        );
+    }
+
+    #[test]
+    fn link_alternate_rfc8288_variants() {
+        assert_eq!(
+            alternates(&[
+                // Several links in one header, unquoted and spaced params,
+                // case-insensitive names, multi-valued rel, a comma in a URL.
+                r#"<https://ca.example/up>; rel="up", <https://ca.example/a,1>; REL=alternate"#,
+                r#"<https://ca.example/b> ; title="x;y" ; rel = "index alternate""#,
+            ]),
+            ["https://ca.example/a,1", "https://ca.example/b"],
+        );
+    }
+
+    #[test]
+    fn link_alternate_ignores_other_and_malformed() {
+        assert!(
+            alternates(&[
+                r#"<https://ca.example/up>;rel="up""#,
+                r#"https://no-brackets.example;rel="alternate""#,
+                r#"<https://ca.example/c>;rel="alternates""#,
+            ])
+            .is_empty()
+        );
     }
 }
