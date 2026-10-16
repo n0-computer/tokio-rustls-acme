@@ -418,7 +418,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                                     &cert_response.alternate_urls,
                                     issuer,
                                 )
-                                .await?
+                                .await
                                 .unwrap_or(cert_response.pem)
                             };
                             (make_pem(&pem), None)
@@ -433,7 +433,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                                 &cert_response.alternate_urls,
                                 issuer,
                             )
-                            .await?
+                            .await
                             .map(|pem| make_pem(&pem));
                             (make_pem(&cert_response.pem), alternate)
                         }
@@ -447,26 +447,37 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     }
     /// Fetch the first alternate chain whose root issuer CN matches `target_issuer`.
     /// Returns `None` if no match is found.
+    ///
+    /// Download errors are logged and skipped, not returned. By now the order
+    /// is valid and the default chain is in hand. Failing the order would
+    /// throw away the issued certificate and order a new one, which counts
+    /// against the CA's rate limits.
     async fn fetch_chain_by_issuer(
         account: &Account,
         client_config: &Arc<rustls::ClientConfig>,
         alternate_urls: &[String],
         target_issuer: &str,
-    ) -> Result<Option<String>, AcmeError> {
+    ) -> Option<String> {
         for url in alternate_urls {
             log::debug!("fetching alternate chain from {url}");
-            let alt_pem = account.certificate(client_config, url).await?;
+            let alt_pem = match account.certificate(client_config, url).await {
+                Ok(pem) => pem,
+                Err(err) => {
+                    log::warn!("failed to fetch alternate chain from {url}: {err}");
+                    continue;
+                }
+            };
             if let Some(issuer) = chain_root_issuer(&alt_pem) {
                 log::debug!("alternate chain root issuer: '{issuer}'");
                 if issuer == target_issuer {
-                    return Ok(Some(alt_pem));
+                    return Some(alt_pem);
                 }
             }
         }
         log::warn!(
             "no alternate chain found matching issuer '{target_issuer}', using default chain"
         );
-        Ok(None)
+        None
     }
     async fn authorize(
         config: &AcmeConfig<EC, EA>,
