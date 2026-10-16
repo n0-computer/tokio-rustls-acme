@@ -16,32 +16,48 @@ const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
 /// Controls which certificate chain to serve to clients.
 ///
 /// ACME servers like Let's Encrypt may offer multiple certificate chains with different root
-/// certificates. This enum allows selecting which chain(s) to use.
+/// certificates (RFC 8555 §7.4.2). This enum allows selecting which chain(s) to use.
 ///
-/// # Note
+/// A chain is identified by the issuer common name of its topmost certificate, i.e. the root it
+/// chains to, like certbot's `--preferred-chain`. These names are chosen by the CA and change
+/// when it rotates its hierarchy. If no offered chain matches, the default chain is used and a
+/// warning is logged.
 ///
-/// For [`DualChain`](CertChainPreference::DualChain), chain selection is currently based on the
-/// client's advertised signature schemes.
+/// # DualChain and client capabilities
+///
+/// [`DualChain`](CertChainPreference::DualChain) picks the chain per connection from the
+/// signature schemes in the client's TLS ClientHello. The alternate is served to clients that
+/// can't verify every signature in the default chain but can verify the alternate. This helps
+/// clients that leave out algorithms they can't verify, e.g. rustls clients built without RSA
+/// support. A client that advertises a scheme it can't actually verify, or that doesn't trust
+/// the alternate's root, gains nothing.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub enum CertChainPreference {
-    /// Use the default chain from the ACME server (typically cross-signed for broad compatibility).
+    /// Use the default chain from the ACME server.
     #[default]
     Default,
-    /// Prefer an alternate chain whose root certificate's subject common name matches the given
-    /// string. Falls back to the default chain if no matching alternate is found.
+    /// Use the alternate chain whose root issuer common name matches the given string. Falls
+    /// back to the default chain if none matches, or if fetching the alternates fails.
     PreferredChain(String),
-    /// Serve two chains, selecting per-client based on TLS capabilities. The string specifies the
-    /// alternate chain's root issuer common name. The default ACME chain is used as the primary.
+    /// Serve the default chain, plus the alternate whose root issuer common name matches the
+    /// given string to clients that can only verify that one. See the type docs.
     DualChain(String),
 }
 
 impl CertChainPreference {
-    /// Use Let's Encrypt ISRG Root X2 (ECDSA-only chain, no RSA).
+    /// Use Let's Encrypt's chain to ISRG Root X2, which is ECDSA-only.
+    ///
+    /// For ECDSA certificates, Let's Encrypt's default chain has its intermediate signed by
+    /// ISRG Root X1 (RSA), with the X2-signed one offered as an alternate. Certificates from
+    /// newer hierarchies (e.g. the 2026 Root YE for the `tlsserver` and `shortlived`
+    /// profiles) may not offer an X2 chain, in which case the default chain is used.
     pub fn letsencrypt_x2() -> Self {
         Self::PreferredChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
     }
-    /// Serve both Let's Encrypt X1 (RSA cross-signed, broad compatibility) and X2 (ECDSA-only)
-    /// chains, selecting per-client based on advertised signature schemes.
+    /// Serve Let's Encrypt's default chain (intermediate signed by ISRG Root X1, RSA) and the
+    /// ISRG Root X2 chain (ECDSA-only) to clients without RSA. Same caveats as
+    /// [`letsencrypt_x2`](Self::letsencrypt_x2).
     pub fn letsencrypt_dual_chain() -> Self {
         Self::DualChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
     }

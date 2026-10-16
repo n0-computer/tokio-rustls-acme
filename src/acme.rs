@@ -370,6 +370,7 @@ struct ApiResponse {
 }
 
 /// The response from downloading a certificate, including any alternate chain URLs.
+#[non_exhaustive]
 pub struct CertificateWithAlternateUrls {
     /// The PEM-encoded certificate chain.
     pub pem: String,
