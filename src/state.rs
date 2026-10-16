@@ -132,6 +132,12 @@ fn chain_root_issuer(cert_pem: &str) -> Option<String> {
 }
 
 /// Map an X.509 signature algorithm OID to the corresponding rustls SignatureScheme.
+///
+/// This is a heuristic: a TLS scheme also fixes the signer's curve (ECDSA) or
+/// the PSS hash, which the OID alone doesn't. ECDSA is mapped by hash
+/// (`ecdsa-with-SHA384` to `ECDSA_NISTP384_SHA384`) and RSA-PSS to
+/// `RSA_PSS_SHA256`. That's right for Let's Encrypt's chains, whose ECDSA
+/// intermediates and roots are P-384.
 fn sig_oid_to_scheme(oid: &x509_parser::asn1_rs::Oid) -> Option<SignatureScheme> {
     use x509_parser::oid_registry::*;
 

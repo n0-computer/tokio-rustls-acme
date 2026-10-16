@@ -78,20 +78,17 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
             let client_schemes = client_hello.signature_schemes();
 
             // In DualChain mode: if the client can't verify the primary chain
-            // but can verify the alternate, serve the alternate.
+            // but can verify the alternate, serve the alternate. Verifying a
+            // chain takes every signature scheme in it, so a client that
+            // supports only some of the primary's schemes can't use it.
             if let (Some(primary), Some(alt)) = (&inner.cert, &inner.alt_cert) {
-                let supports_primary = primary
-                    .required_schemes
-                    .iter()
-                    .any(|s| client_schemes.contains(s));
-                if !supports_primary {
-                    let supports_alt = alt
-                        .required_schemes
+                let supports = |c: &CertWithSchemes| {
+                    c.required_schemes
                         .iter()
-                        .any(|s| client_schemes.contains(s));
-                    if supports_alt {
-                        return Some(alt.key.clone());
-                    }
+                        .all(|s| client_schemes.contains(s))
+                };
+                if !supports(primary) && supports(alt) {
+                    return Some(alt.key.clone());
                 }
             }
 
@@ -151,6 +148,20 @@ mod tests {
         resolver: Arc<ResolvesServerCertAcme>,
         root_store: rustls::RootCertStore,
     ) -> Vec<CertificateDer<'static>> {
+        do_handshake_with(
+            resolver,
+            root_store,
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .await
+    }
+
+    /// Like [`do_handshake`], with `client_provider` on the client side.
+    async fn do_handshake_with(
+        resolver: Arc<ResolvesServerCertAcme>,
+        root_store: rustls::RootCertStore,
+        client_provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Vec<CertificateDer<'static>> {
         let server_config = Arc::new(
             rustls::ServerConfig::builder()
                 .with_no_client_auth()
@@ -159,7 +170,9 @@ mod tests {
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
 
         let client_config = Arc::new(
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_provider(client_provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         );
@@ -230,6 +243,60 @@ mod tests {
         assert_eq!(
             peer_certs[0], primary_chain[0],
             "should serve primary cert when client supports its schemes"
+        );
+    }
+
+    /// The Let's Encrypt case DualChain exists for. The default ECDSA chain
+    /// has an intermediate signed by ISRG Root X1 (RSA), the alternate one
+    /// signed by ISRG Root X2 (ECDSA P-384). A client without RSA support
+    /// still advertises P-384, which must not count as supporting the
+    /// primary.
+    #[tokio::test]
+    async fn dual_chain_client_without_rsa_gets_alt() {
+        let cache = TestCache::<Infallible, Infallible>::new();
+        let (primary_key, _) = make_cert(&cache).await;
+        let (alt_key, alt_chain) = make_cert(&cache).await;
+
+        let resolver = ResolvesServerCertAcme::new();
+        resolver.set_cert(
+            primary_key,
+            vec![
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA256,
+            ],
+        );
+        resolver.set_alt_cert(Some((
+            alt_key,
+            vec![SignatureScheme::ECDSA_NISTP384_SHA384],
+        )));
+
+        // A ring client that doesn't advertise any RSA scheme.
+        let mut provider = rustls::crypto::ring::default_provider();
+        let mapping: Vec<_> = provider
+            .signature_verification_algorithms
+            .mapping
+            .iter()
+            .filter(|(scheme, _)| {
+                !matches!(
+                    scheme,
+                    SignatureScheme::RSA_PKCS1_SHA256
+                        | SignatureScheme::RSA_PKCS1_SHA384
+                        | SignatureScheme::RSA_PKCS1_SHA512
+                        | SignatureScheme::RSA_PSS_SHA256
+                        | SignatureScheme::RSA_PSS_SHA384
+                        | SignatureScheme::RSA_PSS_SHA512
+                )
+            })
+            .cloned()
+            .collect();
+        provider.signature_verification_algorithms.mapping = Box::leak(mapping.into_boxed_slice());
+
+        let root_store = make_root_store(cache.ca_pem());
+        let peer_certs = do_handshake_with(resolver, root_store, Arc::new(provider)).await;
+
+        assert_eq!(
+            peer_certs[0], alt_chain[0],
+            "a client without RSA must get the alternate chain"
         );
     }
 
