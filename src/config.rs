@@ -11,6 +11,58 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
+
+/// Controls which certificate chain to serve to clients.
+///
+/// ACME servers like Let's Encrypt may offer multiple certificate chains with different root
+/// certificates (RFC 8555 §7.4.2). This enum allows selecting which chain(s) to use.
+///
+/// A chain is identified by the issuer common name of its topmost certificate, i.e. the root it
+/// chains to, like certbot's `--preferred-chain`. These names are chosen by the CA and change
+/// when it rotates its hierarchy. If no offered chain matches, the default chain is used and a
+/// warning is logged.
+///
+/// # DualChain and client capabilities
+///
+/// [`DualChain`](CertChainPreference::DualChain) picks the chain per connection from the
+/// signature schemes in the client's TLS ClientHello. The alternate is served to clients that
+/// can't verify every signature in the default chain but can verify the alternate. This helps
+/// clients that leave out algorithms they can't verify, e.g. rustls clients built without RSA
+/// support. A client that advertises a scheme it can't actually verify, or that doesn't trust
+/// the alternate's root, gains nothing.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub enum CertChainPreference {
+    /// Use the default chain from the ACME server.
+    #[default]
+    Default,
+    /// Use the alternate chain whose root issuer common name matches the given string. Falls
+    /// back to the default chain if none matches, or if fetching the alternates fails.
+    PreferredChain(String),
+    /// Serve the default chain, plus the alternate whose root issuer common name matches the
+    /// given string to clients that can only verify that one. See the type docs.
+    DualChain(String),
+}
+
+impl CertChainPreference {
+    /// Use Let's Encrypt's chain to ISRG Root X2, which is ECDSA-only.
+    ///
+    /// For ECDSA certificates, Let's Encrypt's default chain has its intermediate signed by
+    /// ISRG Root X1 (RSA), with the X2-signed one offered as an alternate. Certificates from
+    /// newer hierarchies (e.g. the 2026 Root YE for the `tlsserver` and `shortlived`
+    /// profiles) may not offer an X2 chain, in which case the default chain is used.
+    pub fn letsencrypt_x2() -> Self {
+        Self::PreferredChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
+    }
+    /// Serve Let's Encrypt's default chain (intermediate signed by ISRG Root X1, RSA) and the
+    /// ISRG Root X2 chain (ECDSA-only) to clients without RSA. Same caveats as
+    /// [`letsencrypt_x2`](Self::letsencrypt_x2).
+    pub fn letsencrypt_dual_chain() -> Self {
+        Self::DualChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
+    }
+}
+
 /// Configuration for an ACME resolver.
 ///
 /// The type parameters represent the error types for the certificate cache and account cache.
@@ -21,6 +73,7 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
+    pub(crate) cert_chain: CertChainPreference,
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -79,6 +132,7 @@ impl AcmeConfig<Infallible, Infallible> {
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
+            cert_chain: CertChainPreference::Default,
         }
     }
 }
@@ -131,6 +185,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
+    /// Set the certificate chain preference. See [`CertChainPreference`] for details.
+    pub fn cert_chain(mut self, preference: CertChainPreference) -> Self {
+        self.cert_chain = preference;
+        self
+    }
     pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> {
         AcmeConfig {
             client_config: self.client_config,
@@ -139,6 +198,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             contact: self.contact,
             cache: Box::new(cache),
             eab: self.eab,
+            cert_chain: self.cert_chain,
         }
     }
     pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(
