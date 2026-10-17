@@ -1,7 +1,8 @@
 use crate::ResolvesServerCertAcme;
 use crate::acme::ACME_TLS_ALPN_NAME;
-use rustls::ServerConfig;
+use rustls::crypto::CryptoProvider;
 use rustls::server::Acceptor;
+use rustls::{DEFAULT_VERSIONS, ServerConfig};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -10,26 +11,50 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{Accept, LazyConfigAcceptor, StartHandshake};
 
+/// Builds a [`ServerConfig`] that serves the certificates of `resolver`.
+pub(crate) fn server_config(
+    crypto_provider: Arc<CryptoProvider>,
+    resolver: Arc<ResolvesServerCertAcme>,
+) -> ServerConfig {
+    ServerConfig::builder_with_provider(crypto_provider)
+        .with_protocol_versions(DEFAULT_VERSIONS)
+        // The provider comes from the ACME `ClientConfig`, so it already
+        // passed this check when that config was built.
+        .expect("crypto provider is usable for TLS")
+        .with_no_client_auth()
+        .with_cert_resolver(resolver)
+}
+
+/// Accepts incoming TLS connections, handling `tls-alpn-01` validation
+/// inline and forwarding application traffic to the caller.
 #[derive(Clone)]
 pub struct AcmeAcceptor {
     config: Arc<ServerConfig>,
 }
 
 impl AcmeAcceptor {
-    pub(crate) fn new(resolver: Arc<ResolvesServerCertAcme>) -> Self {
-        let mut config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
+    pub(crate) fn new(
+        resolver: Arc<ResolvesServerCertAcme>,
+        crypto_provider: Arc<CryptoProvider>,
+    ) -> Self {
+        let mut config = server_config(crypto_provider, resolver);
         config.alpn_protocols.push(ACME_TLS_ALPN_NAME.to_vec());
         Self {
             config: Arc::new(config),
         }
     }
+
+    /// Starts handshake processing on `io`.
+    ///
+    /// The returned future resolves to `Some(handshake)` for application
+    /// traffic the caller should finish, or `None` when the connection was
+    /// a `tls-alpn-01` validation already handled internally.
     pub fn accept<IO: AsyncRead + AsyncWrite + Unpin>(&self, io: IO) -> AcmeAccept<IO> {
         AcmeAccept::new(io, self.config.clone())
     }
 }
 
+/// Future returned by [`AcmeAcceptor::accept`].
 pub struct AcmeAccept<IO: AsyncRead + AsyncWrite + Unpin> {
     acceptor: LazyConfigAcceptor<IO>,
     config: Arc<ServerConfig>,

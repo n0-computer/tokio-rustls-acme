@@ -1,4 +1,4 @@
-//! An easy-to-use, async compatible [ACME] client library using [rustls] with [ring].
+//! An easy-to-use, async compatible [ACME] client library using [rustls].
 //! The validation mechanism used is tls-alpn-01, which allows serving acme challenge responses and
 //! regular TLS traffic on the same port.
 //!
@@ -11,9 +11,31 @@
 //! The goal is to provide a [Let's Encrypt](https://letsencrypt.org/) compatible TLS serving and
 //! certificate management using a simple and flexible stream based API.
 //!
-//! This crate uses [ring] as [rustls]'s backend, instead of [aws-lc-rs]. This generally makes it
-//! much easier to compile. If you'd like to use [aws-lc-rs] as [rustls]'s backend, we're open to
-//! contributions with the necessary `Cargo.toml` changes and feature-flags to enable you to do so.
+//! ## Crypto provider
+//!
+//! The crate uses one [`rustls::crypto::CryptoProvider`] end-to-end: for
+//! the HTTPS client, the TLS handshake, and key parsing. It is taken from
+//! the [`rustls::ClientConfig`] passed to [`AcmeConfig`] (or built from
+//! the chosen crate feature when [`AcmeConfig::new`] is used). The crate
+//! never reads or installs the process-wide default provider.
+//!
+//! The default `tls-ring` feature selects [ring] as rustls's crypto
+//! backend. To use [aws-lc-rs] instead, disable default features and
+//! enable `tls-aws-lc-rs`:
+//!
+//! ```toml
+//! tokio-rustls-acme = { version = "*", default-features = false, features = ["tls-aws-lc-rs", "tls-webpki-roots"] }
+//! ```
+//!
+//! One of the two features must be enabled. With both, aws-lc-rs is used,
+//! matching what rcgen does. Cargo unifies features across the dependency
+//! graph, so another crate enabling `tls-aws-lc-rs` switches a ring-only
+//! build over. The selected backend also signs ACME requests and generates
+//! keys, so with `tls-aws-lc-rs` alone ring is not in the dependency tree.
+//! A different rustls provider can still be used for TLS via
+//! [`AcmeConfig::new_with_crypto_provider`] or
+//! [`AcmeConfig::new_with_client_tls_config`]; that pins the TLS side
+//! regardless of features.
 //!
 //! To use tokio-rustls-acme add the following lines to your `Cargo.toml`:
 //!
@@ -126,6 +148,7 @@ pub mod axum;
 mod cache;
 pub mod caches;
 mod config;
+mod crypto;
 mod https_helper;
 mod incoming;
 mod jose;

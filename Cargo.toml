@@ -15,10 +15,11 @@ categories = ["asynchronous", "cryptography", "network-programming"]
 
 [dependencies]
 futures = "0.3.21"
-rcgen = { version = "0.14", features = ["x509-parser", "crypto"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem"] }
 serde_json = "1.0.81"
 serde = { version = "1.0.137", features = ["derive"] }
-ring = { version = "0.17.0", features = ["std"] }
+ring = { version = "0.17.0", features = ["std"], optional = true }
+aws-lc-rs = { version = "1.18", optional = true }
 base64 = "0.23"
 log = "0.4.17"
 webpki-roots = { version = "1", optional = true }
@@ -27,7 +28,7 @@ thiserror = "2.0"
 x509-parser = "0.18"
 chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 async-trait = "0.1.53"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false }
 time = "0.3.36"                                                                 # force the transitive dependency to a more recent minimal version. The build fails with 0.3.20
 
 tokio = { version = "1.20.1", default-features = false, features = ["fs", "time"] }
@@ -63,6 +64,11 @@ tokio-util = { version = "0.7.3", features = ["compat"] }
 warp = "0.3"
 tempfile = "3"
 x509-parser = "0.18"
+# Pulled in only for the integration tests so they can construct a
+# `CryptoProvider` regardless of which crate features are enabled. Cargo
+# applies dev-dep features to test/example/bench builds only, so this does
+# not enable rustls's `ring` feature in downstream library builds.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [package.metadata.docs.rs]
 all-features = true
@@ -75,7 +81,6 @@ allowed_external_types = [
     "nom::*",
     "pem::*",
     "rcgen::*",
-    "ring::*",
     "rustls::*",
     "serde_core::*",
     "serde_json::*",
@@ -86,19 +91,31 @@ allowed_external_types = [
 ]
 
 [features]
-default = ["rustls-tls-webpki-roots"]
+default = ["tls-webpki-roots", "tls-ring"]
 axum = ["dep:axum-server"]
-rustls-tls-webpki-roots = ["dep:webpki-roots"]
+tls-webpki-roots = ["dep:webpki-roots"]
+# At least one of `tls-ring` or `tls-aws-lc-rs` must be enabled. The
+# selected backend signs ACME requests, generates keys, and provides the
+# rustls crypto provider for `AcmeConfig::new`.
+#
+# Selects ring when `tls-aws-lc-rs` is not also enabled.
+tls-ring = ["dep:ring", "rcgen/ring", "rustls/ring"]
+# Selects aws-lc-rs. Takes precedence over `tls-ring` when both are
+# enabled, because rcgen makes the same choice.
+tls-aws-lc-rs = ["dep:aws-lc-rs", "rcgen/aws_lc_rs", "rustls/aws-lc-rs"]
 
 [[example]]
 name = "low_level_axum"
-required-features = ["axum"]
+required-features = ["axum", "tls-webpki-roots"]
 
 [[example]]
 name = "high_level_warp"
+required-features = ["tls-webpki-roots"]
 
 [[example]]
 name = "high_level"
+required-features = ["tls-webpki-roots"]
 
 [[example]]
 name = "low_level"
+required-features = ["tls-webpki-roots"]
