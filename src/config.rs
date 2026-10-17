@@ -21,10 +21,15 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
+    pub(crate) profile: Option<String>,
 }
 
 impl AcmeConfig<Infallible, Infallible> {
     /// Creates a new [AcmeConfig] instance.
+    ///
+    /// `domains` are the identifiers to request a certificate for: DNS names, or IP addresses
+    /// (RFC 8738). Let's Encrypt issues IP address certificates only under the `shortlived`
+    /// profile, see [AcmeConfig::profile].
     ///
     /// The new [AcmeConfig] instance will initially have no cache, and its type parameters for
     /// error types will be `Infallible` since the cache cannot return an error. The methods to set
@@ -79,6 +84,7 @@ impl AcmeConfig<Infallible, Infallible> {
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
+            profile: None,
         }
     }
 }
@@ -101,12 +107,35 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         .into();
         self
     }
+    /// Set the identifiers to request a certificate for, replacing the current ones.
+    ///
+    /// Each identifier is a DNS name or an IP address.
     pub fn domains(mut self, contact: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         self.domains = contact.into_iter().map(|s| s.as_ref().into()).collect();
         self
     }
+    /// Add an identifier (DNS name or IP address) to request a certificate for.
     pub fn domains_push(mut self, contact: impl AsRef<str>) -> Self {
         self.domains.push(contact.as_ref().into());
+        self
+    }
+
+    /// Request certificates with the given ACME profile.
+    ///
+    /// Profiles are defined by the CA and listed in its directory under `meta.profiles` (see
+    /// [draft-ietf-acme-profiles](https://datatracker.ietf.org/doc/draft-ietf-acme-profiles/)).
+    /// If unset, no profile is sent and the CA picks its default. Ordering with a profile the
+    /// CA does not offer fails.
+    ///
+    /// Let's Encrypt issues certificates for IP addresses only under the `shortlived` profile
+    /// (about 6 days of validity), so set it when any identifier is an IP address:
+    ///
+    /// ```rust
+    /// # use tokio_rustls_acme::AcmeConfig;
+    /// let config = AcmeConfig::new(["192.0.2.1"]).profile("shortlived");
+    /// ```
+    pub fn profile(mut self, profile: impl AsRef<str>) -> Self {
+        self.profile = Some(profile.as_ref().into());
         self
     }
 
@@ -139,6 +168,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             contact: self.contact,
             cache: Box::new(cache),
             eab: self.eab,
+            profile: self.profile,
         }
     }
     pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(
