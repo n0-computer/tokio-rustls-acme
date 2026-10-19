@@ -3,30 +3,36 @@
 PEBBLE_FEATURES = { value = "tls-webpki-roots,tls-ring", condition = { env_not_set = ["PEBBLE_FEATURES"] } }
 
 [tasks.pebble-up]
-description = "Start Pebble ACME test server"
+description = "Start Pebble ACME test servers"
 script = '''
 docker compose -f docker-compose.pebble.yml up -d
 echo "Waiting for Pebble to be ready..."
-for i in $(seq 1 30); do
-    if curl -sk https://localhost:14000/dir > /dev/null 2>&1; then
-        echo "Pebble is ready"
-        exit 0
+for port in 14000 14001; do
+    ready=
+    for i in $(seq 1 30); do
+        if curl -sk https://localhost:$port/dir > /dev/null 2>&1; then
+            ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [ -z "$ready" ]; then
+        echo "Pebble on port $port failed to start"
+        exit 1
     fi
-    sleep 1
 done
-echo "Pebble failed to start"
-exit 1
+echo "Pebble is ready"
 '''
 
 [tasks.pebble-down]
-description = "Stop Pebble ACME test server"
+description = "Stop Pebble ACME test servers"
 script = '''
 docker compose -f docker-compose.pebble.yml down
 rm -f pebble.minica.pem
 '''
 
 [tasks.pebble-cert]
-description = "Extract Pebble minica root cert"
+description = "Extract Pebble minica root cert (the same for both instances)"
 dependencies = ["pebble-up"]
 script = '''
 docker compose -f docker-compose.pebble.yml cp pebble:/test/certs/pebble.minica.pem ./pebble.minica.pem
