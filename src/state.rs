@@ -10,19 +10,26 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::future::try_join_all;
 use futures::{FutureExt, Stream, ready};
 use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
-use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
+use rustls::{ServerConfig, SignatureScheme};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
 use x509_parser::parse_x509_certificate;
 
+struct ParsedCert {
+    certified_key: CertifiedKey,
+    validity: [DateTime<Utc>; 2],
+    signature_schemes: Vec<SignatureScheme>,
+}
+
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
     Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
 };
+use crate::config::CertChainPreference;
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
 type Timer = std::pin::Pin<Box<Sleep>>;
@@ -43,9 +50,9 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     account_key: Option<Vec<u8>>,
 
     early_action: Option<BoxFuture<Event<EC, EA>>>,
-    load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
+    load_cert: Option<BoxFuture<Result<Option<CachedCert>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
-    order: Option<BoxFuture<Result<Vec<u8>, OrderError>>>,
+    order: Option<BoxFuture<Result<OrderResult, OrderError>>>,
     backoff_cnt: usize,
     wait: Option<Timer>,
 }
@@ -104,6 +111,65 @@ pub enum CertParseError {
     TooFewPem(usize),
     #[error("unsupported private key type")]
     InvalidPrivateKey,
+}
+
+struct OrderResult {
+    primary: Vec<u8>,
+    alternate: Option<Vec<u8>>,
+}
+
+/// Certificate loaded from the cache, plus the alternate chain in DualChain mode.
+struct CachedCert {
+    primary: Vec<u8>,
+    alternate: Option<Vec<u8>>,
+}
+
+/// Extract the issuer common name of the last certificate in a PEM chain.
+/// For a typical chain [leaf, intermediate], this returns the CN of whoever
+/// signed the intermediate — i.e. the root CA, which may not be included
+/// in the chain itself.
+fn chain_root_issuer(cert_pem: &str) -> Option<String> {
+    let pems = pem::parse_many(cert_pem).ok()?;
+    let last_der = pems.last()?.contents().to_vec();
+    let (_, cert) = parse_x509_certificate(&last_der).ok()?;
+    cert.issuer()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Map an X.509 signature algorithm OID to the corresponding rustls SignatureScheme.
+///
+/// This is a heuristic: a TLS scheme also fixes the signer's curve (ECDSA) or
+/// the PSS hash, which the OID alone doesn't. ECDSA is mapped by hash
+/// (`ecdsa-with-SHA384` to `ECDSA_NISTP384_SHA384`) and RSA-PSS to
+/// `RSA_PSS_SHA256`. That's right for Let's Encrypt's chains, whose ECDSA
+/// intermediates and roots are P-384.
+fn sig_oid_to_scheme(oid: &x509_parser::asn1_rs::Oid) -> Option<SignatureScheme> {
+    use x509_parser::oid_registry::*;
+
+    if *oid == OID_PKCS1_SHA256WITHRSA {
+        Some(SignatureScheme::RSA_PKCS1_SHA256)
+    } else if *oid == OID_PKCS1_SHA384WITHRSA {
+        Some(SignatureScheme::RSA_PKCS1_SHA384)
+    } else if *oid == OID_PKCS1_SHA512WITHRSA {
+        Some(SignatureScheme::RSA_PKCS1_SHA512)
+    } else if *oid == OID_PKCS1_RSASSAPSS {
+        Some(SignatureScheme::RSA_PSS_SHA256)
+    } else if *oid == OID_SIG_ECDSA_WITH_SHA256 {
+        Some(SignatureScheme::ECDSA_NISTP256_SHA256)
+    } else if *oid == OID_SIG_ECDSA_WITH_SHA384 {
+        Some(SignatureScheme::ECDSA_NISTP384_SHA384)
+    } else if *oid == OID_SIG_ECDSA_WITH_SHA512 {
+        Some(SignatureScheme::ECDSA_NISTP521_SHA512)
+    } else if *oid == OID_SIG_ED25519 {
+        Some(SignatureScheme::ED25519)
+    } else if *oid == OID_SIG_ED448 {
+        Some(SignatureScheme::ED448)
+    } else {
+        None
+    }
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
@@ -177,10 +243,30 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             load_cert: Some(Box::pin({
                 let config = config.clone();
                 async move {
-                    config
+                    let Some(primary) = config
                         .cache
                         .load_cert(&config.domains, &config.directory_url)
-                        .await
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    // Only DualChain serves an alternate. A cached one from an
+                    // earlier DualChain run is ignored in the other modes.
+                    let alternate = match config.cert_chain {
+                        CertChainPreference::DualChain(_) => match config
+                            .cache
+                            .load_alt_cert(&config.domains, &config.directory_url)
+                            .await
+                        {
+                            Ok(alternate) => alternate,
+                            Err(err) => {
+                                log::warn!("failed to load cached alternate cert: {err:?}");
+                                None
+                            }
+                        },
+                        _ => None,
+                    };
+                    Ok(Some(CachedCert { primary, alternate }))
                 }
             })),
             load_account: Some(Box::pin({
@@ -200,7 +286,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     fn parse_cert(
         crypto_provider: &CryptoProvider,
         pem: &[u8],
-    ) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertParseError> {
+    ) -> Result<ParsedCert, CertParseError> {
         let mut pems = pem::parse_many(pem)?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
@@ -214,22 +300,44 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         };
         let cert_chain: Vec<RustlsCertificate> =
             pems.into_iter().map(|p| p.into_contents().into()).collect();
-        let validity = match parse_x509_certificate(cert_chain[0].as_ref()) {
-            Ok((_, cert)) => {
-                let validity = cert.validity();
-                [validity.not_before, validity.not_after]
-                    .map(|t| Utc.timestamp_opt(t.timestamp(), 0).earliest().unwrap())
+
+        let mut validity = None;
+        let mut required_schemes = Vec::new();
+
+        for der in cert_chain.iter() {
+            let (_, cert) = parse_x509_certificate(der.as_ref()).map_err(CertParseError::X509)?;
+            if validity.is_none() {
+                let v = cert.validity();
+                validity = Some(
+                    [v.not_before, v.not_after]
+                        .map(|t| Utc.timestamp_opt(t.timestamp(), 0).earliest().unwrap()),
+                );
             }
-            Err(err) => return Err(CertParseError::X509(err)),
-        };
+            if let Some(scheme) = sig_oid_to_scheme(&cert.signature_algorithm.algorithm)
+                && !required_schemes.contains(&scheme)
+            {
+                required_schemes.push(scheme);
+            }
+        }
+
+        let validity = validity.expect("length checked above");
         let cert = CertifiedKey::new(cert_chain, pk);
-        Ok((cert, validity))
+        Ok(ParsedCert {
+            certified_key: cert,
+            validity,
+            signature_schemes: required_schemes,
+        })
     }
 
     #[allow(clippy::result_large_err)]
-    fn process_cert(&mut self, pem: Vec<u8>, cached: bool) -> Event<EC, EA> {
+    fn process_cert(
+        &mut self,
+        pem: Vec<u8>,
+        alternate: Option<Vec<u8>>,
+        cached: bool,
+    ) -> Event<EC, EA> {
         let provider = self.crypto_provider();
-        let (cert, validity) = match (Self::parse_cert(&provider, &pem), cached) {
+        let parsed = match (Self::parse_cert(&provider, &pem), cached) {
             (Ok(r), _) => r,
             (Err(err), cached) => {
                 return match cached {
@@ -238,7 +346,23 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 };
             }
         };
-        self.resolver.set_cert(Arc::new(cert));
+        self.resolver
+            .set_cert(Arc::new(parsed.certified_key), parsed.signature_schemes);
+        // After the primary: the resolver only accepts an alternate with the
+        // primary's leaf, and clears a stale one.
+        let alternate = alternate.filter(|alt_pem| match Self::parse_cert(&provider, alt_pem) {
+            Ok(alt) => self
+                .resolver
+                .set_alt_cert(Some((Arc::new(alt.certified_key), alt.signature_schemes))),
+            Err(err) => {
+                log::warn!("failed to parse alternate cert chain: {err}");
+                false
+            }
+        });
+        if alternate.is_none() {
+            self.resolver.set_alt_cert(None);
+        }
+        let validity = parsed.validity;
         let wait_duration = (validity[1] - (validity[1] - validity[0]) / 3 - Utc::now())
             .max(chrono::Duration::zero())
             .to_std()
@@ -249,11 +373,20 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
         let config = self.config.clone();
         self.early_action = Some(Box::pin(async move {
-            match config
-                .cache
-                .store_cert(&config.domains, &config.directory_url, &pem)
-                .await
-            {
+            let stored = async {
+                config
+                    .cache
+                    .store_cert(&config.domains, &config.directory_url, &pem)
+                    .await?;
+                if let Some(alternate) = &alternate {
+                    config
+                        .cache
+                        .store_alt_cert(&config.domains, &config.directory_url, alternate)
+                        .await?;
+                }
+                Ok(())
+            };
+            match stored.await {
                 Ok(()) => Ok(EventOk::CertCacheStore),
                 Err(err) => Err(EventError::CertCacheStore(err)),
             }
@@ -264,7 +397,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         config: Arc<AcmeConfig<EC, EA>>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
-    ) -> Result<Vec<u8>, OrderError> {
+    ) -> Result<OrderResult, OrderError> {
         let directory = Directory::discover(&config.client_config, &config.directory_url).await?;
         let account = Account::create_with_keypair(
             &config.client_config,
@@ -315,19 +448,94 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
                 OrderStatus::Valid { certificate } => {
                     log::info!("download certificate");
-                    let pem = [
-                        &key_pair.serialize_pem(),
-                        "\n",
-                        &account
-                            .certificate(&config.client_config, certificate)
-                            .await?,
-                    ]
-                    .concat();
-                    return Ok(pem.into_bytes());
+                    let cert_response = account
+                        .certificate_with_alternate_urls(&config.client_config, &certificate)
+                        .await?;
+                    let key_pem = key_pair.serialize_pem();
+
+                    // Build key+cert PEM bundle(s) based on chain preference.
+                    let make_pem = |cert_pem: &str| -> Vec<u8> {
+                        [&key_pem, "\n", cert_pem].concat().into_bytes()
+                    };
+
+                    let (primary, alternate) = match &config.cert_chain {
+                        // Use the default chain as-is.
+                        CertChainPreference::Default => (make_pem(&cert_response.pem), None),
+
+                        // Use a single chain: prefer an alternate matching `issuer`,
+                        // fall back to the default if not found.
+                        CertChainPreference::PreferredChain(issuer) => {
+                            let default_matches =
+                                chain_root_issuer(&cert_response.pem).as_deref() == Some(issuer);
+                            let pem = if default_matches {
+                                cert_response.pem
+                            } else {
+                                Self::fetch_chain_by_issuer(
+                                    &account,
+                                    &config.client_config,
+                                    &cert_response.alternate_urls,
+                                    issuer,
+                                )
+                                .await
+                                .unwrap_or(cert_response.pem)
+                            };
+                            (make_pem(&pem), None)
+                        }
+
+                        // Serve two chains: the default as primary, and an alternate
+                        // matching `issuer` for clients whose signature schemes differ.
+                        CertChainPreference::DualChain(issuer) => {
+                            let alternate = Self::fetch_chain_by_issuer(
+                                &account,
+                                &config.client_config,
+                                &cert_response.alternate_urls,
+                                issuer,
+                            )
+                            .await
+                            .map(|pem| make_pem(&pem));
+                            (make_pem(&cert_response.pem), alternate)
+                        }
+                    };
+
+                    return Ok(OrderResult { primary, alternate });
                 }
                 OrderStatus::Invalid => return Err(OrderError::BadOrder(order)),
             }
         }
+    }
+    /// Fetch the first alternate chain whose root issuer CN matches `target_issuer`.
+    /// Returns `None` if no match is found.
+    ///
+    /// Download errors are logged and skipped, not returned. By now the order
+    /// is valid and the default chain is in hand. Failing the order would
+    /// throw away the issued certificate and order a new one, which counts
+    /// against the CA's rate limits.
+    async fn fetch_chain_by_issuer(
+        account: &Account,
+        client_config: &Arc<rustls::ClientConfig>,
+        alternate_urls: &[String],
+        target_issuer: &str,
+    ) -> Option<String> {
+        for url in alternate_urls {
+            log::debug!("fetching alternate chain from {url}");
+            let alt_pem = match account.certificate(client_config, url).await {
+                Ok(pem) => pem,
+                Err(err) => {
+                    log::warn!("failed to fetch alternate chain from {url}: {err}");
+                    continue;
+                }
+            };
+            if let Some(issuer) = chain_root_issuer(&alt_pem) {
+                log::debug!("alternate chain root issuer: '{issuer}'");
+                if issuer == target_issuer {
+                    return Some(alt_pem);
+                }
+            }
+        }
+        log::warn!(
+            "no alternate chain found matching issuer '{target_issuer}', using default chain"
+        );
+        None
     }
     async fn authorize(
         config: &AcmeConfig<EC, EA>,
@@ -390,8 +598,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let result = ready!(load_cert.poll_unpin(cx));
                 self.load_cert.take();
                 match result {
-                    Ok(Some(pem)) => {
-                        return Poll::Ready(Self::process_cert(self.get_mut(), pem, true));
+                    Ok(Some(cached)) => {
+                        return Poll::Ready(Self::process_cert(
+                            self.get_mut(),
+                            cached.primary,
+                            cached.alternate,
+                            true,
+                        ));
                     }
                     Ok(None) => {}
                     Err(err) => return Poll::Ready(Err(EventError::CertCacheLoad(err))),
@@ -414,9 +627,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let result = ready!(order.poll_unpin(cx));
                 self.order.take();
                 match result {
-                    Ok(pem) => {
+                    Ok(order_result) => {
                         self.backoff_cnt = 0;
-                        return Poll::Ready(Self::process_cert(self.get_mut(), pem, false));
+                        return Poll::Ready(Self::process_cert(
+                            self.get_mut(),
+                            order_result.primary,
+                            order_result.alternate,
+                            false,
+                        ));
                     }
                     Err(err) => {
                         // TODO: replace key on some errors or high backoff_cnt?

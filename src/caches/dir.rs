@@ -80,6 +80,23 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         let file_name = Self::cached_cert_file_name(domains, directory_url);
         self.write(file_name, cert).await
     }
+    async fn load_alt_cert(
+        &self,
+        domains: &[String],
+        directory_url: &str,
+    ) -> Result<Option<Vec<u8>>, Self::EC> {
+        let file_name = Self::cached_cert_file_name(domains, directory_url) + "_alt";
+        self.read_if_exist(file_name).await
+    }
+    async fn store_alt_cert(
+        &self,
+        domains: &[String],
+        directory_url: &str,
+        cert: &[u8],
+    ) -> Result<(), Self::EC> {
+        let file_name = Self::cached_cert_file_name(domains, directory_url) + "_alt";
+        self.write(file_name, cert).await
+    }
 }
 
 #[async_trait]

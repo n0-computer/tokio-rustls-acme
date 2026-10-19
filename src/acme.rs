@@ -11,6 +11,7 @@ use crate::jose::{JoseError, key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rcgen::{CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
+use reqwest::header::HeaderMap;
 use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig,
@@ -112,7 +113,7 @@ impl Account {
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
         payload: &str,
-    ) -> Result<(Option<String>, String), AcmeError> {
+    ) -> Result<ApiResponse, AcmeError> {
         let body = sign(
             &self.key_pair,
             Some(&self.kid),
@@ -122,9 +123,14 @@ impl Account {
         )?;
         let response = https(client_config, url.as_ref(), Method::Post, Some(body)).await?;
         let location = get_header(&response, "Location").ok();
+        let headers = response.headers().clone();
         let body = response.text().await.map_err(HttpsRequestError::from)?;
         log::debug!("response: {body:?}");
-        Ok((location, body))
+        Ok(ApiResponse {
+            body,
+            location,
+            headers,
+        })
     }
     pub async fn new_order(
         &self,
@@ -136,8 +142,10 @@ impl Account {
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
             .await?;
-        let url = response.0.ok_or(AcmeError::MissingHeader("Location"))?;
-        let order = serde_json::from_str(&response.1)?;
+        let url = response
+            .location
+            .ok_or(AcmeError::MissingHeader("Location"))?;
+        let order = serde_json::from_str(&response.body)?;
         Ok((url, order))
     }
     pub async fn auth(
@@ -147,7 +155,7 @@ impl Account {
     ) -> Result<Auth, AcmeError> {
         let payload = "".to_string();
         let response = self.request(client_config, url, &payload).await?;
-        Ok(serde_json::from_str(&response.1)?)
+        Ok(serde_json::from_str(&response.body)?)
     }
     pub async fn challenge(
         &self,
@@ -163,7 +171,7 @@ impl Account {
         url: impl AsRef<str>,
     ) -> Result<Order, AcmeError> {
         let response = self.request(client_config, &url, "").await?;
-        Ok(serde_json::from_str(&response.1)?)
+        Ok(serde_json::from_str(&response.body)?)
     }
     pub async fn finalize(
         &self,
@@ -173,14 +181,26 @@ impl Account {
     ) -> Result<Order, AcmeError> {
         let payload = format!("{{\"csr\":\"{}\"}}", URL_SAFE_NO_PAD.encode(csr),);
         let response = self.request(client_config, &url, &payload).await?;
-        Ok(serde_json::from_str(&response.1)?)
+        Ok(serde_json::from_str(&response.body)?)
+    }
+    pub async fn certificate_with_alternate_urls(
+        &self,
+        client_config: &Arc<ClientConfig>,
+        url: impl AsRef<str>,
+    ) -> Result<CertificateWithAlternateUrls, AcmeError> {
+        let response = self.request(client_config, url, "").await?;
+        let alternate_urls = parse_link_alternate(&response.headers);
+        Ok(CertificateWithAlternateUrls {
+            pem: response.body,
+            alternate_urls,
+        })
     }
     pub async fn certificate(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<String, AcmeError> {
-        Ok(self.request(client_config, &url, "").await?.1)
+        Ok(self.request(client_config, &url, "").await?.body)
     }
     pub fn tls_alpn_01<'a>(
         &self,
@@ -352,6 +372,81 @@ pub enum AcmeError {
     NoTlsAlpn01Challenge,
 }
 
+struct ApiResponse {
+    body: String,
+    location: Option<String>,
+    headers: HeaderMap,
+}
+
+/// The response from downloading a certificate, including any alternate chain URLs.
+#[non_exhaustive]
+pub struct CertificateWithAlternateUrls {
+    /// The PEM-encoded certificate chain.
+    pub pem: String,
+    /// URLs of alternate certificate chains (from `Link: <url>;rel="alternate"` headers).
+    pub alternate_urls: Vec<String>,
+}
+
+/// Parse `Link` headers for `rel="alternate"` URLs (RFC 8555 Section 7.4.2).
+fn parse_link_alternate(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(split_unquoted(','))
+        .filter_map(|link| {
+            let (target, mut params) = parse_link_value(link)?;
+            params
+                .any(|(name, value)| {
+                    name.eq_ignore_ascii_case("rel")
+                        && value
+                            .split_ascii_whitespace()
+                            .any(|rel| rel.eq_ignore_ascii_case("alternate"))
+                })
+                .then(|| target.to_string())
+        })
+        .collect()
+}
+
+/// Splits `s` on `sep`, except inside `<…>` and `"…"` (RFC 8288 link values).
+fn split_unquoted(sep: char) -> impl Fn(&str) -> Vec<&str> {
+    move |s| {
+        let mut parts = Vec::new();
+        let (mut start, mut in_uri, mut in_quotes) = (0, false, false);
+        for (i, c) in s.char_indices() {
+            match c {
+                '<' if !in_quotes => in_uri = true,
+                '>' if !in_quotes => in_uri = false,
+                '"' if !in_uri => in_quotes = !in_quotes,
+                c if c == sep && !in_uri && !in_quotes => {
+                    parts.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&s[start..]);
+        parts
+    }
+}
+
+/// Parses one link value, `<target>; name=value; name="value"`, into the
+/// target and its parameters (names as written, values unquoted).
+fn parse_link_value(link: &str) -> Option<(&str, impl Iterator<Item = (&str, &str)>)> {
+    let link = link.trim().strip_prefix('<')?;
+    let (target, params) = link.split_once('>')?;
+    let params = split_unquoted(';')(params).into_iter().filter_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        Some((name.trim(), value))
+    });
+    Some((target, params))
+}
+
 fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeError> {
     let h = response
         .headers()
@@ -369,6 +464,56 @@ fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::{HeaderValue, LINK};
+
+    fn alternates(values: &[&str]) -> Vec<String> {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(LINK, HeaderValue::from_str(value).unwrap());
+        }
+        parse_link_alternate(&headers)
+    }
+
+    #[test]
+    fn link_alternate_boulder_format() {
+        assert_eq!(
+            alternates(&[
+                r#"<https://ca.example/acme/issuer>;rel="up""#,
+                r#"<https://ca.example/acme/cert/1/1>;rel="alternate""#,
+                r#"<https://ca.example/acme/cert/1/2>;rel="alternate""#,
+            ]),
+            [
+                "https://ca.example/acme/cert/1/1",
+                "https://ca.example/acme/cert/1/2"
+            ],
+        );
+    }
+
+    #[test]
+    fn link_alternate_rfc8288_variants() {
+        assert_eq!(
+            alternates(&[
+                // Several links in one header, unquoted and spaced params,
+                // case-insensitive names, multi-valued rel, a comma in a URL.
+                r#"<https://ca.example/up>; rel="up", <https://ca.example/a,1>; REL=alternate"#,
+                r#"<https://ca.example/b> ; title="x;y" ; rel = "index alternate""#,
+            ]),
+            ["https://ca.example/a,1", "https://ca.example/b"],
+        );
+    }
+
+    #[test]
+    fn link_alternate_ignores_other_and_malformed() {
+        assert!(
+            alternates(&[
+                r#"<https://ca.example/up>;rel="up""#,
+                r#"https://no-brackets.example;rel="alternate""#,
+                r#"<https://ca.example/c>;rel="alternates""#,
+            ])
+            .is_empty()
+        );
+    }
+
     use rustls::crypto::KeyProvider;
     use rustls::sign::SigningKey;
 
