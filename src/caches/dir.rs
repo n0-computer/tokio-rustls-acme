@@ -1,8 +1,8 @@
+use crate::crypto::digest::{Context, SHA256};
 use crate::{AccountCache, CertCache};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ring::digest::{Context, SHA256};
 use std::io::ErrorKind;
 use std::path::Path;
 use tokio::fs;

@@ -5,6 +5,9 @@ use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
 use futures::Stream;
+#[cfg(feature = "tls-webpki-roots")]
+use rustls::DEFAULT_VERSIONS;
+use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, ServerConfig};
 use std::convert::Infallible;
 use std::fmt::Debug;
@@ -77,13 +80,14 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
 }
 
 impl AcmeConfig<Infallible, Infallible> {
-    /// Creates a new [AcmeConfig] instance.
+    /// Creates an [`AcmeConfig`] backed by webpki-roots trust anchors.
     ///
-    /// The new [AcmeConfig] instance will initially have no cache, and its type parameters for
-    /// error types will be `Infallible` since the cache cannot return an error. The methods to set
-    /// a cache will change the error types to match those returned by the supplied cache.
+    /// Picks aws-lc-rs when the `tls-aws-lc-rs` feature is enabled,
+    /// otherwise ring (the default). The same provider is used for the HTTPS client,
+    /// the TLS handshake, and key parsing. Use
+    /// [`AcmeConfig::new_with_crypto_provider`] to pick a different provider.
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tokio_rustls_acme::AcmeConfig;
     /// use tokio_rustls_acme::caches::DirCache;
     /// let config = AcmeConfig::new(["example.com"]).cache(DirCache::new("./rustls_acme_cache"));
@@ -91,20 +95,51 @@ impl AcmeConfig<Infallible, Infallible> {
     ///
     /// Due to limited support for type parameter inference in Rust (see
     /// [RFC213](https://github.com/rust-lang/rfcs/blob/master/text/0213-defaulted-type-params.md)),
-    /// [AcmeConfig::new] is not (yet) generic over the [AcmeConfig]'s type parameters.
-    /// An uncached instance of [AcmeConfig] with particular type parameters can be created using
-    /// [NoCache].
+    /// [`AcmeConfig::new`] is not (yet) generic over the [`AcmeConfig`]'s type parameters.
+    /// An uncached instance of [`AcmeConfig`] with particular type parameters can be created using
+    /// [`NoCache`](crate::caches::NoCache).
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tokio_rustls_acme::AcmeConfig;
     /// use tokio_rustls_acme::caches::NoCache;
     /// # type EC = std::io::Error;
     /// # type EA = EC;
     /// let config: AcmeConfig<EC, EA> = AcmeConfig::new(["example.com"]).cache(NoCache::new());
     /// ```
-    ///
-    #[cfg(feature = "rustls-tls-webpki-roots")]
+    #[cfg(feature = "tls-webpki-roots")]
     pub fn new(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        Self::new_with_crypto_provider(domains, Arc::new(crate::crypto::default_provider()))
+    }
+
+    /// Same as [`AcmeConfig::new`] but with an explicit [`CryptoProvider`].
+    ///
+    /// Lets the caller pick the provider regardless of which crate features
+    /// are enabled. The same provider is used for the HTTPS client, the
+    /// TLS handshake, and key parsing. ACME request signing and key
+    /// generation still use the backend selected by the crate features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `crypto_provider` is unusable for TLS 1.2 and 1.3, i.e. it
+    /// has no key exchange groups or no cipher suite for either version.
+    /// This is the same check rustls's `ClientConfig::builder` performs.
+    #[cfg(feature = "tls-webpki-roots")]
+    pub fn new_with_crypto_provider(
+        domains: impl IntoIterator<Item = impl AsRef<str>>,
+        crypto_provider: Arc<CryptoProvider>,
+    ) -> Self {
+        let client_config = Arc::new(
+            ClientConfig::builder_with_provider(crypto_provider)
+                .with_protocol_versions(DEFAULT_VERSIONS)
+                .expect("crypto provider has no usable cipher suites or key exchange groups")
+                .with_root_certificates(Self::webpki_root_store())
+                .with_no_client_auth(),
+        );
+        Self::new_with_client_tls_config(domains, client_config)
+    }
+
+    #[cfg(feature = "tls-webpki-roots")]
+    fn webpki_root_store() -> rustls::RootCertStore {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
             rustls::pki_types::TrustAnchor {
@@ -113,14 +148,19 @@ impl AcmeConfig<Infallible, Infallible> {
                 name_constraints: ta.name_constraints.clone(),
             }
         }));
-        let client_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
-        Self::new_with_client_tls_config(domains, client_config)
+        root_store
     }
 
+    /// Creates a config that uses `client_config` for ACME directory and
+    /// order requests.
+    ///
+    /// The [`CryptoProvider`] is read from `client_config` and reused for
+    /// the TLS handshake and key parsing, so the whole crate runs on the
+    /// same provider as the HTTPS client.
+    ///
+    /// Use this when you need to control the trust store or crypto provider
+    /// of the HTTPS client. Otherwise prefer [`AcmeConfig::new`] or
+    /// [`AcmeConfig::new_with_crypto_provider`].
     pub fn new_with_client_tls_config(
         domains: impl IntoIterator<Item = impl AsRef<str>>,
         client_config: Arc<ClientConfig>,
@@ -138,7 +178,11 @@ impl AcmeConfig<Infallible, Infallible> {
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
-    /// Set custom `rustls::ClientConfig` for ACME API calls.
+    /// Sets a custom [`ClientConfig`] for ACME API calls.
+    ///
+    /// The [`CryptoProvider`] is read from `client_config` and reused for
+    /// the TLS handshake and key parsing, keeping the whole crate on a
+    /// single provider.
     pub fn client_tls_config(mut self, client_config: Arc<ClientConfig>) -> Self {
         self.client_config = client_config;
         self
@@ -217,6 +261,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             None => self.cache(NoCache::<C::EC, C::EA>::new()),
         }
     }
+
+    /// The provider of the ACME client config, used for everything TLS.
+    pub(crate) fn crypto_provider(&self) -> &Arc<CryptoProvider> {
+        self.client_config.crypto_provider()
+    }
+
+    /// Returns the [`AcmeState`] that drives ordering, renewal, and caching.
     pub fn state(self) -> AcmeState<EC, EA> {
         AcmeState::new(self)
     }

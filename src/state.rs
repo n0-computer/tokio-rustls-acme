@@ -10,7 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::future::try_join_all;
 use futures::{FutureExt, Stream, ready};
 use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
-use rustls::crypto::ring::sign::any_ecdsa_type;
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, SignatureScheme};
@@ -39,6 +39,10 @@ pub fn after(d: std::time::Duration) -> Timer {
     Box::pin(tokio::time::sleep(d))
 }
 
+/// Drives ACME orders and renewals, surfacing lifecycle events as a [`Stream`].
+///
+/// Owns the [`ResolvesServerCertAcme`] populated as new certificates are
+/// issued. Construct one from [`AcmeConfig::state`].
 #[allow(clippy::type_complexity)]
 pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
@@ -169,6 +173,11 @@ fn sig_oid_to_scheme(oid: &x509_parser::asn1_rs::Oid) -> Option<SignatureScheme>
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
+    /// Wraps `tcp_incoming` so each connection is dispatched to ACME
+    /// validation or to application TLS, returning an [`Incoming`] stream.
+    ///
+    /// `alpn_protocols` lists application protocols offered to clients,
+    /// most preferred first. Pass an empty `Vec` to disable ALPN.
     pub fn incoming<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
@@ -182,6 +191,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Incoming::new(tcp_incoming, self, acceptor, alpn_protocols)
     }
 
+    /// Like [`AcmeState::incoming`] but uses `server_config` for the
+    /// application TLS handshake.
+    ///
+    /// Use this when the caller needs to customize the rustls
+    /// [`ServerConfig`] beyond ALPN (e.g. session storage, mTLS).
     pub fn incoming_with_server<
         TCP: AsyncRead + AsyncWrite + Unpin,
         ETCP,
@@ -195,8 +209,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Incoming::new_with_server(tcp_incoming, self, acceptor, server_config)
     }
 
+    /// Returns an [`AcmeAcceptor`] for use with custom TCP accept loops.
     pub fn acceptor(&self) -> AcmeAcceptor {
-        AcmeAcceptor::new(self.resolver())
+        AcmeAcceptor::new(self.resolver(), self.crypto_provider())
+    }
+
+    /// Returns the [`CryptoProvider`] used by this state machine.
+    pub fn crypto_provider(&self) -> Arc<CryptoProvider> {
+        self.config.crypto_provider().clone()
     }
 
     #[cfg(feature = "axum")]
@@ -206,9 +226,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     ) -> crate::axum::AxumAcceptor {
         crate::axum::AxumAcceptor::new(self.acceptor(), rustls_config)
     }
+    /// Returns the certificate resolver populated by this state machine.
     pub fn resolver(&self) -> Arc<ResolvesServerCertAcme> {
         self.resolver.clone()
     }
+
+    /// Creates a state machine from `config`. Equivalent to
+    /// [`AcmeConfig::state`].
     pub fn new(config: AcmeConfig<EC, EA>) -> Self {
         let config = Arc::new(config);
         Self {
@@ -259,15 +283,18 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             wait: None,
         }
     }
-    fn parse_cert(pem: &[u8]) -> Result<ParsedCert, CertParseError> {
+    fn parse_cert(
+        crypto_provider: &CryptoProvider,
+        pem: &[u8],
+    ) -> Result<ParsedCert, CertParseError> {
         let mut pems = pem::parse_many(pem)?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
         }
         let pk_bytes = pems.remove(0).into_contents();
-        let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
-        let pk: PrivateKeyDer = pk_der.into();
-        let pk = match any_ecdsa_type(&pk) {
+        let pk_der: PrivatePkcs8KeyDer<'static> = pk_bytes.into();
+        let pk_der: PrivateKeyDer<'static> = pk_der.into();
+        let pk = match crypto_provider.key_provider.load_private_key(pk_der) {
             Ok(pk) => pk,
             Err(_) => return Err(CertParseError::InvalidPrivateKey),
         };
@@ -309,7 +336,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         alternate: Option<Vec<u8>>,
         cached: bool,
     ) -> Event<EC, EA> {
-        let parsed = match (Self::parse_cert(&pem), cached) {
+        let provider = self.crypto_provider();
+        let parsed = match (Self::parse_cert(&provider, &pem), cached) {
             (Ok(r), _) => r,
             (Err(err), cached) => {
                 return match cached {
@@ -322,7 +350,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             .set_cert(Arc::new(parsed.certified_key), parsed.signature_schemes);
         // After the primary: the resolver only accepts an alternate with the
         // primary's leaf, and clears a stale one.
-        let alternate = alternate.filter(|alt_pem| match Self::parse_cert(alt_pem) {
+        let alternate = alternate.filter(|alt_pem| match Self::parse_cert(&provider, alt_pem) {
             Ok(alt) => self
                 .resolver
                 .set_alt_cert(Some((Arc::new(alt.certified_key), alt.signature_schemes))),
@@ -520,8 +548,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             AuthStatus::Pending => {
                 let Identifier::Dns(domain) = auth.identifier;
                 log::info!("trigger challenge for {}", domain);
-                let (challenge, auth_key) =
-                    account.tls_alpn_01(&auth.challenges, domain.clone())?;
+                let (challenge, auth_key) = account.tls_alpn_01(
+                    config.crypto_provider(),
+                    &auth.challenges,
+                    domain.clone(),
+                )?;
                 resolver.set_auth_key(domain.clone(), Arc::new(auth_key));
                 account
                     .challenge(&config.client_config, &challenge.url)
@@ -641,9 +672,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             };
             let config = self.config.clone();
             let resolver = self.resolver.clone();
-            self.order = Some(Box::pin({
-                Self::order(config.clone(), resolver.clone(), account_key)
-            }));
+            self.order = Some(Box::pin(Self::order(config, resolver, account_key)));
         }
     }
 }

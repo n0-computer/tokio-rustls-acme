@@ -1,19 +1,23 @@
 use std::sync::Arc;
 
+pub use crate::crypto::CryptoError;
+use crate::crypto::hmac;
+use crate::crypto::rand::SystemRandom;
+use crate::crypto::signature::{
+    ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm,
+};
 use crate::https_helper::{HttpsRequestError, Method, Response, https};
 use crate::jose::{JoseError, key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rcgen::{CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
 use reqwest::header::HeaderMap;
-use ring::error::{KeyRejected, Unspecified};
-use ring::rand::SystemRandom;
-use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm};
+use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig,
+    crypto::CryptoProvider,
     pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
 };
-use rustls::{crypto::ring::sign::any_ecdsa_type, sign::CertifiedKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -26,7 +30,7 @@ pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
 #[derive(Debug)]
 pub struct Account {
-    pub key_pair: EcdsaKeyPair,
+    pub(crate) key_pair: EcdsaKeyPair,
     pub directory: Directory,
     pub kid: String,
 }
@@ -63,7 +67,8 @@ impl Account {
         S: AsRef<str> + 'a,
         I: IntoIterator<Item = &'a S>,
     {
-        let key_pair = EcdsaKeyPair::from_pkcs8(ALG, key_pair, &SystemRandom::new())?;
+        let key_pair = crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, key_pair)
+            .map_err(AcmeError::KeyRejected)?;
         let contact: Vec<&'a str> = contact.into_iter().map(AsRef::<str>::as_ref).collect();
 
         let payload = if let Some(eab) = &eab.as_ref() {
@@ -199,6 +204,7 @@ impl Account {
     }
     pub fn tls_alpn_01<'a>(
         &self,
+        crypto_provider: &CryptoProvider,
         challenges: &'a [Challenge],
         domain: String,
     ) -> Result<(&'a Challenge, CertifiedKey), AcmeError> {
@@ -218,9 +224,12 @@ impl Account {
         let cert = params.self_signed(&key_pair)?;
 
         let pk_bytes = key_pair.serialize_der();
-        let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
-        let pk_der: PrivateKeyDer = pk_der.into();
-        let pk = any_ecdsa_type(&pk_der).unwrap();
+        let pk_der: PrivatePkcs8KeyDer<'static> = pk_bytes.into();
+        let pk_der: PrivateKeyDer<'static> = pk_der.into();
+        let pk = crypto_provider
+            .key_provider
+            .load_private_key(pk_der)
+            .map_err(|err| AcmeError::Crypto(CryptoError::new(err)))?;
         let certified_key = CertifiedKey::new(vec![cert.der().clone()], pk);
         Ok((challenge, certified_key))
     }
@@ -253,14 +262,14 @@ impl Directory {
 /// See RFC 8555 section 7.3.4 for more information.
 pub struct ExternalAccountKey {
     pub kid: String,
-    pub key: ring::hmac::Key,
+    pub(crate) key: hmac::Key,
 }
 
 impl ExternalAccountKey {
     pub fn new(kid: String, key: &[u8]) -> Self {
         Self {
             kid,
-            key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key),
+            key: hmac::Key::new(hmac::HMAC_SHA256, key),
         }
     }
 }
@@ -354,9 +363,9 @@ pub enum AcmeError {
     #[error("http request error: {0}")]
     HttpRequest(#[from] HttpsRequestError),
     #[error("invalid key pair: {0}")]
-    KeyRejected(#[from] KeyRejected),
+    KeyRejected(CryptoError),
     #[error("crypto error: {0}")]
-    Crypto(#[from] Unspecified),
+    Crypto(#[from] CryptoError),
     #[error("acme service response is missing {0} header")]
     MissingHeader(&'static str),
     #[error("no tls-alpn-01 challenge found")]
@@ -503,5 +512,49 @@ mod tests {
             ])
             .is_empty()
         );
+    }
+
+    use rustls::crypto::KeyProvider;
+    use rustls::sign::SigningKey;
+
+    #[derive(Debug)]
+    struct RejectingKeyProvider;
+
+    impl KeyProvider for RejectingKeyProvider {
+        fn load_private_key(
+            &self,
+            _key_der: PrivateKeyDer<'static>,
+        ) -> Result<Arc<dyn SigningKey>, rustls::Error> {
+            Err(rustls::Error::General("rejected".into()))
+        }
+    }
+
+    /// A provider that can't load the challenge key must fail the order,
+    /// not panic the task polling it.
+    #[test]
+    fn tls_alpn_01_reports_unloadable_key() {
+        let provider = CryptoProvider {
+            key_provider: &RejectingKeyProvider,
+            ..rustls::crypto::ring::default_provider()
+        };
+        let account = Account {
+            key_pair: crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, &Account::generate_key_pair())
+                .unwrap(),
+            directory: Directory {
+                new_nonce: String::new(),
+                new_account: String::new(),
+                new_order: String::new(),
+            },
+            kid: String::new(),
+        };
+        let challenges = [Challenge {
+            typ: ChallengeType::TlsAlpn01,
+            url: String::new(),
+            token: "token".into(),
+            error: None,
+        }];
+
+        let result = account.tls_alpn_01(&provider, &challenges, "example.com".into());
+        assert!(matches!(result, Err(AcmeError::Crypto(_))));
     }
 }
