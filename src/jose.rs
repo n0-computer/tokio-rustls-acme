@@ -1,8 +1,10 @@
+use crate::crypto::CryptoError;
+use crate::crypto::digest::{Digest, SHA256, digest};
+use crate::crypto::hmac;
+use crate::crypto::rand::SystemRandom;
+use crate::crypto::signature::{EcdsaKeyPair, KeyPair};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ring::digest::{Digest, SHA256, digest};
-use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, KeyPair};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -20,7 +22,9 @@ pub(crate) fn sign(
     let protected = Protected::base64(jwk, kid, Some(nonce.as_ref()), url)?;
     let payload = URL_SAFE_NO_PAD.encode(payload);
     let combined = format!("{}.{}", protected, payload);
-    let signature = key.sign(&SystemRandom::new(), combined.as_bytes())?;
+    let signature = key
+        .sign(&SystemRandom::new(), combined.as_bytes())
+        .map_err(CryptoError::new)?;
     let signature = URL_SAFE_NO_PAD.encode(signature.as_ref());
     let body = Body {
         protected,
@@ -32,14 +36,14 @@ pub(crate) fn sign(
 
 pub(crate) fn sign_eab(
     key: &EcdsaKeyPair,
-    eab_key: &ring::hmac::Key,
+    eab_key: &hmac::Key,
     kid: &str,
     url: &str,
 ) -> Result<Body, JoseError> {
     let protected = Protected::hmac_base64(kid, url)?;
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Jwk::new(key))?);
     let combined = format!("{}.{}", protected, payload);
-    let signature = ring::hmac::sign(eab_key, combined.as_bytes());
+    let signature = hmac::sign(eab_key, combined.as_bytes());
     let signature = URL_SAFE_NO_PAD.encode(signature.as_ref());
     let body = Body {
         protected,
@@ -157,5 +161,51 @@ pub enum JoseError {
     #[error("json serialization failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("crypto error: {0}")]
-    Crypto(#[from] ring::error::Unspecified),
+    Crypto(#[from] crate::crypto::CryptoError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::signature::{
+        ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, UnparsedPublicKey,
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ParsedBody {
+        protected: String,
+        payload: String,
+        signature: String,
+    }
+
+    #[test]
+    fn sign_produces_verifiable_es256_jws() {
+        let pkcs8 = crate::acme::Account::generate_key_pair();
+        let key =
+            crate::crypto::ecdsa_key_pair_from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8)
+                .unwrap();
+        let body = sign(&key, None, "nonce".into(), "https://example.com", "{}").unwrap();
+        let body: ParsedBody = serde_json::from_str(&body).unwrap();
+
+        let signature = URL_SAFE_NO_PAD.decode(&body.signature).unwrap();
+        assert_eq!(signature.len(), 64, "ES256 signatures are fixed-size r||s");
+        let signed = format!("{}.{}", body.protected, body.payload);
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, key.public_key().as_ref())
+            .verify(signed.as_bytes(), &signature)
+            .unwrap();
+    }
+
+    #[test]
+    fn sign_eab_uses_hmac_sha256() {
+        let pkcs8 = crate::acme::Account::generate_key_pair();
+        let key =
+            crate::crypto::ecdsa_key_pair_from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8)
+                .unwrap();
+        let eab_key = hmac::Key::new(hmac::HMAC_SHA256, b"secret");
+        let body = sign_eab(&key, &eab_key, "kid", "https://example.com").unwrap();
+
+        let signature = URL_SAFE_NO_PAD.decode(&body.signature).unwrap();
+        let signed = format!("{}.{}", body.protected, body.payload);
+        hmac::verify(&eab_key, signed.as_bytes(), &signature).unwrap();
+    }
 }

@@ -7,6 +7,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+/// Cert resolver that serves the issued certificate to application traffic
+/// and per-domain validation certificates to `tls-alpn-01` clients.
 #[derive(Debug)]
 pub struct ResolvesServerCertAcme {
     inner: Mutex<Inner>,

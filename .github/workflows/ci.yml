@@ -68,6 +68,51 @@ jobs:
       - name: cargo test
         run: cargo test --locked --workspace --all-features --bins --tests --examples
 
+  # Verifies the crate compiles and tests pass under each crypto provider
+  # feature combo, and that a single-backend build doesn't pull in the other.
+  feature-combos:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "ring only"
+            features: "tls-webpki-roots,tls-ring"
+            absent: "aws-lc-rs"
+          - name: "aws-lc-rs only"
+            features: "tls-webpki-roots,tls-aws-lc-rs"
+            absent: "ring"
+          - name: "ring and aws-lc-rs"
+            features: "tls-webpki-roots,tls-ring,tls-aws-lc-rs"
+            absent: ""
+    env:
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      # Checked on its own: with `--tests` in the same invocation, the rustls
+      # dev-dependency's `ring` feature would be visible to the lib too.
+      - name: cargo check (lib only)
+        run: cargo check --locked --no-default-features --features ${{ matrix.features }} --lib
+      - name: other backend absent from dependency tree
+        if: matrix.absent != ''
+        env:
+          FEATURES: ${{ matrix.features }}
+          ABSENT: ${{ matrix.absent }}
+        run: |
+          tree=$(cargo tree --locked -e normal,build --no-default-features --features "$FEATURES" --prefix none --format '{p}')
+          if awk '{print $1}' <<<"$tree" | grep -qx "$ABSENT"; then
+            echo "$ABSENT is in the dependency tree for features $FEATURES"
+            exit 1
+          fi
+      - name: cargo test
+        run: cargo test --locked --no-default-features --features ${{ matrix.features }}
+
   # Checks correct runtime deps and features are requested by not including dev-dependencies.
   check-deps:
     runs-on: ubuntu-latest
