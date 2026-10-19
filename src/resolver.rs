@@ -127,7 +127,6 @@ mod tests {
     use super::*;
     use crate::CertCache;
     use crate::caches::TestCache;
-    use rustls::crypto::ring::sign::any_ecdsa_type;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use std::convert::{Infallible, TryFrom};
 
@@ -144,7 +143,10 @@ mod tests {
         let pk_bytes = pems.remove(0).into_contents();
         let pk_der: PrivatePkcs8KeyDer = pk_bytes.into();
         let pk: PrivateKeyDer = pk_der.into();
-        let pk = any_ecdsa_type(&pk).unwrap();
+        let pk = rustls::crypto::ring::default_provider()
+            .key_provider
+            .load_private_key(pk)
+            .unwrap();
         let cert_chain: Vec<CertificateDer<'static>> = pems
             .into_iter()
             .map(|p| CertificateDer::from(p.into_contents()))
@@ -194,9 +196,15 @@ mod tests {
         client_provider: Arc<rustls::crypto::CryptoProvider>,
     ) -> Vec<CertificateDer<'static>> {
         let server_config = Arc::new(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(resolver),
+            // Explicit provider: with both ring (dev-dependency) and
+            // aws-lc-rs enabled, rustls can't pick a process default.
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver),
         );
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
 
