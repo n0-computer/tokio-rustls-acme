@@ -183,6 +183,12 @@ mod tests {
         }
     }
 
+    /// Explicit provider: with both ring (dev-dependency) and aws-lc-rs
+    /// enabled, rustls can't pick a process default.
+    fn test_provider() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::ring::default_provider())
+    }
+
     fn certified_key(name: &str) -> (Arc<CertifiedKey>, CertificateDer<'static>) {
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let cert = rcgen::CertificateParams::new(vec![name.to_string()])
@@ -190,7 +196,7 @@ mod tests {
             .self_signed(&key_pair)
             .unwrap();
         let key = PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
-        let key = rustls::crypto::ring::sign::any_ecdsa_type(&key).unwrap();
+        let key = test_provider().key_provider.load_private_key(key).unwrap();
         let der = cert.der().clone();
         (Arc::new(CertifiedKey::new(vec![der.clone()], key)), der)
     }
@@ -201,11 +207,15 @@ mod tests {
         resolver: Arc<ResolvesServerCertAcme>,
         sni: &str,
     ) -> Result<CertificateDer<'static>, std::io::Error> {
-        let mut server_config = ServerConfig::builder()
+        let mut server_config = ServerConfig::builder_with_provider(test_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_no_client_auth()
             .with_cert_resolver(resolver);
         server_config.alpn_protocols = vec![ACME_TLS_ALPN_NAME.to_vec()];
-        let mut client_config = ClientConfig::builder()
+        let mut client_config = ClientConfig::builder_with_provider(test_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerify))
             .with_no_client_auth();

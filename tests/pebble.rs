@@ -592,14 +592,18 @@ async fn verify_tls_handshake_ip(
     ip: IpAddr,
 ) -> Vec<CertificateDer<'static>> {
     let server_config = Arc::new(
-        ServerConfig::builder()
+        ServerConfig::builder_with_provider(test_crypto_provider())
+            .with_protocol_versions(DEFAULT_VERSIONS)
+            .unwrap()
             .with_no_client_auth()
             .with_cert_resolver(resolver),
     );
     let acceptor = TlsAcceptor::from(server_config);
 
     let client_config = Arc::new(
-        ClientConfig::builder()
+        ClientConfig::builder_with_provider(test_crypto_provider())
+            .with_protocol_versions(DEFAULT_VERSIONS)
+            .unwrap()
             .with_root_certificates(root_store)
             .with_no_client_auth(),
     );
@@ -731,7 +735,9 @@ async fn acquire_validated_cert(
     // Serve on both loopback addresses: Pebble's VA connects to the identifier's address.
     let acceptor = state.acceptor();
     let server_config = Arc::new(
-        ServerConfig::builder()
+        ServerConfig::builder_with_provider(state.crypto_provider())
+            .with_protocol_versions(DEFAULT_VERSIONS)
+            .unwrap()
             .with_no_client_auth()
             .with_cert_resolver(state.resolver()),
     );
@@ -781,7 +787,9 @@ async fn acquire_validated_cert(
         Ok(()) => {
             let root_store = pebble_acme_root_store_at(VALIDATING_MGMT).await;
             let connector = TlsConnector::from(Arc::new(
-                ClientConfig::builder()
+                ClientConfig::builder_with_provider(test_crypto_provider())
+                    .with_protocol_versions(DEFAULT_VERSIONS)
+                    .unwrap()
                     .with_root_certificates(root_store)
                     .with_no_client_auth(),
             ));
