@@ -79,7 +79,7 @@ async fn stored_certificate_key_is_owner_only() {
     );
 }
 
-/// Only the new cache directory is owner-only, its missing parents are not.
+/// Only the new cache directory is owner-only, not its missing parents.
 ///
 /// The parents hold no secrets. Other service users may need to traverse
 /// them, so they get the default permissions of the umask.

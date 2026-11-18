@@ -85,9 +85,15 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
     ///
     /// The rename also replaces an old file with open permissions or a planted
     /// symlink, instead of writing through it. On Unix, a sync of the directory
-    /// after the rename makes the new entry survive a power loss.
+    /// after the rename makes the new entry survive a power loss. If that sync
+    /// fails, the function returns the error although the new file is in place.
     async fn write(&self, file: &str, contents: &[u8]) -> Result<(), std::io::Error> {
-        let dir = self.inner.as_ref();
+        let mut dir = self.inner.as_ref();
+        // An empty path means the current directory. Neither `mkdir` nor
+        // `open` accepts it, so the cache spells it out.
+        if dir.as_os_str().is_empty() {
+            dir = Path::new(".");
+        }
         create_dir(dir).await?;
         let (temp_path, temp_file) = create_temp_file(dir, file).await?;
         let result = async {
@@ -101,7 +107,7 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             return Err(err);
         }
         #[cfg(unix)]
-        fs::File::open(dir).await?.sync_all().await?;
+        sync_dir(dir).await?;
         Ok(())
     }
 
@@ -191,6 +197,21 @@ async fn create_dir(dir: &Path) -> Result<(), std::io::Error> {
             Ok(metadata) if metadata.is_dir() => Ok(()),
             _ => Err(err),
         },
+        result => result,
+    }
+}
+
+/// Syncs `dir` to disk, so a rename in it survives a power loss.
+///
+/// Some filesystems do not support a sync of a directory and fail with
+/// `EINVAL` or `ENOTSUP`. The function ignores these errors, as PostgreSQL
+/// does, because the rename has already succeeded.
+#[cfg(unix)]
+async fn sync_dir(dir: &Path) -> Result<(), std::io::Error> {
+    match fs::File::open(dir).await?.sync_all().await {
+        Err(err) if matches!(err.kind(), ErrorKind::InvalidInput | ErrorKind::Unsupported) => {
+            Ok(())
+        }
         result => result,
     }
 }

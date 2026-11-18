@@ -2,6 +2,9 @@
 //!
 //! Each store writes a temporary file and renames it over the cache entry.
 //! These tests run on every platform, so CI covers the rename on Windows too.
+//!
+//! One test changes the current directory of the process. All other tests in
+//! this file must use absolute paths.
 
 use std::fs;
 
@@ -51,6 +54,38 @@ async fn second_store_replaces_entries_without_temp_files() {
     );
     assert!(
         names[1].starts_with("cached_cert_"),
+        "unexpected files in the cache: {names:?}"
+    );
+}
+
+/// An empty cache path stores the entries in the current directory.
+///
+/// Earlier releases accepted the empty path, for example from
+/// `env::var(..).unwrap_or_default()`. The cache must keep accepting it.
+#[tokio::test]
+async fn empty_path_uses_current_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+    let cache = DirCache::new("");
+    let domains = ["example.com".to_string()];
+
+    cache
+        .store_cert(&domains, DIRECTORY_URL, b"key and chain")
+        .await
+        .unwrap();
+
+    let cert = cache.load_cert(&domains, DIRECTORY_URL).await.unwrap();
+    // Windows cannot delete the current directory, so leave it first.
+    std::env::set_current_dir(&original).unwrap();
+    assert_eq!(cert.as_deref(), Some(&b"key and chain"[..]));
+    let names: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1, "unexpected files in the cache: {names:?}");
+    assert!(
+        names[0].starts_with("cached_cert_"),
         "unexpected files in the cache: {names:?}"
     );
 }
