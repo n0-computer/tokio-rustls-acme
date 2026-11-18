@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
 use futures::future::try_join_all;
 use futures::{FutureExt, Stream, ready};
 use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
@@ -15,6 +14,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use thiserror::Error;
+use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
 use x509_parser::parse_x509_certificate;
@@ -200,7 +200,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     fn parse_cert(
         crypto_provider: &CryptoProvider,
         pem: &[u8],
-    ) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertParseError> {
+    ) -> Result<(CertifiedKey, [OffsetDateTime; 2]), CertParseError> {
         let mut pems = pem::parse_many(pem)?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
@@ -217,8 +217,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let validity = match parse_x509_certificate(cert_chain[0].as_ref()) {
             Ok((_, cert)) => {
                 let validity = cert.validity();
-                [validity.not_before, validity.not_after]
-                    .map(|t| Utc.timestamp_opt(t.timestamp(), 0).earliest().unwrap())
+                [validity.not_before, validity.not_after].map(|t| t.to_datetime())
             }
             Err(err) => return Err(CertParseError::X509(err)),
         };
@@ -239,9 +238,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             }
         };
         self.resolver.set_cert(Arc::new(cert));
-        let wait_duration = (validity[1] - (validity[1] - validity[0]) / 3 - Utc::now())
-            .max(chrono::Duration::zero())
-            .to_std()
+        let [not_before, not_after] = validity;
+        let renew_at = not_after - (not_after - not_before) / 3_i32;
+        // Negative durations (renewal already due) fail the conversion and become zero.
+        let wait_duration = (renew_at - OffsetDateTime::now_utc())
+            .try_into()
             .unwrap_or_default();
         self.wait = Some(after(wait_duration));
         if cached {

@@ -26,10 +26,9 @@ webpki-roots = { version = "1", optional = true }
 pem = "4.0"
 thiserror = "2.0"
 x509-parser = "0.18"
-chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 async-trait = "0.1.53"
 rustls = { version = "0.23", default-features = false }
-time = "0.3.36"                                                                 # force the transitive dependency to a more recent minimal version. The build fails with 0.3.20
+time = "0.3.36"
 
 tokio = { version = "1.20.1", default-features = false, features = ["fs", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
