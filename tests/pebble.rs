@@ -14,7 +14,7 @@
 
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -549,4 +549,191 @@ async fn test_multi_domain_san() {
         }
         eprintln!("multi-domain SANs served on {addr}: {sans:?}");
     }
+}
+
+/// Collects the IP address SANs of a DER certificate.
+fn ip_sans(cert: &CertificateDer<'_>) -> Vec<IpAddr> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
+    let san = cert
+        .subject_alternative_name()
+        .expect("SAN extension malformed")
+        .expect("SAN extension missing");
+    san.value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::IPAddress(bytes) => match bytes.len() {
+                4 => Some(IpAddr::from(<[u8; 4]>::try_from(*bytes).unwrap())),
+                16 => Some(IpAddr::from(<[u8; 16]>::try_from(*bytes).unwrap())),
+                n => panic!("IP SAN with {n} bytes"),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Serializes the tests that listen on `127.0.0.1` or `::1`.
+///
+/// The tests with IP identifiers share these addresses. Pebble's VA connects to the address in
+/// the identifier, and `::1` is the only IPv6 loopback address.
+static LOOPBACK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Orders a certificate for the IP addresses `ips`, with `profile` if set.
+///
+/// Serves tls-alpn-01 on each address of `ips`, and after deployment connects to each of them
+/// with the address as server name. Returns the chain served on the first address, or the
+/// error of the order.
+// The crate returns `OrderError` by value in its events too.
+#[allow(clippy::result_large_err)]
+async fn acquire_ip_cert(
+    ips: &[IpAddr],
+    profile: Option<&str>,
+) -> Result<Vec<CertificateDer<'static>>, OrderError> {
+    let _guard = LOOPBACK_LOCK.lock().await;
+
+    let identifiers: Vec<String> = ips.iter().map(IpAddr::to_string).collect();
+    let identifiers: Vec<&str> = identifiers.iter().map(String::as_str).collect();
+    let mut config = pebble_config(&identifiers);
+    if let Some(profile) = profile {
+        config = config.profile(profile);
+    }
+    let mut site = Site::bind(config, ips).await;
+    let result = site.deploy().await;
+    let mut chains = Vec::new();
+    if result.is_ok() {
+        for &ip in ips {
+            chains.push(fetch_chain(ip, ServerName::from(ip)).await);
+        }
+    }
+    site.close().await;
+    result.map(|()| chains.swap_remove(0))
+}
+
+/// Issue a certificate for an IPv4 address through real tls-alpn-01 validation.
+///
+/// The CA sends the reverse-DNS name `1.0.0.127.in-addr.arpa` as SNI (RFC 8738 section 6), so
+/// this fails unless the resolver serves the challenge certificate under that name.
+#[tokio::test]
+#[ignore]
+async fn test_validated_ipv4_certificate() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let chain = acquire_ip_cert(&[ip], None).await.expect("order failed");
+    assert_eq!(ip_sans(&chain[0]), [ip]);
+}
+
+/// Issue a certificate for an IPv6 address through real tls-alpn-01 validation, with the
+/// nibble-format reverse name under `ip6.arpa` as SNI.
+#[tokio::test]
+#[ignore]
+async fn test_validated_ipv6_certificate() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let chain = acquire_ip_cert(&[ip], None).await.expect("order failed");
+    assert_eq!(ip_sans(&chain[0]), [ip]);
+}
+
+/// Issue one certificate for both an IPv4 and an IPv6 address.
+#[tokio::test]
+#[ignore]
+async fn test_validated_dual_stack_certificate() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let ips = [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ];
+    let chain = acquire_ip_cert(&ips, None).await.expect("order failed");
+    assert_eq!(ip_sans(&chain[0]), ips);
+}
+
+/// Issue one certificate for an IP address and a domain.
+///
+/// Pebble validates the IP identifier on `127.0.0.1` with the reverse-DNS name as SNI, and the
+/// domain on the address that `challtestsrv` resolves it to, with the domain as SNI.
+#[tokio::test]
+#[ignore]
+async fn test_validated_mixed_ip_and_domain_certificate() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let domain = "mixed.example.com";
+    let domain_addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 10));
+    set_dns_record(domain, domain_addr).await;
+
+    let _guard = LOOPBACK_LOCK.lock().await;
+    let ip_identifier = ip.to_string();
+    let config = pebble_config(&[&ip_identifier, domain]);
+    let mut site = Site::bind(config, &[ip, domain_addr]).await;
+    site.deploy().await.expect("order failed");
+
+    let chain = fetch_chain(ip, ServerName::from(ip)).await;
+    fetch_chain_for(domain_addr, domain).await;
+    site.close().await;
+
+    assert_eq!(ip_sans(&chain[0]), [ip]);
+    let (_, leaf) = x509_parser::parse_x509_certificate(chain[0].as_ref()).unwrap();
+    let has_dns = leaf
+        .subject_alternative_name()
+        .expect("SAN extension malformed")
+        .expect("SAN extension missing")
+        .value
+        .general_names
+        .iter()
+        .any(
+            |name| matches!(name, x509_parser::extensions::GeneralName::DNSName(d) if *d == domain),
+        );
+    assert!(has_dns, "certificate should contain a DNS SAN for {domain}");
+}
+
+/// Lifetime of a DER certificate (`notAfter - notBefore`) in seconds.
+fn lifetime_secs(cert: &CertificateDer<'_>) -> i64 {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
+    let validity = cert.validity();
+    validity.not_after.timestamp() - validity.not_before.timestamp()
+}
+
+/// Request certificates under specific ACME profiles and check that the CA applied them.
+///
+/// `test/pebble-config.json` gives the profiles distinct validity periods. Pebble issues
+/// certificates valid for `validityPeriod - 1` seconds.
+#[tokio::test]
+#[ignore]
+async fn test_profile_selects_lifetime() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    for (profile, validity_period) in [("shortlived", 10), ("default", 20)] {
+        let chain = acquire_ip_cert(&[ip], Some(profile))
+            .await
+            .unwrap_or_else(|e| panic!("order with profile {profile} failed: {e}"));
+        assert_eq!(
+            lifetime_secs(&chain[0]),
+            validity_period - 1,
+            "lifetime for profile {profile}"
+        );
+    }
+}
+
+/// Requesting a profile the CA doesn't offer fails the order.
+///
+/// Pebble rejects the order before it validates anything, so the test does not listen.
+#[tokio::test]
+#[ignore]
+async fn test_unknown_profile_is_rejected() {
+    let _ = simple_logger::init_with_level(log::Level::Info);
+
+    let config = pebble_config(&["127.0.0.1"]).profile("no-such-profile");
+    let mut site = Site::bind(config, &[]).await;
+    let err = site
+        .deploy()
+        .await
+        .expect_err("order with an unknown profile should fail")
+        .to_string();
+    assert!(
+        err.contains("invalidProfile"),
+        "expected an invalidProfile error, got: {err}"
+    );
 }
