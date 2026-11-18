@@ -79,6 +79,36 @@ async fn stored_certificate_key_is_owner_only() {
     );
 }
 
+/// Only the new cache directory is owner-only, its missing parents are not.
+///
+/// The parents hold no secrets. Other service users may need to traverse
+/// them, so they get the default permissions of the umask.
+#[tokio::test]
+async fn missing_parents_get_default_permissions() {
+    set_common_umask();
+    let dir = tempfile::tempdir().unwrap();
+    let app_dir = dir.path().join("app");
+    let data_dir = app_dir.join("data");
+    let cache_dir = data_dir.join("acme");
+    let cache = DirCache::new(&cache_dir);
+
+    cache
+        .store_account(&[], DIRECTORY_URL, b"account key")
+        .await
+        .unwrap();
+
+    // Octal strings make a failure readable.
+    let mode = |path: &Path| {
+        format!(
+            "{:o}",
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        )
+    };
+    assert_eq!(mode(&cache_dir), "700", "cache directory {cache_dir:?}");
+    assert_eq!(mode(&data_dir), "755", "parent {data_dir:?}");
+    assert_eq!(mode(&app_dir), "755", "parent {app_dir:?}");
+}
+
 /// A stored ACME account key is readable by its owner only.
 #[tokio::test]
 async fn stored_account_key_is_owner_only() {
@@ -130,9 +160,9 @@ async fn renewed_certificate_key_is_owner_only() {
 
 /// A symlink at the name of a cache file does not redirect the TLS private key.
 ///
-/// Another local user could plant such a symlink in a cache directory that
-/// is writable for others, to make the server write its key to a file that
-/// the attacker can read.
+/// The cache directory must not be writable by others, so no other user can
+/// plant such a symlink. The rename is defense in depth: a stray symlink does
+/// not send the key to another file.
 #[tokio::test]
 async fn certificate_key_is_not_written_through_symlink() {
     set_common_umask();
