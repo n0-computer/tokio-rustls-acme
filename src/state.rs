@@ -344,7 +344,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                     &auth.challenges,
                     domain.clone(),
                 )?;
-                resolver.set_auth_key(domain.clone(), Arc::new(auth_key));
+                resolver.set_auth_key(&auth.identifier, Arc::new(auth_key));
                 account
                     .challenge(&config.client_config, &challenge.url)
                     .await?;
