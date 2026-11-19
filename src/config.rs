@@ -133,6 +133,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self.client_config = client_config;
         self
     }
+    /// Sets the URL of the ACME directory.
+    ///
+    /// RFC 8555 requires HTTPS. Plain HTTP works, but leaves the ACME traffic unprotected.
+    ///
+    /// Signed requests follow no redirects.
     pub fn directory(mut self, directory_url: impl AsRef<str>) -> Self {
         self.directory_url = directory_url.as_ref().into();
         self
