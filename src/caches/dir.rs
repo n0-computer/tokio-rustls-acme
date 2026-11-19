@@ -67,16 +67,17 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// A store that replaces a file keeps the group and the group bits of the old
 /// file. Thus a sidecar with group access can still read the new file. The
 /// user of the process owns the new file. The cache keeps the group only if
-/// the user of the process or root owns the old file. A file of another user
-/// could be a trap that grants its group access to the key. If the cache does
+/// the old file is a regular file with a single link that the user of the
+/// process or root owns. Another file could be a trap that grants its group
+/// access to the key, for example a hard link to a file of another group. If the cache does
 /// not keep the group, the new file gets no group bits. The new file never
 /// gets permission bits for other users.
 ///
 /// The new file does not keep an ACL of the old file. On a file with an ACL,
 /// the group bits show the ACL mask. Thus the owning group of the new file gets
 /// the rights of that mask. Grant access through the group or through a default
-/// ACL on the directory instead. An in-place write keeps the mode and the ACL
-/// of the file as they are.
+/// ACL on the directory instead. An in-place write keeps the ACL and the
+/// user and group bits of the file. It removes the bits for other users.
 ///
 /// On other platforms, files and directories get the default permissions. On
 /// Windows, they inherit the ACL of the parent directory.
@@ -150,7 +151,7 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
                 if !may_write_in_place(dir).await {
                     return Err(err);
                 }
-                let Some(handle) = open_in_place(&target, &old).await? else {
+                let Ok(Some(handle)) = open_in_place(&target, &old).await else {
                     return Err(err);
                 };
                 log::warn!(
@@ -190,7 +191,7 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             let Some(old) = old.filter(|_| in_place) else {
                 return Err(err);
             };
-            let Some(handle) = open_in_place(&target, &old).await? else {
+            let Ok(Some(handle)) = open_in_place(&target, &old).await else {
                 return Err(err);
             };
             log::warn!(
@@ -405,10 +406,10 @@ async fn keep_group_access(file: fs::File, old: &Metadata) -> Result<fs::File, s
     if group_bits == 0 {
         return Ok(file);
     }
-    if !is_trusted_owner(old.uid(), euid()) {
+    if !may_overwrite(old, euid()) {
         log::warn!(
-            "the old cache file belongs to user {}, so the new file gets no group access.",
-            old.uid(),
+            "the old cache file is not a regular file with one link of this user or root, \
+             so the new file gets no group access.",
         );
         return Ok(file);
     }
@@ -463,8 +464,9 @@ async fn may_write_in_place(_dir: &Path) -> bool {
 
 /// Opens `target` for an in-place write if the cache may write it there.
 ///
-/// The function returns `None` if the cache must not write the file. It opens the file without truncating it. It then checks that the
-/// handle refers to the `old` file. Thus it does not write through a symlink
+/// The function returns `None` if the cache must not write the file. It
+/// opens the file without truncating it. It then checks that the handle
+/// refers to the `old` file. Thus it does not write through a symlink
 /// that replaced the file after the check. On Unix, the file must also pass
 /// [`may_overwrite`]. The open does not follow a symlink and does not block on
 /// a FIFO.
@@ -496,9 +498,19 @@ async fn open_in_place(target: &Path, old: &Metadata) -> Result<Option<fs::File>
 
 /// Overwrites the opened `file` with `contents` and syncs it.
 ///
-/// The file keeps its mode. A crash during the write can leave a truncated
-/// file behind.
+/// On Unix, the function first removes the permission bits for other users,
+/// so a file from an earlier release no longer exposes the key. The user and
+/// group bits stay. A crash during the write can leave a truncated file
+/// behind.
 async fn overwrite(file: fs::File, contents: &[u8]) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        let mode = file.metadata().await?.mode();
+        if mode & 0o007 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7770))
+                .await?;
+        }
+    }
     file.set_len(0).await?;
     write_and_sync(file, contents).await
 }
@@ -555,6 +567,30 @@ mod tests {
         assert!(is_trusted_owner(0, 0));
         assert!(!is_trusted_owner(1001, 1000));
         assert!(!is_trusted_owner(1000, 0));
+    }
+
+    /// A hard-linked old file does not pass its group bits to the new file.
+    ///
+    /// A hard link at the cache name could point to a file of a group that
+    /// the attacker belongs to.
+    #[tokio::test]
+    async fn hard_linked_old_file_keeps_no_group_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::write(&old, b"key").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::hard_link(&old, dir.path().join("link")).unwrap();
+        let metadata = std::fs::metadata(&old).unwrap();
+
+        let new = dir.path().join("new");
+        let file = fs::File::create(&new).await.unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        keep_group_access(file, &metadata).await.unwrap();
+
+        let mode = std::fs::metadata(&new).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode {mode:o}");
     }
 
     #[test]

@@ -266,6 +266,36 @@ async fn store_into_read_only_directory_writes_in_place() {
     );
 }
 
+/// An in-place write removes the bits for other users from an old file.
+///
+/// Earlier releases wrote cache files with mode `0o644` under umask `022`.
+#[tokio::test]
+async fn store_into_read_only_directory_drops_world_bits() {
+    if is_root() {
+        return;
+    }
+    set_common_umask();
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    let cache = DirCache::new(&cache_dir);
+    let domains = ["example.com".to_string()];
+
+    cache
+        .store_cert(&domains, DIRECTORY_URL, b"old key and chain")
+        .await
+        .unwrap();
+    let file = cache_file(&cache_dir, "cached_cert_");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = cache.store_cert(&domains, DIRECTORY_URL, b"new key").await;
+
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    result.unwrap();
+    assert_eq!(fs::read(&file).unwrap(), b"new key");
+    assert_eq!(mode(&file), "640", "cache file {file:?}");
+}
+
 /// A store into a directory that other users can write never writes in place.
 ///
 /// Another user could plant a file at the cache name and read the key from
