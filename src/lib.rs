@@ -51,6 +51,7 @@
 //! well as accepting TLS connections, which are handed over to the caller on success.
 //!
 //! ```rust,no_run
+//! use std::time::Duration;
 //! use tokio::io::AsyncWriteExt;
 //! use futures::StreamExt;
 //! use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
@@ -69,7 +70,15 @@
 //!         .incoming(tcp_incoming, Vec::new());
 //!
 //!     while let Some(tls) = tls_incoming.next().await {
-//!         let mut tls = tls.unwrap();
+//!         let mut tls = match tls {
+//!             Ok(tls) => tls,
+//!             Err(err) => {
+//!                 log::error!("TCP accept failed: {err:?}");
+//!                 // Accept fails again at once while no file descriptor is free.
+//!                 tokio::time::sleep(Duration::from_millis(50)).await;
+//!                 continue;
+//!             }
+//!         };
 //!         tokio::spawn(async move {
 //!             tls.write_all(HELLO).await.unwrap();
 //!             tls.shutdown().await.unwrap();

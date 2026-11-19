@@ -1,13 +1,15 @@
 use clap::Parser;
+use futures::StreamExt;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
+use std::io;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::pin::pin;
+use std::time::Duration;
 use tokio_rustls_acme::AcmeConfig;
 use tokio_rustls_acme::caches::DirCache;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use warp::Filter;
 
@@ -42,7 +44,20 @@ async fn main() {
     let tcp_listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, args.port))
         .await
         .unwrap();
-    let tcp_incoming = TcpListenerStream::new(tcp_listener);
+    // Log and drop accept errors here, and pause after those that would repeat at once.
+    let tcp_incoming = TcpListenerStream::new(tcp_listener)
+        .filter_map(|tcp| async move {
+            match tcp {
+                Ok(tcp) => Some(Ok::<_, io::Error>(tcp)),
+                Err(err) => {
+                    log::error!("TCP accept failed: {err:?}");
+                    // Accept fails again at once while no file descriptor is free.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    None
+                }
+            }
+        })
+        .boxed();
 
     let tls_incoming = AcmeConfig::new(args.domains)
         .contact(args.email.iter().map(|e| format!("mailto:{e}")))
