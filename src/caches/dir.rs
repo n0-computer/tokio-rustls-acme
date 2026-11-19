@@ -3,10 +3,15 @@ use crate::{AccountCache, CertCache};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use tokio::fs;
 
+/// A cache that stores certificates and account keys as files in a directory.
+///
+/// The files hold private keys. Files are written owner-only (`0600`) on Unix
+/// and replaced atomically. The directory must not be writable by other users.
+/// A crash during a write can leave a temporary file behind.
 pub struct DirCache<P: AsRef<Path> + Send + Sync> {
     inner: P,
 }
@@ -33,9 +38,23 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
         file: impl AsRef<Path>,
         contents: impl AsRef<[u8]>,
     ) -> Result<(), std::io::Error> {
-        fs::create_dir_all(&self.inner).await?;
-        let path = self.inner.as_ref().join(file);
-        fs::write(path, contents).await
+        let dir = self.inner.as_ref().to_path_buf();
+        let path = dir.join(file);
+        let contents = contents.as_ref().to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(&dir)?;
+            let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+            tmp.write_all(&contents)?;
+            tmp.as_file().sync_all()?;
+            tmp.persist(path).map_err(|err| err.error)?;
+            Ok(())
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     fn cached_account_file_name(contact: &[String], directory_url: impl AsRef<str>) -> String {
