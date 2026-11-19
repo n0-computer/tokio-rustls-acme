@@ -577,6 +577,30 @@ mod tests {
         assert!(result.is_none(), "opened a swapped file");
     }
 
+    #[tokio::test]
+    async fn open_in_place_does_not_block_on_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::write(&old, b"key").unwrap();
+        let metadata = std::fs::metadata(&old).unwrap();
+        let target = dir.path().join("target");
+        let c_target = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_target` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_target.as_ptr(), 0o600) }, 0);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            open_in_place(&target, &metadata),
+        )
+        .await;
+
+        // A reader unblocks a hung open, so the runtime can shut down.
+        let _reader = result.is_err().then(|| std::fs::File::open(&target));
+        assert!(matches!(result, Ok(Err(_) | Ok(None))), "{result:?}");
+    }
+
     /// A hard-linked old file does not pass its group bits to the new file.
     #[tokio::test]
     async fn hard_linked_old_file_keeps_no_group_access() {
