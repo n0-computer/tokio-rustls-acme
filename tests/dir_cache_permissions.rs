@@ -52,9 +52,9 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// A stored TLS private key is readable by its owner only.
+/// A stored TLS private key and ACME account key are readable by their owner only.
 #[tokio::test]
-async fn stored_certificate_key_is_owner_only() {
+async fn stored_keys_are_owner_only() {
     set_common_umask();
     let dir = tempfile::tempdir().unwrap();
     let cache = DirCache::new(dir.path().join("cache"));
@@ -67,14 +67,20 @@ async fn stored_certificate_key_is_owner_only() {
         )
         .await
         .unwrap();
+    cache
+        .store_account(&[], DIRECTORY_URL, b"account key")
+        .await
+        .unwrap();
 
     let cache_dir = dir.path().join("cache");
-    let file = cache_file(&cache_dir, "cached_cert_");
-    assert_eq!(
-        group_and_other_bits(&file),
-        0,
-        "other users can access the TLS private key in {file:?}"
-    );
+    for prefix in ["cached_cert_", "cached_account_"] {
+        let file = cache_file(&cache_dir, prefix);
+        assert_eq!(
+            group_and_other_bits(&file),
+            0,
+            "other users can access the private key in {file:?}"
+        );
+    }
     assert_eq!(
         group_and_other_bits(&cache_dir),
         0,
@@ -82,8 +88,8 @@ async fn stored_certificate_key_is_owner_only() {
     );
     assert_eq!(
         fs::read_dir(&cache_dir).unwrap().count(),
-        1,
-        "the cache directory holds files other than the certificate"
+        2,
+        "the cache directory holds files other than the two keys"
     );
 }
 
@@ -110,26 +116,6 @@ async fn missing_parents_get_default_permissions() {
     assert_eq!(mode(&app_dir), "755", "parent {app_dir:?}");
 }
 
-/// A stored ACME account key is readable by its owner only.
-#[tokio::test]
-async fn stored_account_key_is_owner_only() {
-    set_common_umask();
-    let dir = tempfile::tempdir().unwrap();
-    let cache = DirCache::new(dir.path().join("cache"));
-
-    cache
-        .store_account(&[], DIRECTORY_URL, b"account key")
-        .await
-        .unwrap();
-
-    let file = cache_file(&dir.path().join("cache"), "cached_account_");
-    assert_eq!(
-        group_and_other_bits(&file),
-        0,
-        "other users can access the ACME account key in {file:?}"
-    );
-}
-
 /// Stores a certificate with `old_mode`, renews it, and returns the new mode.
 async fn renew_with_old_mode(old_mode: u32) -> String {
     set_common_umask();
@@ -153,22 +139,13 @@ async fn renew_with_old_mode(old_mode: u32) -> String {
     mode(&file)
 }
 
-/// A renewed TLS private key drops the world bits but keeps the group bits.
+/// A renewed TLS private key keeps the group bits of the old file but no world bits.
 #[tokio::test]
-async fn renewed_certificate_key_drops_world_bits() {
-    assert_eq!(renew_with_old_mode(0o644).await, "640");
-}
-
-/// A renewed TLS private key keeps the group access of the old file.
-#[tokio::test]
-async fn renewed_certificate_key_keeps_group_bits() {
-    assert_eq!(renew_with_old_mode(0o640).await, "640");
-}
-
-/// A renewed TLS private key stays owner-only when the old file is.
-#[tokio::test]
-async fn renewed_certificate_key_stays_owner_only() {
-    assert_eq!(renew_with_old_mode(0o600).await, "600");
+async fn renewed_certificate_key_keeps_only_group_bits() {
+    for (old_mode, expected) in [(0o644, "640"), (0o600, "600")] {
+        let mode = renew_with_old_mode(old_mode).await;
+        assert_eq!(mode, expected, "old mode {old_mode:o}");
+    }
 }
 
 /// Returns a supplementary group of the process other than its effective group.
@@ -212,41 +189,10 @@ async fn renewed_certificate_key_keeps_group() {
 }
 
 /// A store into a directory without write access replaces the content in place.
+///
+/// The in-place write also removes the bits for other users from the old file.
 #[tokio::test]
 async fn store_into_read_only_directory_writes_in_place() {
-    if is_root() {
-        return;
-    }
-    set_common_umask();
-    let dir = tempfile::tempdir().unwrap();
-    let cache_dir = dir.path().join("cache");
-    let cache = DirCache::new(&cache_dir);
-    let domains = ["example.com".to_string()];
-
-    cache
-        .store_cert(&domains, DIRECTORY_URL, b"old key and chain")
-        .await
-        .unwrap();
-    let file = cache_file(&cache_dir, "cached_cert_");
-    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).unwrap();
-
-    // Shorter content catches a missing truncation.
-    let result = cache.store_cert(&domains, DIRECTORY_URL, b"new key").await;
-
-    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    result.unwrap();
-    assert_eq!(fs::read(&file).unwrap(), b"new key");
-    assert_eq!(mode(&file), "600", "cache file {file:?}");
-    assert_eq!(
-        fs::read_dir(&cache_dir).unwrap().count(),
-        1,
-        "the cache directory holds files other than the certificate"
-    );
-}
-
-/// An in-place write removes the bits for other users from an old file.
-#[tokio::test]
-async fn store_into_read_only_directory_drops_world_bits() {
     if is_root() {
         return;
     }
@@ -264,12 +210,18 @@ async fn store_into_read_only_directory_drops_world_bits() {
     fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
     fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).unwrap();
 
+    // Shorter content catches a missing truncation.
     let result = cache.store_cert(&domains, DIRECTORY_URL, b"new key").await;
 
     fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
     result.unwrap();
     assert_eq!(fs::read(&file).unwrap(), b"new key");
     assert_eq!(mode(&file), "640", "cache file {file:?}");
+    assert_eq!(
+        fs::read_dir(&cache_dir).unwrap().count(),
+        1,
+        "the cache directory holds files other than the certificate"
+    );
 }
 
 /// A store into a directory that other users can write never writes in place.
