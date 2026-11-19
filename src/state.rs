@@ -50,62 +50,87 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     wait: Option<Timer>,
 }
 
+/// Item of the [`AcmeState`] stream, reporting the outcome of one step.
 pub type Event<EC, EA> = Result<EventOk, EventError<EC, EA>>;
 
+/// A successful step of [`AcmeState`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum EventOk {
+    /// A certificate from the cache is now served.
     DeployedCachedCert,
+    /// A newly issued certificate is now served.
     DeployedNewCert,
+    /// The newly issued certificate was stored in the cache.
     CertCacheStore,
+    /// A newly generated account key was stored in the cache.
     AccountCacheStore,
 }
 
+/// A failed step of [`AcmeState`].
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum EventError<EC: Debug, EA: Debug> {
+    /// Loading the certificate from the cache failed.
     #[error("cert cache load: {0}")]
     CertCacheLoad(EC),
     #[error("account cache load: {0}")]
     AccountCacheLoad(EA),
+    /// Storing the newly issued certificate in the cache failed.
     #[error("cert cache store: {0}")]
     CertCacheStore(EC),
+    /// Storing the newly generated account key in the cache failed.
     #[error("account cache store: {0}")]
     AccountCacheStore(EA),
+    /// The certificate from the cache could not be parsed.
     #[error("cached cert parse: {0}")]
     CachedCertParse(CertParseError),
+    /// Ordering a certificate failed, and the next order follows after a backoff.
     #[error("order: {0}")]
     Order(OrderError),
+    /// The newly issued certificate could not be parsed.
     #[error("new cert parse: {0}")]
     NewCertParse(CertParseError),
 }
 
+/// An error that stopped a certificate order.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum OrderError {
+    /// An ACME request failed.
     #[error("acme error: {0}")]
     Acme(#[from] AcmeError),
+    /// Generating the certificate key or the CSR failed.
     #[error("certificate generation error: {0}")]
     Rcgen(#[from] RcgenError),
+    /// The server marked the order invalid.
     #[error("bad order object: {0:?}")]
     BadOrder(Order),
+    /// An authorization reached a status other than pending or valid.
     #[error("bad auth object: {0:?}")]
     BadAuth(Auth),
+    /// The authorization for the given domain was still pending after the last check.
     #[error("authorization for {0} failed too many times")]
     TooManyAttemptsAuth(String),
+    /// The order was still processing after the last check.
     #[error("order status stayed on processing too long")]
     ProcessingTimeout(Order),
 }
 
+/// An error from parsing a PEM bundle of private key and certificate chain.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum CertParseError {
+    /// The end-entity certificate is not valid X.509.
     #[error("X509 parsing error: {0}")]
     X509(#[from] x509_parser::nom::Err<x509_parser::error::X509Error>),
+    /// The data is not valid PEM.
     #[error("expected 2 or more pem, got: {0}")]
     Pem(#[from] pem::PemError),
+    /// The bundle holds fewer than two PEM blocks, so the key or the certificate is missing.
     #[error("expected 2 or more pem, got: {0}")]
     TooFewPem(usize),
+    /// The crypto provider cannot load the private key.
     #[error("unsupported private key type")]
     InvalidPrivateKey,
 }
@@ -157,6 +182,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         self.config.crypto_provider().clone()
     }
 
+    /// Returns an [`AxumAcceptor`] that uses `rustls_config` for application TLS.
+    ///
+    /// [`AxumAcceptor`]: crate::axum::AxumAcceptor
     #[cfg(feature = "axum")]
     pub fn axum_acceptor(
         &self,

@@ -57,10 +57,12 @@ impl<EC: Debug, EA: Debug> Default for TestCache<EC, EA> {
 }
 
 impl<EC: Debug, EA: Debug> TestCache<EC, EA> {
+    /// Creates a cache with a newly generated test CA.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns the PEM certificate of the test CA, for clients to trust.
     pub fn ca_pem(&self) -> &str {
         &self.ca_pem
     }

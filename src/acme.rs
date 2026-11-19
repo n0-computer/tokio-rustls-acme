@@ -21,22 +21,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
+/// Directory URL of the Let's Encrypt staging environment.
 pub const LETS_ENCRYPT_STAGING_DIRECTORY: &str =
     "https://acme-staging-v02.api.letsencrypt.org/directory";
+/// Directory URL of the Let's Encrypt production environment.
 pub const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
     "https://acme-v02.api.letsencrypt.org/directory";
+/// ALPN protocol name that marks a `tls-alpn-01` validation handshake (RFC 8737).
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
 #[derive(Debug)]
 pub struct Account {
     pub(crate) key_pair: EcdsaKeyPair,
+    /// Directory of the ACME server that holds this account.
     pub directory: Directory,
+    /// Account URL from the server, sent as `kid` in signed requests.
     pub kid: String,
 }
 
 static ALG: &EcdsaSigningAlgorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
 
 impl Account {
+    /// Generates a new P-256 ECDSA account key in PKCS#8 DER form.
     pub fn generate_key_pair() -> Vec<u8> {
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(ALG, &rng).unwrap();
@@ -55,6 +61,7 @@ impl Account {
         let key_pair = Self::generate_key_pair();
         Self::create_with_keypair(client_config, directory, contact, &key_pair, eab).await
     }
+    /// Registers the account for `key_pair` at the server, or looks up the existing one.
     pub async fn create_with_keypair<'a, S, I>(
         client_config: &Arc<ClientConfig>,
         directory: Directory,
@@ -140,6 +147,7 @@ impl Account {
         let order = serde_json::from_str(&response.1)?;
         Ok((url, order))
     }
+    /// Fetches the authorization object at `url`.
     pub async fn auth(
         &self,
         client_config: &Arc<ClientConfig>,
@@ -149,6 +157,7 @@ impl Account {
         let response = self.request(client_config, url, &payload).await?;
         Ok(serde_json::from_str(&response.1)?)
     }
+    /// Tells the server that the challenge at `url` is ready for validation.
     pub async fn challenge(
         &self,
         client_config: &Arc<ClientConfig>,
@@ -157,6 +166,7 @@ impl Account {
         self.request(client_config, &url, "{}").await?;
         Ok(())
     }
+    /// Fetches the current state of the order at `url`.
     pub async fn order(
         &self,
         client_config: &Arc<ClientConfig>,
@@ -165,6 +175,7 @@ impl Account {
         let response = self.request(client_config, &url, "").await?;
         Ok(serde_json::from_str(&response.1)?)
     }
+    /// Sends the DER-encoded `csr` to the finalize `url` and returns the updated order.
     pub async fn finalize(
         &self,
         client_config: &Arc<ClientConfig>,
@@ -175,6 +186,7 @@ impl Account {
         let response = self.request(client_config, &url, &payload).await?;
         Ok(serde_json::from_str(&response.1)?)
     }
+    /// Downloads the PEM certificate chain at `url`.
     pub async fn certificate(
         &self,
         client_config: &Arc<ClientConfig>,
@@ -182,6 +194,7 @@ impl Account {
     ) -> Result<String, AcmeError> {
         Ok(self.request(client_config, &url, "").await?.1)
     }
+    /// Picks the `tls-alpn-01` challenge and builds its validation certificate for `domain`.
     pub fn tls_alpn_01<'a>(
         &self,
         crypto_provider: &CryptoProvider,
@@ -215,15 +228,20 @@ impl Account {
     }
 }
 
+/// Endpoint URLs from the directory object of an ACME server (RFC 8555 section 7.1.1).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Directory {
+    /// URL that hands out fresh replay nonces.
     pub new_nonce: String,
+    /// URL to create an account or look up an existing one.
     pub new_account: String,
+    /// URL to create a new order.
     pub new_order: String,
 }
 
 impl Directory {
+    /// Fetches and parses the directory object at `url`.
     pub async fn discover(
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -233,6 +251,7 @@ impl Directory {
 
         Ok(serde_json::from_slice(&body)?)
     }
+    /// Fetches a fresh replay nonce from the `newNonce` URL.
     pub async fn nonce(&self, client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
         let response = &https(client_config, &self.new_nonce.as_str(), Method::Head, None).await?;
         get_header(response, "replay-nonce")
@@ -241,11 +260,13 @@ impl Directory {
 
 /// See RFC 8555 section 7.3.4 for more information.
 pub struct ExternalAccountKey {
+    /// Key identifier that the CA assigned to the external account.
     pub kid: String,
     pub(crate) key: hmac::Key,
 }
 
 impl ExternalAccountKey {
+    /// Creates a binding key from the CA-issued `kid` and the raw HMAC-SHA256 `key` bytes.
     pub fn new(kid: String, key: &[u8]) -> Self {
         Self {
             kid,
@@ -256,8 +277,10 @@ impl ExternalAccountKey {
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 pub enum ChallengeType {
+    /// The `http-01` challenge (RFC 8555 section 8.3), not supported by this crate.
     #[serde(rename = "http-01")]
     Http01,
+    /// The `dns-01` challenge (RFC 8555 section 8.4), not supported by this crate.
     #[serde(rename = "dns-01")]
     Dns01,
     #[serde(rename = "tls-alpn-01")]
@@ -266,46 +289,71 @@ pub enum ChallengeType {
     Unknown,
 }
 
+/// An order object (RFC 8555 section 7.1.3).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Order {
+    /// Status of the order, with the certificate URL once it is valid.
     #[serde(flatten)]
     pub status: OrderStatus,
+    /// URLs of the authorizations that must be valid before finalization.
     pub authorizations: Vec<String>,
+    /// URL to send the CSR to once the order is ready.
     pub finalize: String,
+    /// Error that made the order fail, if any.
     pub error: Option<Problem>,
 }
 
+/// Status of an order (RFC 8555 section 7.1.6).
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum OrderStatus {
+    /// Authorizations are not complete yet.
     Pending,
+    /// All authorizations are valid, and the server waits for the CSR.
     Ready,
-    Valid { certificate: String },
+    /// The certificate is issued and can be downloaded.
+    Valid {
+        /// URL to download the certificate chain from.
+        certificate: String,
+    },
+    /// The order failed or expired.
     Invalid,
+    /// The server is issuing the certificate.
     Processing,
 }
 
+/// An authorization object (RFC 8555 section 7.1.4).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Auth {
+    /// Status of the authorization, `valid` once a challenge succeeded.
     pub status: AuthStatus,
+    /// Identifier that this authorization proves control of.
     pub identifier: Identifier,
+    /// Challenges the server offers to prove control of the identifier.
     pub challenges: Vec<Challenge>,
 }
 
+/// Status of an authorization (RFC 8555 section 7.1.6).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum AuthStatus {
+    /// Validation has not succeeded yet.
     Pending,
+    /// A challenge was validated.
     Valid,
+    /// Validation failed.
     Invalid,
+    /// The server revoked the authorization.
     Revoked,
+    /// The authorization expired.
     Expired,
+    /// The client deactivated the authorization.
     Deactivated,
 }
 
@@ -313,49 +361,67 @@ pub enum AuthStatus {
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum Identifier {
+    /// A DNS name.
     Dns(String),
 }
 
+/// A challenge object (RFC 8555 section 8).
 #[derive(Debug, Deserialize)]
 #[non_exhaustive]
 pub struct Challenge {
+    /// Validation method of this challenge, such as `tls-alpn-01`.
     #[serde(rename = "type")]
     pub typ: ChallengeType,
+    /// URL to post to when the client is ready for validation.
     #[serde(default)]
     pub url: String,
+    /// Random token from the server, part of the key authorization.
     #[serde(default)]
     pub token: String,
     pub error: Option<Problem>,
 }
 
+/// A problem document from the ACME server (RFC 8555 section 6.7, RFC 7807).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Problem {
+    /// Problem type URI, such as `urn:ietf:params:acme:error:rateLimited`.
     #[serde(rename = "type")]
     pub typ: Option<String>,
+    /// Human-readable explanation of the problem.
     pub detail: Option<String>,
 }
 
+/// An error from the ACME client.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum AcmeError {
+    /// An I/O error, currently not produced by this crate.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Generating the validation certificate or its key failed.
     #[error("certificate generation error: {0}")]
     Rcgen(#[from] RcgenError),
+    /// Signing a request or computing the key authorization failed.
     #[error("JOSE error: {0}")]
     Jose(#[from] JoseError),
+    /// A request could not be serialized, or a response could not be parsed.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// An HTTP request failed or returned a non-2xx status.
     #[error("http request error: {0}")]
     HttpRequest(#[from] HttpsRequestError),
+    /// The account key is not a valid P-256 ECDSA PKCS#8 key.
     #[error("invalid key pair: {0}")]
     KeyRejected(CryptoError),
+    /// The crypto provider failed, for example to load the validation key.
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
+    /// A server response lacks a required header.
     #[error("acme service response is missing {0} header")]
     MissingHeader(&'static str),
+    /// The authorization offers no `tls-alpn-01` challenge.
     #[error("no tls-alpn-01 challenge found")]
     NoTlsAlpn01Challenge,
 }

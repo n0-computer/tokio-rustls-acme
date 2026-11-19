@@ -1,18 +1,23 @@
 use crate::{AccountCache, CertCache};
 use async_trait::async_trait;
 
+/// A cache that keeps certificates in one cache and account keys in another.
 pub struct CompositeCache<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> {
+    /// Cache for certificates.
     pub cert_cache: C,
+    /// Cache for account keys.
     pub account_cache: A,
 }
 
 impl<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> CompositeCache<C, A> {
+    /// Combines `cert_cache` and `account_cache` into one cache.
     pub fn new(cert_cache: C, account_cache: A) -> Self {
         Self {
             cert_cache,
             account_cache,
         }
     }
+    /// Returns the certificate cache and the account cache.
     pub fn into_inner(self) -> (C, A) {
         (self.cert_cache, self.account_cache)
     }

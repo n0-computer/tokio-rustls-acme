@@ -15,6 +15,7 @@ pub struct AxumAcceptor {
 }
 
 impl AxumAcceptor {
+    /// Creates an acceptor that uses `config` for application TLS.
     pub fn new(acme_acceptor: AcmeAcceptor, config: Arc<ServerConfig>) -> Self {
         Self {
             acme_acceptor,
@@ -41,6 +42,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static>
     }
 }
 
+/// Future that [`AxumAcceptor`] returns for each connection.
 pub struct AxumAccept<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> {
     config: Arc<ServerConfig>,
     acme_accept: AcmeAccept<I>,
