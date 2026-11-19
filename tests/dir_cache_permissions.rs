@@ -266,6 +266,37 @@ async fn store_into_read_only_directory_writes_in_place() {
     );
 }
 
+/// A store into a directory that other users can write never writes in place.
+///
+/// Another user could plant a file at the cache name and read the key from
+/// it. The mode `0o507` denies write access to the owner only. Thus the cache
+/// cannot create a temporary file, and the in-place fallback must refuse.
+#[tokio::test]
+async fn store_into_world_writable_directory_does_not_write_in_place() {
+    if is_root() {
+        return;
+    }
+    set_common_umask();
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    let cache = DirCache::new(&cache_dir);
+    let domains = ["example.com".to_string()];
+
+    cache
+        .store_cert(&domains, DIRECTORY_URL, b"old key and chain")
+        .await
+        .unwrap();
+    let file = cache_file(&cache_dir, "cached_cert_");
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o507)).unwrap();
+
+    let result = cache.store_cert(&domains, DIRECTORY_URL, b"new key").await;
+
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let err = result.expect_err("the store wrote in place in a world-writable directory");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::read(&file).unwrap(), b"old key and chain");
+}
+
 /// A store of a new entry into a directory without write access fails.
 #[tokio::test]
 async fn store_of_new_entry_into_read_only_directory_fails() {

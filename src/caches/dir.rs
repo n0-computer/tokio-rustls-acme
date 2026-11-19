@@ -53,6 +53,10 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///   happens when another user owns the old file. Let the user of the process
 ///   own the file to fix this.
 ///
+/// On Unix, the cache never writes in place in a directory that other users
+/// can write. Such a user could plant a file there and read the key from it.
+/// The store then fails with the original error.
+///
 /// On Unix, the cache writes each new file with mode `0o600`. If the directory
 /// does not exist, the cache creates it with mode `0o700`. Missing parents of
 /// the directory get the default permissions. The cache does not change the
@@ -116,8 +120,8 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
     /// after the rename makes the new entry survive a power loss. If that sync
     /// fails with an unexpected error, the function returns the error although
     /// the new file is in place. If the function cannot create the temporary
-    /// file or cannot rename it, it writes an existing regular file in place.
-    /// The [`DirCache`] docs list these cases.
+    /// file or cannot rename it, it can write an existing regular file in
+    /// place. The [`DirCache`] docs list these cases and their limits.
     async fn write(&self, file: &str, contents: &[u8]) -> Result<(), std::io::Error> {
         let mut dir = self.inner.as_ref();
         // An empty path means the current directory. Neither `mkdir` nor
@@ -139,6 +143,9 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
                 let Some(old) = old else {
                     return Err(err);
                 };
+                if !may_write_in_place(dir).await {
+                    return Err(err);
+                }
                 log::warn!(
                     "cannot create a temporary file in {}: {err}. Writing {} in place. \
                      Give the process write access to the directory for crash-safe writes.",
@@ -171,8 +178,9 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
                 err.kind(),
                 ErrorKind::ResourceBusy | ErrorKind::CrossesDevices | ErrorKind::PermissionDenied
             );
+            let in_place = old.is_some() && cannot_replace && may_write_in_place(dir).await;
             return match old {
-                Some(old) if cannot_replace => {
+                Some(old) if in_place => {
                     log::warn!(
                         "cannot replace {}: {err}. Writing it in place. \
                          A crash during this write can leave a truncated file. \
@@ -405,6 +413,33 @@ async fn keep_group_access(file: fs::File, old: &Metadata) -> Result<fs::File, s
     };
     file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     Ok(fs::File::from_std(file))
+}
+
+/// Returns whether the cache may write an existing file in `dir` in place.
+///
+/// On Unix, the function refuses a directory that other users can write. Such
+/// a user can plant a regular file at a cache name, for example in `/tmp`. An
+/// in-place write would put the key into that file, and its owner could read
+/// it. A rename replaces a planted file instead, so it needs no such check.
+#[cfg(unix)]
+async fn may_write_in_place(dir: &Path) -> bool {
+    match fs::metadata(dir).await {
+        Ok(metadata) if metadata.mode() & 0o002 == 0 => true,
+        Ok(_) => {
+            log::warn!(
+                "{} is writable by other users, so the cache does not write in place there.",
+                dir.display(),
+            );
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Returns whether the cache may write an existing file in `dir` in place.
+#[cfg(not(unix))]
+async fn may_write_in_place(_dir: &Path) -> bool {
+    true
 }
 
 /// Overwrites the existing regular file `target` with `contents` in place.
