@@ -27,9 +27,17 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// in place and logs a warning. On Unix, it does this only for a single-link
 /// file of the process user or root, and never in a world-writable directory.
 ///
+/// A rename replaces a symlink at a cache file name, and the cache never
+/// writes through it. On Unix, the cache syncs the directory after the rename.
+/// Without read access to the directory, it skips the sync, and a power loss
+/// can undo the store.
+///
 /// On Unix, new files get mode `0o600`, and a new cache directory gets mode
-/// `0o700`. A replaced file keeps the group and group bits of the old file,
-/// but not its bits for other users or its ACL.
+/// `0o700`. A replaced file keeps the group and the group bits of the old file
+/// if the process user or root owns it and it has a single link. It never
+/// keeps bits for other users or an ACL. With an ACL, the group bits of the
+/// new file show the ACL mask, so grant access through the group or a default
+/// ACL on the directory. An in-place write keeps the ACL.
 ///
 /// A crash can leave a hidden `.tmp` file behind. You can delete it while no
 /// store runs.
