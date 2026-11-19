@@ -251,13 +251,13 @@ async fn store_into_read_only_directory_writes_in_place() {
     let file = cache_file(&cache_dir, "cached_cert_");
     fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).unwrap();
 
-    let result = cache
-        .store_cert(&domains, DIRECTORY_URL, b"new key and chain")
-        .await;
+    // The new content is shorter than the old one, so a missing truncation
+    // would leave old bytes at the end of the file.
+    let result = cache.store_cert(&domains, DIRECTORY_URL, b"new key").await;
 
     fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
     result.unwrap();
-    assert_eq!(fs::read(&file).unwrap(), b"new key and chain");
+    assert_eq!(fs::read(&file).unwrap(), b"new key");
     assert_eq!(mode(&file), "600", "cache file {file:?}");
     assert_eq!(
         fs::read_dir(&cache_dir).unwrap().count(),
