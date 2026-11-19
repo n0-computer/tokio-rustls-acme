@@ -1,10 +1,10 @@
 use rustls::{ClientConfig, pki_types::InvalidDnsNameError};
 use thiserror::Error;
 
-pub use reqwest::Response;
+pub(crate) use reqwest::Response;
 
 #[derive(Copy, Clone)]
-pub enum Method {
+pub(crate) enum Method {
     Post,
     Get,
     Head,

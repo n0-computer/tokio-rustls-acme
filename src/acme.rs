@@ -268,6 +268,7 @@ pub enum ChallengeType {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Order {
     #[serde(flatten)]
     pub status: OrderStatus,
@@ -278,6 +279,7 @@ pub struct Order {
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum OrderStatus {
     Pending,
     Ready,
@@ -288,6 +290,7 @@ pub enum OrderStatus {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Auth {
     pub status: AuthStatus,
     pub identifier: Identifier,
@@ -296,6 +299,7 @@ pub struct Auth {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum AuthStatus {
     Pending,
     Valid,
@@ -307,11 +311,13 @@ pub enum AuthStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum Identifier {
     Dns(String),
 }
 
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct Challenge {
     #[serde(rename = "type")]
     pub typ: ChallengeType,
@@ -324,6 +330,7 @@ pub struct Challenge {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Problem {
     #[serde(rename = "type")]
     pub typ: Option<String>,
@@ -331,6 +338,7 @@ pub struct Problem {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum AcmeError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

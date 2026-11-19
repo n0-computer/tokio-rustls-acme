@@ -28,7 +28,7 @@ use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 type Timer = std::pin::Pin<Box<Sleep>>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-pub fn after(d: std::time::Duration) -> Timer {
+pub(crate) fn after(d: std::time::Duration) -> Timer {
     Box::pin(tokio::time::sleep(d))
 }
 
@@ -53,6 +53,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
 pub type Event<EC, EA> = Result<EventOk, EventError<EC, EA>>;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EventOk {
     DeployedCachedCert,
     DeployedNewCert,
@@ -61,6 +62,7 @@ pub enum EventOk {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum EventError<EC: Debug, EA: Debug> {
     #[error("cert cache load: {0}")]
     CertCacheLoad(EC),
@@ -79,6 +81,7 @@ pub enum EventError<EC: Debug, EA: Debug> {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum OrderError {
     #[error("acme error: {0}")]
     Acme(#[from] AcmeError),
@@ -95,6 +98,7 @@ pub enum OrderError {
 }
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum CertParseError {
     #[error("X509 parsing error: {0}")]
     X509(#[from] x509_parser::nom::Err<x509_parser::error::X509Error>),

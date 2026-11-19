@@ -160,6 +160,7 @@ where
                     eprintln!("event: AccountCacheStore");
                     events.account_cache_store = true;
                 }
+                Some(Ok(event)) => eprintln!("event: {event:?}"),
                 Some(Err(err)) => panic!("ACME error: {:?}", err),
                 None => panic!("state stream ended unexpectedly"),
             }
