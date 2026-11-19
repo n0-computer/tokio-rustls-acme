@@ -548,6 +548,35 @@ mod tests {
         assert!(!is_trusted_owner(1000, 0));
     }
 
+    #[tokio::test]
+    async fn open_in_place_refuses_symlink_to_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::write(&old, b"key").unwrap();
+        let target = dir.path().join("target");
+        std::os::unix::fs::symlink(&old, &target).unwrap();
+        let metadata = std::fs::metadata(&old).unwrap();
+
+        let result = open_in_place(&target, &metadata).await;
+
+        assert!(!matches!(result, Ok(Some(_))), "opened through a symlink");
+    }
+
+    #[tokio::test]
+    async fn open_in_place_refuses_swapped_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"key").unwrap();
+        let metadata = std::fs::metadata(&target).unwrap();
+        // Keeps the old inode alive, so the new file cannot reuse its number.
+        std::fs::rename(&target, dir.path().join("moved")).unwrap();
+        std::fs::write(&target, b"planted").unwrap();
+
+        let result = open_in_place(&target, &metadata).await.unwrap();
+
+        assert!(result.is_none(), "opened a swapped file");
+    }
+
     /// A hard-linked old file does not pass its group bits to the new file.
     #[tokio::test]
     async fn hard_linked_old_file_keeps_no_group_access() {
