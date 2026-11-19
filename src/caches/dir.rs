@@ -20,7 +20,9 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Each store writes a temporary file and renames it over the old file, so a
 /// crash does not leave a truncated file. This needs write access to the
 /// directory. On Unix, new files get mode `0o600`, and a new cache directory
-/// gets mode `0o700`.
+/// gets mode `0o700`. A load removes the permission bits for other users from
+/// a file of the process user, and warns if other users can access the
+/// directory.
 ///
 /// A crash can leave a hidden `.tmp` file behind. You can delete it while no
 /// store runs.
@@ -35,12 +37,21 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
     pub fn new(dir: P) -> Self {
         Self { inner: dir }
     }
+    /// Returns the cache directory, with the current directory for the empty path.
+    fn dir(&self) -> &Path {
+        let dir = self.inner.as_ref();
+        // `mkdir` and `open` reject the empty path.
+        if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        }
+    }
     async fn read_if_exist(
         &self,
         file: impl AsRef<Path>,
     ) -> Result<Option<Vec<u8>>, std::io::Error> {
-        let path = self.inner.as_ref().join(file);
-        match fs::read(path).await {
+        match read_file(self.dir(), &self.dir().join(file)).await {
             Ok(content) => Ok(Some(content)),
             Err(err) => match err.kind() {
                 ErrorKind::NotFound => Ok(None),
@@ -53,11 +64,7 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
     /// If the directory sync after the rename fails, the function returns the
     /// error although the new file is in place.
     async fn write(&self, file: &str, contents: &[u8]) -> Result<(), std::io::Error> {
-        let mut dir = self.inner.as_ref();
-        // `mkdir` and `open` reject the empty path.
-        if dir.as_os_str().is_empty() {
-            dir = Path::new(".");
-        }
+        let dir = self.dir();
         create_dir(dir).await?;
         let (temp_path, temp_file) = create_temp_file(dir, file).await?;
         let result = match write_and_sync(temp_file, contents).await {
@@ -138,6 +145,63 @@ impl<P: AsRef<Path> + Send + Sync> AccountCache for DirCache<P> {
         let file_name = Self::cached_account_file_name(contact, directory_url);
         self.write(&file_name, account).await
     }
+}
+
+/// Reads `path`.
+#[cfg(not(unix))]
+async fn read_file(_dir: &Path, path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    fs::read(path).await
+}
+
+/// Reads `path` and removes the bits for other users if the process user owns it.
+///
+/// The open does not follow a symlink, so the mode change cannot reach a file
+/// outside the cache. A symlink is read without the change.
+#[cfg(unix)]
+async fn read_file(dir: &Path, path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use tokio::io::AsyncReadExt;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = match options.open(path).await {
+        Ok(file) => file,
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => return fs::read(path).await,
+        Err(err) => return Err(err),
+    };
+    let metadata = file.metadata().await?;
+    // SAFETY: `geteuid` only reads the effective user ID and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if let Some(mode) = owner_only_mode(metadata.mode(), metadata.uid(), euid) {
+        log::warn!(
+            "{} is accessible by other users. Removing their permissions.",
+            path.display()
+        );
+        let permissions = std::fs::Permissions::from_mode(mode);
+        if let Err(err) = file.set_permissions(permissions).await {
+            log::warn!("cannot change the mode of {}: {err}", path.display());
+        }
+    }
+    if let Ok(metadata) = fs::metadata(dir).await
+        && metadata.mode() & 0o007 != 0
+    {
+        log::warn!(
+            "the cache directory {} is accessible by other users. Run `chmod o= {}`.",
+            dir.display(),
+            dir.display(),
+        );
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).await?;
+    Ok(contents)
+}
+
+/// Returns `mode` without the bits for other users, or `None` if it keeps `mode`.
+///
+/// Leaves files of other owners alone, because their owner chose the mode.
+#[cfg(unix)]
+fn owner_only_mode(mode: u32, uid: u32, euid: u32) -> Option<u32> {
+    (uid == euid && mode & 0o007 != 0).then_some(mode & 0o7770)
 }
 
 /// Creates `dir` and its missing parents, `dir` on Unix with mode `0o700`.
@@ -244,4 +308,24 @@ async fn write_and_sync(mut file: fs::File, contents: &[u8]) -> Result<(), std::
     // `sync_all` does not report errors of buffered writes, `flush` does.
     file.flush().await?;
     file.sync_all().await
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::owner_only_mode;
+
+    #[test]
+    fn owner_only_mode_clears_other_bits_of_own_files() {
+        let cases = [
+            (0o100644, 1000, 1000, Some(0o640)),
+            (0o100607, 1000, 1000, Some(0o600)),
+            (0o102644, 1000, 1000, Some(0o2640)),
+            (0o100640, 1000, 1000, None),
+            (0o100644, 1001, 1000, None),
+            (0o100644, 1000, 0, None),
+        ];
+        for (mode, uid, euid, expected) in cases {
+            assert_eq!(owner_only_mode(mode, uid, euid), expected, "mode {mode:o}");
+        }
+    }
 }

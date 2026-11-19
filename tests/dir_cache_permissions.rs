@@ -145,6 +145,64 @@ async fn renewed_certificate_key_is_owner_only() {
     assert_eq!(renew_with_old_mode(0o644).await, "600");
 }
 
+/// A load removes the bits for other users from a key file and keeps the group bits.
+#[tokio::test]
+async fn load_makes_world_readable_keys_private() {
+    set_common_umask();
+    let dir = tempfile::tempdir().unwrap();
+    let cache = DirCache::new(dir.path());
+    let domains = ["example.com".to_string()];
+
+    cache
+        .store_cert(&domains, DIRECTORY_URL, b"key and chain")
+        .await
+        .unwrap();
+    cache
+        .store_account(&[], DIRECTORY_URL, b"account key")
+        .await
+        .unwrap();
+    for prefix in ["cached_cert_", "cached_account_"] {
+        let file = cache_file(dir.path(), prefix);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let cert = cache.load_cert(&domains, DIRECTORY_URL).await.unwrap();
+    let account = cache.load_account(&[], DIRECTORY_URL).await.unwrap();
+
+    assert_eq!(cert.as_deref(), Some(&b"key and chain"[..]));
+    assert_eq!(account.as_deref(), Some(&b"account key"[..]));
+    for prefix in ["cached_cert_", "cached_account_"] {
+        let file = cache_file(dir.path(), prefix);
+        assert_eq!(mode(&file), "640", "cache file {file:?}");
+    }
+}
+
+/// A load through a symlink returns the content and leaves the target mode alone.
+#[tokio::test]
+async fn load_does_not_change_symlink_target() {
+    set_common_umask();
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    let outside = dir.path().join("outside");
+    let cache = DirCache::new(&cache_dir);
+    let domains = ["example.com".to_string()];
+
+    // The first store reveals the file name for the symlink.
+    cache
+        .store_cert(&domains, DIRECTORY_URL, b"key and chain")
+        .await
+        .unwrap();
+    let file = cache_file(&cache_dir, "cached_cert_");
+    fs::rename(&file, &outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+    std::os::unix::fs::symlink(&outside, &file).unwrap();
+
+    let cert = cache.load_cert(&domains, DIRECTORY_URL).await.unwrap();
+
+    assert_eq!(cert.as_deref(), Some(&b"key and chain"[..]));
+    assert_eq!(mode(&outside), "644", "symlink target {outside:?}");
+}
+
 /// A store into a directory without write access fails and leaves no file.
 #[tokio::test]
 async fn store_into_read_only_directory_fails() {

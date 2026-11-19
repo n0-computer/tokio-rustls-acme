@@ -119,5 +119,6 @@ required-features = ["tls-webpki-roots"]
 name = "low_level"
 required-features = ["tls-webpki-roots"]
 
-[target.'cfg(unix)'.dev-dependencies]
+# Reads the effective user ID and opens cache files without following symlinks.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
