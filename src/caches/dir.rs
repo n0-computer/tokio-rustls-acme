@@ -166,8 +166,13 @@ async fn read_file(dir: &Path, path: &Path) -> Result<Vec<u8>, std::io::Error> {
     options.read(true).custom_flags(libc::O_NOFOLLOW);
     let mut file = match options.open(path).await {
         Ok(file) => file,
-        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => return fs::read(path).await,
-        Err(err) => return Err(err),
+        Err(err) => {
+            // The errno for a symlink varies, ELOOP on Linux, EMLINK on FreeBSD, EFTYPE on NetBSD.
+            return match fs::symlink_metadata(path).await {
+                Ok(metadata) if metadata.file_type().is_symlink() => fs::read(path).await,
+                _ => Err(err),
+            };
+        }
     };
     let metadata = file.metadata().await?;
     // SAFETY: `geteuid` only reads the effective user ID and cannot fail.
