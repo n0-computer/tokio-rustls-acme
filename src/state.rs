@@ -98,6 +98,12 @@ pub enum EventOk {
 pub enum EventError<EC: Debug, EA: Debug> {
     #[error("cert cache load: {0}")]
     CertCacheLoad(EC),
+    /// The account cache could not be read, so this run orders with a new key that is not stored.
+    ///
+    /// Return `Ok(None)` from [`AccountCache::load_account`] when no key is stored.
+    /// Otherwise every start uses a new account.
+    ///
+    /// [`AccountCache::load_account`]: crate::AccountCache::load_account
     #[error("account cache load: {0}")]
     AccountCacheLoad(EA),
     #[error("cert cache store: {0}")]
@@ -469,10 +475,22 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             if let Some(load_account) = &mut self.load_account {
                 let result = ready!(load_account.poll_unpin(cx));
                 self.load_account.take();
+                // Never overwrite a stored key, it may be the only access to an account.
                 match result {
-                    Ok(Some(key_pair)) => self.account_key = Some(key_pair),
+                    Ok(Some(key_pair)) => match Account::check_key_pair(&key_pair) {
+                        Ok(()) => self.account_key = Some(key_pair),
+                        Err(err) => {
+                            log::error!(
+                                "cannot use the cached account key, fix or delete it. Ordering with a new key that is not stored: {err}"
+                            );
+                            self.account_key = Some(Account::generate_key_pair());
+                        }
+                    },
                     Ok(None) => {}
-                    Err(err) => return Poll::Ready(Err(EventError::AccountCacheLoad(err))),
+                    Err(err) => {
+                        self.account_key = Some(Account::generate_key_pair());
+                        return Poll::Ready(Err(EventError::AccountCacheLoad(err)));
+                    }
                 }
             }
 
