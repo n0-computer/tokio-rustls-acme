@@ -8,8 +8,14 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Sleep;
+use tokio_rustls::server::TlsStream;
 use tokio_rustls::{Accept, LazyConfigAcceptor, StartHandshake};
+
+/// Default limit for one TLS handshake, as in `axum_server`'s `RustlsAcceptor`.
+pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Builds a [`ServerConfig`] that serves the certificates of `resolver`.
 pub(crate) fn server_config(
@@ -47,8 +53,13 @@ impl AcmeAcceptor {
     /// Starts handshake processing on `io`.
     ///
     /// The returned future resolves to `Some(handshake)` for application
-    /// traffic the caller should finish, or `None` when the connection was
-    /// a `tls-alpn-01` validation already handled internally.
+    /// traffic, which the caller must complete. It resolves to `None` for a
+    /// `tls-alpn-01` validation request, which the acceptor answers itself.
+    ///
+    /// Neither the returned future nor [`StartHandshake::into_stream`] has a
+    /// timeout. Wrap both stages in one [`tokio::time::timeout`], or a
+    /// stalled peer holds the connection open. A timeout does not limit how
+    /// many handshakes peers can open.
     pub fn accept<IO: AsyncRead + AsyncWrite + Unpin>(&self, io: IO) -> AcmeAccept<IO> {
         AcmeAccept::new(io, self.config.clone())
     }
@@ -102,5 +113,65 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Future for AcmeAccept<IO> {
                 Poll::Pending => Poll::Pending,
             };
         }
+    }
+}
+
+/// Runs both handshake stages of one connection under a single deadline.
+pub(crate) struct Handshake<IO: AsyncRead + AsyncWrite + Unpin> {
+    stage: HandshakeStage<IO>,
+    config: Arc<ServerConfig>,
+    deadline: Pin<Box<Sleep>>,
+}
+
+// Every handshake starts in the larger variant, so boxing it only adds an allocation.
+#[allow(clippy::large_enum_variant)]
+enum HandshakeStage<IO: AsyncRead + AsyncWrite + Unpin> {
+    /// Reads the ClientHello and answers `tls-alpn-01` validation requests.
+    Acme(AcmeAccept<IO>),
+    /// Completes the handshake of application traffic.
+    Tls(Accept<IO>),
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> Handshake<IO> {
+    /// Creates a handshake for `accept` that fails `timeout` after this call.
+    pub(crate) fn new(
+        accept: AcmeAccept<IO>,
+        config: Arc<ServerConfig>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            stage: HandshakeStage::Acme(accept),
+            config,
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> Future for Handshake<IO> {
+    type Output = io::Result<Option<TlsStream<IO>>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let poll = loop {
+            match &mut this.stage {
+                HandshakeStage::Acme(accept) => match Pin::new(accept).poll(cx) {
+                    Poll::Ready(Ok(Some(start_handshake))) => {
+                        let accept = start_handshake.into_stream(this.config.clone());
+                        this.stage = HandshakeStage::Tls(accept);
+                    }
+                    Poll::Ready(Ok(None)) => break Poll::Ready(Ok(None)),
+                    Poll::Ready(Err(err)) => break Poll::Ready(Err(err)),
+                    Poll::Pending => break Poll::Pending,
+                },
+                HandshakeStage::Tls(accept) => break Pin::new(accept).poll(cx).map_ok(Some),
+            }
+        };
+        if poll.is_pending() && this.deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS handshake timed out",
+            )));
+        }
+        poll
     }
 }

@@ -3,6 +3,7 @@ use rustls::{DEFAULT_VERSIONS, ServerConfig};
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio_rustls_acme::caches::DirCache;
 use tokio_rustls_acme::{AcmeAcceptor, AcmeConfig};
@@ -65,22 +66,48 @@ async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u
         .await
         .unwrap();
     loop {
-        let tcp = listener.accept().await.unwrap().0;
+        let tcp = match listener.accept().await {
+            Ok((tcp, _)) => tcp,
+            Err(err) => {
+                log::error!("TCP accept failed: {err:?}");
+                // Accept fails again at once while no file descriptor is free.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let rustls_config = rustls_config.clone();
         let accept_future = acceptor.accept(tcp);
+        // Start the clock before spawning, so executor queueing counts.
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
 
         tokio::spawn(async move {
-            match accept_future.await.unwrap() {
-                None => log::info!("received TLS-ALPN-01 validation request"),
-                Some(start_handshake) => {
-                    let mut tls = start_handshake.into_stream(rustls_config).await.unwrap();
-                    tls.write_all(HELLO).await.unwrap();
-                    tls.shutdown().await.unwrap();
+            let handshake = async {
+                match accept_future.await? {
+                    None => Ok(None),
+                    Some(start_handshake) => {
+                        start_handshake.into_stream(rustls_config).await.map(Some)
+                    }
                 }
+            };
+            match tokio::time::timeout_at(deadline, handshake).await {
+                Ok(Ok(Some(mut tls))) => {
+                    let response = async {
+                        tls.write_all(HELLO).await?;
+                        tls.shutdown().await
+                    };
+                    if let Err(err) = response.await {
+                        log::debug!("failed to send response: {err:?}");
+                    }
+                }
+                Ok(Ok(None)) => log::info!("received TLS-ALPN-01 validation request"),
+                Ok(Err(err)) => log::debug!("TLS handshake failed: {err:?}"),
+                Err(_) => log::debug!("TLS handshake timed out"),
             }
         });
     }
 }
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const HELLO: &[u8] = br#"HTTP/1.1 200 OK
 Content-Length: 10
