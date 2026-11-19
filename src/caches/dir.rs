@@ -187,9 +187,8 @@ async fn read_file(dir: &Path, path: &Path) -> Result<Vec<u8>, std::io::Error> {
             log::warn!("cannot change the mode of {}: {err}", path.display());
         }
     }
-    if let Ok(metadata) = fs::metadata(dir).await
-        && metadata.mode() & 0o007 != 0
-    {
+    let dir_metadata = fs::metadata(dir).await;
+    if dir_metadata.is_ok_and(|metadata| metadata.mode() & 0o007 != 0) {
         log::warn!(
             "the cache directory {} is accessible by other users. Run `chmod o= {}`.",
             dir.display(),
