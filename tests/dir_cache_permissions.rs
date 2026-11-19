@@ -44,6 +44,22 @@ fn group_and_other_bits(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o077
 }
 
+/// Returns the permission bits of `path` as an octal string.
+///
+/// Octal strings make a failure readable.
+fn mode(path: &Path) -> String {
+    format!(
+        "{:o}",
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    )
+}
+
+/// Returns whether the tests run as root, which ignores file permissions.
+fn is_root() -> bool {
+    // SAFETY: `geteuid` only reads the effective user ID and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
 /// A stored TLS private key is readable by its owner only.
 #[tokio::test]
 async fn stored_certificate_key_is_owner_only() {
@@ -97,13 +113,6 @@ async fn missing_parents_get_default_permissions() {
         .await
         .unwrap();
 
-    // Octal strings make a failure readable.
-    let mode = |path: &Path| {
-        format!(
-            "{:o}",
-            fs::metadata(path).unwrap().permissions().mode() & 0o777
-        )
-    };
     assert_eq!(mode(&cache_dir), "700", "cache directory {cache_dir:?}");
     assert_eq!(mode(&data_dir), "755", "parent {data_dir:?}");
     assert_eq!(mode(&app_dir), "755", "parent {app_dir:?}");
@@ -129,33 +138,139 @@ async fn stored_account_key_is_owner_only() {
     );
 }
 
-/// A renewed TLS private key is readable by its owner only, even when it
-/// replaces a world-readable file.
-#[tokio::test]
-async fn renewed_certificate_key_is_owner_only() {
+/// Stores a certificate, sets the mode of its file, and stores a renewal.
+///
+/// Returns the mode of the cache file after the renewal.
+async fn renew_with_old_mode(old_mode: u32) -> String {
     set_common_umask();
     let dir = tempfile::tempdir().unwrap();
     let cache = DirCache::new(dir.path());
     let domains = ["example.com".to_string()];
 
-    // A file as a release without the fix created it.
     cache
         .store_cert(&domains, DIRECTORY_URL, b"old key and chain")
         .await
         .unwrap();
     let file = cache_file(dir.path(), "cached_cert_");
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(old_mode)).unwrap();
 
     cache
         .store_cert(&domains, DIRECTORY_URL, b"new key and chain")
         .await
         .unwrap();
 
+    assert_eq!(fs::read(&file).unwrap(), b"new key and chain");
+    mode(&file)
+}
+
+/// A renewed TLS private key drops the world bits of a world-readable file.
+///
+/// Earlier releases wrote the files with mode `0o644` under the common umask.
+/// The group bits stay, because an operator may have granted them on purpose.
+#[tokio::test]
+async fn renewed_certificate_key_drops_world_bits() {
+    assert_eq!(renew_with_old_mode(0o644).await, "640");
+}
+
+/// A renewed TLS private key keeps the group access of the old file.
+///
+/// A sidecar that reads the files through group access keeps working.
+#[tokio::test]
+async fn renewed_certificate_key_keeps_group_bits() {
+    assert_eq!(renew_with_old_mode(0o640).await, "640");
+}
+
+/// A renewed TLS private key stays owner-only when the old file is.
+#[tokio::test]
+async fn renewed_certificate_key_stays_owner_only() {
+    assert_eq!(renew_with_old_mode(0o600).await, "600");
+}
+
+/// A store into a directory without write access replaces the content in place.
+///
+/// Earlier releases wrote the files in place, so a setup with a read-only
+/// directory and writable files worked. The cache must keep it working.
+#[tokio::test]
+async fn store_into_read_only_directory_writes_in_place() {
+    if is_root() {
+        return;
+    }
+    set_common_umask();
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    let cache = DirCache::new(&cache_dir);
+    let domains = ["example.com".to_string()];
+
+    cache
+        .store_cert(&domains, DIRECTORY_URL, b"old key and chain")
+        .await
+        .unwrap();
+    let file = cache_file(&cache_dir, "cached_cert_");
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = cache
+        .store_cert(&domains, DIRECTORY_URL, b"new key and chain")
+        .await;
+
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    result.unwrap();
+    assert_eq!(fs::read(&file).unwrap(), b"new key and chain");
+    assert_eq!(mode(&file), "600", "cache file {file:?}");
     assert_eq!(
-        group_and_other_bits(&file),
-        0,
-        "the renewed TLS private key in {file:?} kept the old open permissions"
+        fs::read_dir(&cache_dir).unwrap().count(),
+        1,
+        "the cache directory holds files other than the certificate"
     );
+}
+
+/// A store of a new entry into a directory without write access fails.
+#[tokio::test]
+async fn store_of_new_entry_into_read_only_directory_fails() {
+    if is_root() {
+        return;
+    }
+    set_common_umask();
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir(&cache_dir).unwrap();
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let cache = DirCache::new(&cache_dir);
+
+    let result = cache
+        .store_cert(&["example.com".to_string()], DIRECTORY_URL, b"key")
+        .await;
+
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let err = result.expect_err("the store created a file in a read-only directory");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 0);
+}
+
+/// A store succeeds in a directory that the process can write but not read.
+///
+/// The sync of the directory opens it, which needs read access. The rename
+/// has already replaced the entry, so the store must not fail.
+#[tokio::test]
+async fn store_into_unreadable_directory_succeeds() {
+    if is_root() {
+        return;
+    }
+    set_common_umask();
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir(&cache_dir).unwrap();
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o300)).unwrap();
+    let cache = DirCache::new(&cache_dir);
+    let domains = ["example.com".to_string()];
+
+    let result = cache
+        .store_cert(&domains, DIRECTORY_URL, b"key and chain")
+        .await;
+
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    result.unwrap();
+    let cert = cache.load_cert(&domains, DIRECTORY_URL).await.unwrap();
+    assert_eq!(cert.as_deref(), Some(&b"key and chain"[..]));
 }
 
 /// A symlink at the name of a cache file does not redirect the TLS private key.
