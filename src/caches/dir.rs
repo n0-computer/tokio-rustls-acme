@@ -23,9 +23,10 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// Each store writes a temporary file and renames it over the old file, so a
 /// crash does not leave a truncated file. This needs write access to the
-/// directory. If the rename is not possible, the cache writes an existing file
-/// in place and logs a warning. On Unix, it does this only for a single-link
-/// file of the process user or root, and never in a world-writable directory.
+/// directory. On Unix, if the rename is not possible, the cache writes an
+/// existing file in place and logs a warning. It does this only for a
+/// single-link file of the process user or root, and never in a world-writable
+/// directory.
 ///
 /// A rename replaces a symlink at a cache file name, and the cache never
 /// writes through it. On Unix, the cache syncs the directory after the rename.
@@ -96,22 +97,7 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
         let (temp_path, temp_file) = match create_temp_file(dir, file).await {
             Ok(temp) => temp,
             Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-                let Some(old) = old else {
-                    return Err(err);
-                };
-                if !may_write_in_place(dir).await {
-                    return Err(err);
-                }
-                let Ok(Some(handle)) = open_in_place(&target, &old).await else {
-                    return Err(err);
-                };
-                log::warn!(
-                    "cannot create a temporary file in {}: {err}. Writing {} in place. \
-                     Give the process write access to the directory for crash-safe writes.",
-                    dir.display(),
-                    target.display(),
-                );
-                return overwrite(handle, contents).await;
+                return write_in_place(dir, &target, old.as_ref(), contents, err).await;
             }
             Err(err) => return Err(err),
         };
@@ -132,24 +118,13 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             fs::remove_file(&temp_path).await.ok();
             // `PermissionDenied` covers a sticky directory. If root owns the
             // old file there, the in-place write may still work.
-            let cannot_replace = matches!(
+            if matches!(
                 err.kind(),
                 ErrorKind::ResourceBusy | ErrorKind::CrossesDevices | ErrorKind::PermissionDenied
-            );
-            let in_place = old.is_some() && cannot_replace && may_write_in_place(dir).await;
-            let Some(old) = old.filter(|_| in_place) else {
-                return Err(err);
-            };
-            let Ok(Some(handle)) = open_in_place(&target, &old).await else {
-                return Err(err);
-            };
-            log::warn!(
-                "cannot replace {}: {err}. Writing it in place. \
-                 A crash during this write can leave a truncated file. \
-                 See the DirCache docs for setups with crash-safe writes.",
-                target.display(),
-            );
-            return overwrite(handle, contents).await;
+            ) {
+                return write_in_place(dir, &target, old.as_ref(), contents, err).await;
+            }
+            return Err(err);
         }
         #[cfg(unix)]
         sync_dir(dir).await?;
@@ -428,10 +403,47 @@ async fn keep_group_access(file: fs::File, old: &Metadata) -> Result<fs::File, s
     Ok(fs::File::from_std(file))
 }
 
-/// Returns whether the cache may write an existing file in `dir` in place.
+/// Writes `contents` into the existing `target` after a failed replace, or returns `err`.
+#[cfg(unix)]
+async fn write_in_place(
+    dir: &Path,
+    target: &Path,
+    old: Option<&Metadata>,
+    contents: &[u8],
+    err: std::io::Error,
+) -> Result<(), std::io::Error> {
+    let Some(old) = old else {
+        return Err(err);
+    };
+    if !may_write_in_place(dir).await {
+        return Err(err);
+    }
+    let Ok(Some(file)) = open_in_place(target, old).await else {
+        return Err(err);
+    };
+    log::warn!(
+        "cannot replace {}: {err}. Writing it in place. \
+         A crash during this write can leave a truncated file.",
+        target.display(),
+    );
+    overwrite(file, contents).await
+}
+
+/// Returns `err`, because only Unix can check that an open file is the old file.
+#[cfg(not(unix))]
+async fn write_in_place(
+    _dir: &Path,
+    _target: &Path,
+    _old: Option<&Metadata>,
+    _contents: &[u8],
+    err: std::io::Error,
+) -> Result<(), std::io::Error> {
+    Err(err)
+}
+
+/// Returns whether `dir` is not writable by other users.
 ///
-/// On Unix, refuses a directory that other users can write. They could plant
-/// a file at a cache name and read the key from it.
+/// Another user could plant a file at a cache name and read the key from it.
 #[cfg(unix)]
 async fn may_write_in_place(dir: &Path) -> bool {
     match fs::metadata(dir).await {
@@ -447,34 +459,20 @@ async fn may_write_in_place(dir: &Path) -> bool {
     }
 }
 
-/// Returns whether the cache may write an existing file in `dir` in place.
-#[cfg(not(unix))]
-async fn may_write_in_place(_dir: &Path) -> bool {
-    true
-}
-
-/// Opens `target` for an in-place write, or returns `None` if it must not.
-///
-/// Checks the open handle against `old`, so a file swapped in after the first
-/// check is not written.
+/// Opens `target` for writing if it is still the trusted file `old`, else returns `None`.
+#[cfg(unix)]
 async fn open_in_place(target: &Path, old: &Metadata) -> Result<Option<fs::File>, std::io::Error> {
     let mut options = fs::OpenOptions::new();
-    options.write(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    // `O_NONBLOCK` keeps a FIFO planted at the name from blocking the open.
+    options
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options.open(target).await?;
     let metadata = file.metadata().await?;
-    if !is_same_file(&metadata, old) {
+    // The name can point to another file since the check of `old`.
+    if !is_same_file(&metadata, old) || !may_overwrite(&metadata, euid()) {
         log::warn!(
-            "{} changed during the store, so the cache does not write it in place.",
-            target.display()
-        );
-        return Ok(None);
-    }
-    #[cfg(unix)]
-    if !may_overwrite(&metadata, euid()) {
-        log::warn!(
-            "{} is not a regular file with one link of this user or root, \
+            "{} changed or is not a single-link file of this user or root, \
              so the cache does not write it in place.",
             target.display()
         );
@@ -483,17 +481,13 @@ async fn open_in_place(target: &Path, old: &Metadata) -> Result<Option<fs::File>
     Ok(Some(file))
 }
 
-/// Overwrites the opened `file` with `contents` and syncs it.
-///
-/// On Unix, the function first removes the permission bits for other users.
+/// Removes the bits for other users from `file`, then replaces its content with `contents`.
+#[cfg(unix)]
 async fn overwrite(file: fs::File, contents: &[u8]) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        let mode = file.metadata().await?.mode();
-        if mode & 0o007 != 0 {
-            file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7770))
-                .await?;
-        }
+    let mode = file.metadata().await?.mode();
+    if mode & 0o007 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7770))
+            .await?;
     }
     file.set_len(0).await?;
     write_and_sync(file, contents).await
@@ -503,15 +497,6 @@ async fn overwrite(file: fs::File, contents: &[u8]) -> Result<(), std::io::Error
 #[cfg(unix)]
 fn is_same_file(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-/// Returns whether `a` and `b` describe the same file.
-///
-/// Other platforms have no stable file ID in `std`, so this only checks that
-/// `a` is a regular file.
-#[cfg(not(unix))]
-fn is_same_file(a: &Metadata, _b: &Metadata) -> bool {
-    a.is_file()
 }
 
 /// Returns the effective user ID of the process.
