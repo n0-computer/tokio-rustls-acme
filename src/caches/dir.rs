@@ -3,7 +3,10 @@ use crate::{AccountCache, CertCache};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use std::fs::Metadata;
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
@@ -23,28 +26,44 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// writable by others. The cache trusts the files that it loads. A user who
 /// can write to the directory can plant a key or a certificate.
 ///
-/// On Unix, the cache writes each file with mode `0o600`. If the directory
-/// does not exist, the cache creates it with mode `0o700`. Missing parents of
-/// the directory get the default permissions. The cache does not change the
-/// permissions of a directory that already exists. On other platforms, files
-/// and directories get the default permissions. On Windows, they inherit the
-/// ACL of the parent directory.
-///
 /// The cache writes each file to a temporary file in the same directory first
 /// and then renames it over the old file. Thus a crash or a full disk does not
-/// leave a truncated file behind. On Unix, the cache then syncs the directory,
-/// so the new file survives a power loss.
+/// leave a truncated file behind. For this, the process needs write access to
+/// the directory, not only to the files.
 ///
-/// The rename puts these requirements on the setup:
+/// On Unix, the cache syncs the directory after the rename, so the new file
+/// survives a power loss. It also syncs the parent of each directory that it
+/// creates. The sync opens the directory, which needs read access. Without
+/// read access, or on a filesystem without directory sync, the cache skips the
+/// sync. The store then succeeds, but a power loss can undo it.
 ///
-/// - The process needs write access to the directory, not only to the files.
-/// - Each store replaces the file. The new file does not keep the owner,
-///   group, mode, or ACL of the old file. A sidecar that reads the files
-///   through group or ACL access loses that access at the next store.
-/// - A symlink at the name of a cache file becomes a regular file. The target
-///   of the symlink keeps its old content.
-/// - A store fails on a file that is bind-mounted at the name of a cache file,
-///   because the cache cannot replace it.
+/// The rename replaces a symlink at the name of a cache file with a regular
+/// file. The cache never writes through such a symlink, and the target of the
+/// symlink keeps its old content.
+///
+/// In two cases, the cache cannot rename and writes the old file in place, as
+/// earlier releases did. It logs a warning, because a crash during this write
+/// can leave a truncated file behind. The cases are:
+///
+/// - The process cannot create a file in the directory. Give the process write
+///   access to the directory to fix this.
+/// - The rename fails with `EBUSY` or `EXDEV`, for example because the file is
+///   bind-mounted into a container. Mount the directory instead.
+///
+/// On Unix, the cache writes each new file with mode `0o600`. If the directory
+/// does not exist, the cache creates it with mode `0o700`. Missing parents of
+/// the directory get the default permissions. The cache does not change the
+/// permissions of a directory that already exists.
+///
+/// A store that replaces a file keeps the group and the group bits of the old
+/// file, so a sidecar with group access can still read the new file. The user
+/// of the process owns the new file. If the cache cannot give the new file the
+/// group of the old file, the new file gets no group bits. The new file never
+/// gets permission bits for other users. An in-place write keeps the mode of
+/// the file as it is.
+///
+/// On other platforms, files and directories get the default permissions. On
+/// Windows, they inherit the ACL of the parent directory.
 ///
 /// A crash or a cancelled store can leave a hidden temporary file behind. Its
 /// name ends in `.tmp`, and on Unix it has mode `0o600`. You can delete such a
@@ -53,10 +72,11 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Earlier releases of this crate wrote these files with the default
 /// permissions. With the common umask `022`, other local users can read them.
 /// The cache does not change the mode of a file when it reads it. An old
-/// certificate file gets mode `0o600` when the next renewal replaces it. The
-/// crate writes an account file only when it generates a new account key, so
-/// an old account file keeps its mode. If you upgrade from such a release on
-/// Unix, run `chmod 600` on the files and `chmod 700` on the directory.
+/// certificate file loses its bits for other users when the next renewal
+/// replaces it, but it keeps its group bits. The crate writes an account file
+/// only when it generates a new account key, so an old account file keeps its
+/// mode. If you upgrade from such a release on Unix, run `chmod 600` on the
+/// files and `chmod 700` on the directory.
 pub struct DirCache<P: AsRef<Path> + Send + Sync> {
     inner: P,
 }
@@ -86,7 +106,8 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
     /// The rename also replaces an old file with open permissions or a planted
     /// symlink, instead of writing through it. On Unix, a sync of the directory
     /// after the rename makes the new entry survive a power loss. If that sync
-    /// fails, the function returns the error although the new file is in place.
+    /// fails with an unexpected error, the function returns the error although
+    /// the new file is in place.
     async fn write(&self, file: &str, contents: &[u8]) -> Result<(), std::io::Error> {
         let mut dir = self.inner.as_ref();
         // An empty path means the current directory. Neither `mkdir` nor
@@ -95,16 +116,60 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             dir = Path::new(".");
         }
         create_dir(dir).await?;
-        let (temp_path, temp_file) = create_temp_file(dir, file).await?;
+        let target = dir.join(file);
+        // `symlink_metadata` does not follow a symlink, so `old` is only set
+        // for a regular file. The cache never writes through a symlink.
+        let old = match fs::symlink_metadata(&target).await {
+            Ok(metadata) if metadata.is_file() => Some(metadata),
+            _ => None,
+        };
+        let (temp_path, temp_file) = match create_temp_file(dir, file).await {
+            Ok(temp) => temp,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                let Some(old) = old else {
+                    return Err(err);
+                };
+                log::warn!(
+                    "cannot create a temporary file in {}: {err}. Writing {} in place. \
+                     Give the process write access to the directory for crash-safe writes.",
+                    dir.display(),
+                    target.display(),
+                );
+                return write_in_place(&target, &old, contents).await;
+            }
+            Err(err) => return Err(err),
+        };
         let result = async {
-            write_and_sync(temp_file, contents).await?;
-            fs::rename(&temp_path, dir.join(file)).await
+            #[cfg(unix)]
+            let temp_file = match &old {
+                Some(old) => keep_group_access(temp_file, old).await?,
+                None => temp_file,
+            };
+            write_and_sync(temp_file, contents).await
         }
         .await;
         if let Err(err) = result {
             // The write error matters more to the caller than a failed cleanup.
             fs::remove_file(&temp_path).await.ok();
             return Err(err);
+        }
+        if let Err(err) = fs::rename(&temp_path, &target).await {
+            fs::remove_file(&temp_path).await.ok();
+            let cannot_replace = matches!(
+                err.kind(),
+                ErrorKind::ResourceBusy | ErrorKind::CrossesDevices
+            );
+            return match old {
+                Some(old) if cannot_replace => {
+                    log::warn!(
+                        "cannot replace {}: {err}. Writing it in place. \
+                         Mount the cache directory instead of single files for crash-safe writes.",
+                        target.display(),
+                    );
+                    write_in_place(&target, &old, contents).await
+                }
+                _ => Err(err),
+            };
         }
         #[cfg(unix)]
         sync_dir(dir).await?;
@@ -178,38 +243,82 @@ impl<P: AsRef<Path> + Send + Sync> AccountCache for DirCache<P> {
     }
 }
 
-/// Creates `dir`, on Unix with mode `0o700`.
+/// Creates `dir` and its missing parents, `dir` on Unix with mode `0o700`.
 ///
 /// Missing parents get the default permissions, because they hold no secrets
 /// and other users may need to traverse them. A directory that already exists
-/// keeps its permissions.
+/// keeps its permissions. On Unix, the function syncs the parent of each
+/// directory that it creates, so the new directory survives a power loss.
 async fn create_dir(dir: &Path) -> Result<(), std::io::Error> {
-    if let Some(parent) = dir.parent() {
-        // `create_dir_all` accepts the empty parent of a relative path.
-        fs::create_dir_all(parent).await?;
+    // `dir` and those of its parents that do not exist, innermost first.
+    let mut missing = Vec::new();
+    for path in dir.ancestors() {
+        // The empty parent of a relative path is the current directory.
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        match fs::metadata(path).await {
+            Ok(_) => break,
+            Err(err) if err.kind() == ErrorKind::NotFound => missing.push(path),
+            Err(err) => return Err(err),
+        }
     }
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    builder.mode(0o700);
-    match builder.create(dir).await {
-        Err(err) if err.kind() == ErrorKind::AlreadyExists => match fs::metadata(dir).await {
-            Ok(metadata) if metadata.is_dir() => Ok(()),
-            _ => Err(err),
-        },
-        result => result,
+    for path in missing.into_iter().rev() {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        if path == dir {
+            builder.mode(0o700);
+        }
+        match builder.create(path).await {
+            Ok(()) => {
+                #[cfg(unix)]
+                sync_dir(parent_dir(path)).await?;
+            }
+            // Another store created the directory concurrently.
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+    let metadata = fs::metadata(dir).await?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            format!("{} exists and is not a directory", dir.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the parent of `path`, or the current directory for a relative name.
+#[cfg(unix)]
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     }
 }
 
-/// Syncs `dir` to disk, so a rename in it survives a power loss.
+/// Syncs `dir` to disk, so a new entry in it survives a power loss.
 ///
 /// Some filesystems do not support a sync of a directory and fail with
 /// `EINVAL` or `ENOTSUP`. The function ignores these errors, as PostgreSQL
-/// does, because the rename has already succeeded.
+/// does, because the change in the directory has already succeeded. It also
+/// ignores `EACCES`, because the sync must open the directory, which needs
+/// read access. A process can change a directory with write access alone.
 #[cfg(unix)]
 async fn sync_dir(dir: &Path) -> Result<(), std::io::Error> {
-    match fs::File::open(dir).await?.sync_all().await {
-        Err(err) if matches!(err.kind(), ErrorKind::InvalidInput | ErrorKind::Unsupported) => {
+    let result = match fs::File::open(dir).await {
+        Ok(handle) => handle.sync_all().await,
+        Err(err) => Err(err),
+    };
+    match result {
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::InvalidInput | ErrorKind::Unsupported | ErrorKind::PermissionDenied
+            ) =>
+        {
             Ok(())
         }
         result => result,
@@ -247,4 +356,77 @@ async fn write_and_sync(mut file: fs::File, contents: &[u8]) -> Result<(), std::
     // `sync_all` does not report errors of buffered writes, `flush` does.
     file.flush().await?;
     file.sync_all().await
+}
+
+/// Gives the new `file` the group and the group bits of the `old` file.
+///
+/// The file keeps mode `0o600` if the old file has no group bits or if the
+/// function cannot change the group. Bits for other users never carry over.
+/// The function sets the mode explicitly, so the umask does not apply.
+///
+/// The calls only change the open file, so the function runs them directly
+/// instead of on a blocking thread.
+#[cfg(unix)]
+async fn keep_group_access(file: fs::File, old: &Metadata) -> Result<fs::File, std::io::Error> {
+    let group_bits = old.mode() & 0o070;
+    if group_bits == 0 {
+        return Ok(file);
+    }
+    let file = file.into_std().await;
+    let mode = if file.metadata()?.gid() == old.gid() {
+        0o600 | group_bits
+    } else {
+        match std::os::unix::fs::fchown(&file, None, Some(old.gid())) {
+            Ok(()) => 0o600 | group_bits,
+            Err(err) => {
+                // Group bits for another group would grant access to users
+                // that the operator did not choose.
+                log::warn!(
+                    "cannot give the new cache file the group {} of the old file: {err}. \
+                     The new file gets no group access.",
+                    old.gid(),
+                );
+                0o600
+            }
+        }
+    };
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    Ok(fs::File::from_std(file))
+}
+
+/// Overwrites the existing regular file `target` with `contents` in place.
+///
+/// The function checks that the opened file is still the `old` file, so it
+/// does not write through a symlink that replaced the file after the check.
+/// The file keeps its mode. A crash during the write can leave a truncated
+/// file behind.
+async fn write_in_place(
+    target: &Path,
+    old: &Metadata,
+    contents: &[u8],
+) -> Result<(), std::io::Error> {
+    let file = fs::OpenOptions::new().write(true).open(target).await?;
+    if !is_same_file(&file.metadata().await?, old) {
+        return Err(std::io::Error::other(format!(
+            "{} changed during the store",
+            target.display()
+        )));
+    }
+    file.set_len(0).await?;
+    write_and_sync(file, contents).await
+}
+
+/// Returns whether `a` and `b` describe the same file.
+#[cfg(unix)]
+fn is_same_file(a: &Metadata, b: &Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Returns whether `a` and `b` describe the same file.
+///
+/// Other platforms have no stable file ID in `std`, so the function only
+/// checks that `a` is a regular file.
+#[cfg(not(unix))]
+fn is_same_file(a: &Metadata, _b: &Metadata) -> bool {
+    a.is_file()
 }

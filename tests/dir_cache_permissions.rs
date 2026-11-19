@@ -7,7 +7,7 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -184,6 +184,49 @@ async fn renewed_certificate_key_keeps_group_bits() {
 #[tokio::test]
 async fn renewed_certificate_key_stays_owner_only() {
     assert_eq!(renew_with_old_mode(0o600).await, "600");
+}
+
+/// Returns a supplementary group of the process other than its effective group.
+fn other_group() -> Option<u32> {
+    let mut groups = vec![0; 256];
+    // SAFETY: The buffer holds `groups.len()` entries.
+    let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+    // SAFETY: `getegid` only reads the effective group ID and cannot fail.
+    let egid = unsafe { libc::getegid() };
+    let count = usize::try_from(count).ok()?;
+    groups[..count].iter().copied().find(|gid| *gid != egid)
+}
+
+/// A renewed TLS private key keeps the group of the old file.
+///
+/// The test uses a supplementary group of the process, so the new file does
+/// not get that group by default.
+#[tokio::test]
+async fn renewed_certificate_key_keeps_group() {
+    let Some(gid) = other_group() else {
+        return;
+    };
+    set_common_umask();
+    let dir = tempfile::tempdir().unwrap();
+    let cache = DirCache::new(dir.path());
+    let domains = ["example.com".to_string()];
+
+    cache
+        .store_cert(&domains, DIRECTORY_URL, b"old key and chain")
+        .await
+        .unwrap();
+    let file = cache_file(dir.path(), "cached_cert_");
+    std::os::unix::fs::chown(&file, None, Some(gid)).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+
+    cache
+        .store_cert(&domains, DIRECTORY_URL, b"new key and chain")
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read(&file).unwrap(), b"new key and chain");
+    assert_eq!(fs::metadata(&file).unwrap().gid(), gid);
+    assert_eq!(mode(&file), "640", "cache file {file:?}");
 }
 
 /// A store into a directory without write access replaces the content in place.
