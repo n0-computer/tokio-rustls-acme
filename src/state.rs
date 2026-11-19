@@ -17,6 +17,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
+use x509_parser::error::X509Error;
 use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
@@ -30,6 +31,38 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 pub(crate) fn after(d: std::time::Duration) -> Timer {
     Box::pin(tokio::time::sleep(d))
+}
+
+/// Longest renewal sleep, because the monotonic timer misses clock corrections and host suspend.
+const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
+
+/// Number of order rounds that can fail to advance the order status before the order fails.
+const MAX_STALLED_ROUNDS: u32 = 10;
+
+/// Returns the position of `status` in the RFC 8555 order lifecycle.
+fn order_progress(status: &OrderStatus) -> u8 {
+    match status {
+        OrderStatus::Pending => 0,
+        OrderStatus::Ready => 1,
+        OrderStatus::Processing => 2,
+        OrderStatus::Valid { .. } | OrderStatus::Invalid => 3,
+    }
+}
+
+/// Returns the time left from `now` until `deadline`, or `None` once it is reached.
+fn time_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
+    let left: Duration = (deadline - now).try_into().ok()?;
+    (!left.is_zero()).then_some(left)
+}
+
+/// Returns how long to sleep before the next renewal check, or `None` once renewal is due.
+fn renewal_sleep(renew_at: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
+    time_until(renew_at, now).map(|left| left.min(MAX_RENEWAL_SLEEP))
+}
+
+/// Returns the delay after stalled order round `round`, or `None` once the order should fail.
+fn stall_delay(round: u32) -> Option<Duration> {
+    (round < MAX_STALLED_ROUNDS).then(|| Duration::from_secs(1 << round))
 }
 
 /// Drives ACME orders and renewals, surfacing lifecycle events as a [`Stream`].
@@ -48,6 +81,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     order: Option<BoxFuture<Result<Vec<u8>, OrderError>>>,
     backoff_cnt: usize,
     wait: Option<Timer>,
+    renew_at: Option<OffsetDateTime>,
 }
 
 /// Item of the [`AcmeState`] stream, reporting the outcome of one step.
@@ -114,8 +148,8 @@ pub enum OrderError {
     /// The authorization for the given domain was still pending after the last check.
     #[error("authorization for {0} failed too many times")]
     TooManyAttemptsAuth(String),
-    /// The order was still processing after the last check.
-    #[error("order status stayed on processing too long")]
+    /// The order stayed `processing` or stopped advancing for too long.
+    #[error("order did not reach a final status in time, last status {:?}", .0.status)]
     ProcessingTimeout(Order),
 }
 
@@ -237,6 +271,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             order: None,
             backoff_cnt: 0,
             wait: None,
+            renew_at: None,
         }
     }
     fn parse_cert(
@@ -279,14 +314,18 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 };
             }
         };
-        self.resolver.set_cert(Arc::new(cert));
         let [not_before, not_after] = validity;
-        let renew_at = not_after - (not_after - not_before) / 3_i32;
-        // Negative durations (renewal already due) fail the conversion and become zero.
-        let wait_duration = (renew_at - OffsetDateTime::now_utc())
-            .try_into()
-            .unwrap_or_default();
-        self.wait = Some(after(wait_duration));
+        // The deployed certificate may still be valid, so keep it and the cache.
+        if !cached && not_after <= OffsetDateTime::now_utc() {
+            log::warn!(
+                "the CA issued a certificate that expired at {not_after}, keeping the deployed one"
+            );
+            // A dedicated error variant needs the API break of #67, so reuse `InvalidDate`.
+            let err = x509_parser::nom::Err::Error(X509Error::InvalidDate);
+            return Err(EventError::NewCertParse(CertParseError::X509(err.into())));
+        }
+        self.resolver.set_cert(Arc::new(cert));
+        self.renew_at = Some(not_after - (not_after - not_before) / 3_i32);
         if cached {
             return Ok(EventOk::DeployedCachedCert);
         }
@@ -325,7 +364,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let (order_url, mut order) = account
             .new_order(&config.client_config, config.domains.clone())
             .await?;
+        let mut stalled_rounds = 0;
         loop {
+            let previous_progress = order_progress(&order.status);
             match order.status {
                 OrderStatus::Pending => {
                     let auth_futures = order
@@ -370,6 +411,15 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
                 OrderStatus::Invalid => return Err(OrderError::BadOrder(order)),
             }
+            // A CA can lag in updating the status, and a broken CA can move it backwards.
+            if order_progress(&order.status) <= previous_progress {
+                let Some(delay) = stall_delay(stalled_rounds) else {
+                    return Err(OrderError::ProcessingTimeout(order));
+                };
+                log::info!("order status did not advance, now {:?}", order.status);
+                after(delay).await;
+                stalled_rounds += 1;
+            }
         }
     }
     async fn authorize(
@@ -413,6 +463,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
         Err(OrderError::TooManyAttemptsAuth(domain))
     }
+    fn back_off(&mut self) {
+        self.wait = Some(after(Duration::from_secs(1 << self.backoff_cnt)));
+        self.backoff_cnt = (self.backoff_cnt + 1).min(16);
+    }
     fn poll_next_infinite(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Event<EC, EA>> {
         loop {
             // queued early action
@@ -426,6 +480,17 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             if let Some(timer) = &mut self.wait {
                 ready!(timer.poll_unpin(cx));
                 self.wait.take();
+            }
+
+            // wait for renewal
+            if let Some(renew_at) = self.renew_at {
+                match renewal_sleep(renew_at, OffsetDateTime::now_utc()) {
+                    Some(sleep) => {
+                        self.wait = Some(after(sleep));
+                        continue;
+                    }
+                    None => self.renew_at = None,
+                }
             }
 
             // load from cert cache
@@ -458,13 +523,20 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 self.order.take();
                 match result {
                     Ok(pem) => {
-                        self.backoff_cnt = 0;
-                        return Poll::Ready(Self::process_cert(self.get_mut(), pem, false));
+                        let event = self.process_cert(pem, false);
+                        // An unusable or already due certificate counts as a failed order.
+                        let now = OffsetDateTime::now_utc();
+                        let due = self.renew_at.is_some_and(|t| time_until(t, now).is_none());
+                        if event.is_err() || due {
+                            self.back_off();
+                        } else {
+                            self.backoff_cnt = 0;
+                        }
+                        return Poll::Ready(event);
                     }
                     Err(err) => {
                         // TODO: replace key on some errors or high backoff_cnt?
-                        self.wait = Some(after(Duration::from_secs(1 << self.backoff_cnt)));
-                        self.backoff_cnt = (self.backoff_cnt + 1).min(16);
+                        self.back_off();
                         return Poll::Ready(Err(EventError::Order(err)));
                     }
                 }
@@ -507,5 +579,42 @@ impl<EC: 'static + Debug, EA: 'static + Debug> Stream for AcmeState<EC, EA> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(Some(ready!(self.poll_next_infinite(cx))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN: Duration = Duration::from_secs(60);
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+
+    #[test]
+    fn renewal_sleep_is_capped_at_max_renewal_sleep() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let cases = [
+            (now - MIN, None),
+            (now, None),
+            (now + MIN, Some(MIN)),
+            (now + MAX_RENEWAL_SLEEP, Some(MAX_RENEWAL_SLEEP)),
+            (now + 30 * 24 * HOUR, Some(MAX_RENEWAL_SLEEP)),
+        ];
+        for (renew_at, expected) in cases {
+            assert_eq!(
+                renewal_sleep(renew_at, now),
+                expected,
+                "renew at {renew_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn stall_delay_doubles_until_the_round_limit() {
+        let delays: Vec<_> = (0..=MAX_STALLED_ROUNDS).map(stall_delay).collect();
+        let expected: Vec<_> = (0..MAX_STALLED_ROUNDS)
+            .map(|round| Some(Duration::from_secs(1 << round)))
+            .chain([None])
+            .collect();
+        assert_eq!(delays, expected);
     }
 }
