@@ -22,8 +22,9 @@ use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
-    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
+    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus, Problem,
 };
+use crate::https_helper::HttpsRequestError;
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
 type Timer = std::pin::Pin<Box<Sleep>>;
@@ -65,6 +66,23 @@ fn stall_delay(round: u32) -> Option<Duration> {
     (round < MAX_STALLED_ROUNDS).then(|| Duration::from_secs(1 << round))
 }
 
+/// Returns whether a `newAccount` error shows a deactivated or unknown account, RFC 8555 section 7.3.6.
+fn rejects_account(err: &AcmeError) -> bool {
+    let AcmeError::HttpRequest(HttpsRequestError::Non2xxStatus { body, .. }) = err else {
+        return false;
+    };
+    let typ = serde_json::from_str::<Problem>(body)
+        .ok()
+        .and_then(|p| p.typ);
+    matches!(
+        typ.as_deref(),
+        Some(
+            "urn:ietf:params:acme:error:unauthorized"
+                | "urn:ietf:params:acme:error:accountDoesNotExist"
+        )
+    )
+}
+
 /// Drives ACME orders and renewals, surfacing lifecycle events as a [`Stream`].
 ///
 /// Owns the [`ResolvesServerCertAcme`] populated as new certificates are
@@ -78,7 +96,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     early_action: Option<BoxFuture<Event<EC, EA>>>,
     load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
-    order: Option<BoxFuture<Result<Vec<u8>, OrderError>>>,
+    order: Option<BoxFuture<Result<Vec<u8>, (OrderError, bool)>>>,
     backoff_cnt: usize,
     wait: Option<Timer>,
     renew_at: Option<OffsetDateTime>,
@@ -112,6 +130,9 @@ pub enum EventError<EC: Debug, EA: Debug> {
     AccountCacheStore(EA),
     #[error("cached cert parse: {0}")]
     CachedCertParse(CertParseError),
+    /// An order failed, and the next one starts after a backoff.
+    ///
+    /// If the CA rejects the account, later orders use a new account key kept in memory only.
     #[error("order: {0}")]
     Order(OrderError),
     #[error("new cert parse: {0}")]
@@ -307,21 +328,40 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }));
         Event::Ok(EventOk::DeployedNewCert)
     }
+    /// Runs one order, and on failure reports whether the CA rejected the account key.
+    #[allow(clippy::result_large_err)]
     async fn order(
         config: Arc<AcmeConfig<EC, EA>>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
+    ) -> Result<Vec<u8>, (OrderError, bool)> {
+        let account = async {
+            let directory =
+                Directory::discover(&config.client_config, &config.directory_url).await?;
+            Account::create_with_keypair(
+                &config.client_config,
+                directory,
+                &config.contact,
+                &key_pair,
+                &config.eab,
+            )
+            .await
+        }
+        .await
+        .map_err(|err| {
+            let rejected = rejects_account(&err);
+            (err.into(), rejected)
+        })?;
+        // CAs also use `unauthorized` for order problems, so only account errors count.
+        Self::order_with_account(&config, &resolver, &account)
+            .await
+            .map_err(|err| (err, false))
+    }
+    async fn order_with_account(
+        config: &AcmeConfig<EC, EA>,
+        resolver: &ResolvesServerCertAcme,
+        account: &Account,
     ) -> Result<Vec<u8>, OrderError> {
-        let directory = Directory::discover(&config.client_config, &config.directory_url).await?;
-        let account = Account::create_with_keypair(
-            &config.client_config,
-            directory,
-            &config.contact,
-            &key_pair,
-            &config.eab,
-        )
-        .await?;
-
         let mut params = CertificateParams::new(config.domains.clone())?;
         params.distinguished_name = DistinguishedName::new();
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
@@ -337,7 +377,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                     let auth_futures = order
                         .authorizations
                         .iter()
-                        .map(|url| Self::authorize(&config, &resolver, &account, url));
+                        .map(|url| Self::authorize(config, resolver, account, url));
                     try_join_all(auth_futures).await?;
                     log::info!("completed all authorizations");
                     order = account.order(&config.client_config, &order_url).await?;
@@ -511,8 +551,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         }
                         return Poll::Ready(event);
                     }
-                    Err(err) => {
-                        // TODO: replace key on some errors or high backoff_cnt?
+                    Err((err, account_rejected)) => {
+                        // Keeps the stored key, so a wrong CA answer cannot lose a valid account.
+                        if account_rejected {
+                            log::error!(
+                                "the CA rejected the ACME account, ordering with a new account key that is not stored"
+                            );
+                            self.account_key = Some(Account::generate_key_pair());
+                        }
                         self.back_off();
                         return Poll::Ready(Err(EventError::Order(err)));
                     }
@@ -583,6 +629,28 @@ mod tests {
                 "renew at {renew_at}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_account_on_account_problems_only() {
+        let non_2xx = |body: &str| {
+            AcmeError::HttpRequest(HttpsRequestError::Non2xxStatus {
+                status_code: 403,
+                body: body.to_string(),
+            })
+        };
+        let problem = |typ: &str| format!(r#"{{"type":"urn:ietf:params:acme:error:{typ}"}}"#);
+        let cases = [
+            (problem("unauthorized"), true),
+            (problem("accountDoesNotExist"), true),
+            (problem("rateLimited"), false),
+            ("{}".to_string(), false),
+            ("unauthorized".to_string(), false),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(rejects_account(&non_2xx(&body)), expected, "{body}");
+        }
+        assert!(!rejects_account(&AcmeError::MissingHeader("location")));
     }
 
     #[test]

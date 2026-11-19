@@ -7,12 +7,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::StreamExt;
 use rcgen::{KeyPair, PKCS_ECDSA_P384_SHA384};
-use serde_json::Value;
-use support::MockAcme;
-use tokio_rustls_acme::{AccountCache, AcmeConfig, AcmeState, CertCache, EventError, EventOk};
+use support::{MockAcme, jwk_public_point};
+use tokio_rustls_acme::{
+    AccountCache, AcmeConfig, AcmeState, CertCache, EventError, EventOk, acme::Account,
+};
 
 const DOMAIN: &str = "example.com";
 /// Upper bound on the real time that one test waits for a certificate.
@@ -74,15 +74,6 @@ async fn deploy_new_cert(state: &mut AcmeState<io::Error, io::Error>) -> bool {
     load_failed
 }
 
-/// Returns the uncompressed public point of the P-256 key in `jwk`.
-fn jwk_public_point(jwk: &Value) -> Vec<u8> {
-    let coordinate = |name: &str| {
-        let value = jwk[name].as_str().expect("JWK coordinate");
-        URL_SAFE_NO_PAD.decode(value).expect("base64url coordinate")
-    };
-    [vec![0x04], coordinate("x"), coordinate("y")].concat()
-}
-
 /// Only a missing key is stored. Any other load result orders with a key kept in memory.
 #[tokio::test]
 async fn account_key_is_stored_only_when_missing() {
@@ -119,5 +110,46 @@ async fn account_key_is_stored_only_when_missing() {
         } else {
             assert!(stored.is_empty(), "{name}: the cached key was overwritten");
         }
+    }
+}
+
+/// A CA rejecting `newAccount` switches to a new unstored key. Other rejections keep the key.
+#[tokio::test]
+async fn account_rejection_switches_to_unstored_key() {
+    // (case, newAccount rejected, finalize rejected)
+    let cases = [("newAccount", true, false), ("finalize", false, true)];
+    for (name, reject_account, reject_finalize) in cases {
+        let mock = MockAcme::start().await;
+        let key = Account::generate_key_pair();
+        let point = KeyPair::try_from(key.as_slice())
+            .expect("P-256 key")
+            .public_key_raw()
+            .to_vec();
+        mock.state().deactivated_key = reject_account.then(|| point.clone());
+        mock.state().reject_finalize = reject_finalize;
+        let stored_accounts = Arc::default();
+        let cache = FixedCache {
+            account: Ok(Some(key)),
+            stored_accounts: Arc::clone(&stored_accounts),
+        };
+        let mut state =
+            AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
+                .directory(&mock.directory_url)
+                .cache(cache)
+                .state();
+
+        let first = state.next().await.expect("event");
+        assert!(
+            matches!(first, Err(EventError::Order(_))),
+            "{name}: {first:?}"
+        );
+        deploy_new_cert(&mut state).await;
+
+        assert!(
+            stored_accounts.lock().expect("poisoned").is_empty(),
+            "{name}"
+        );
+        let jwk = mock.state().account_jwk.clone().expect("newAccount JWK");
+        assert_eq!(jwk_public_point(&jwk) != point, reject_account, "{name}");
     }
 }
