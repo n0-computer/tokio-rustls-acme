@@ -3,9 +3,9 @@ use async_trait::async_trait;
 
 /// A cache that keeps certificates in one cache and account keys in another.
 pub struct CompositeCache<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> {
-    /// Cache for certificates.
+    /// Cache that `load_cert` and `store_cert` delegate to.
     pub cert_cache: C,
-    /// Cache for account keys.
+    /// Cache that `load_account` and `store_account` delegate to.
     pub account_cache: A,
 }
 

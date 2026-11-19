@@ -415,7 +415,7 @@ pub enum AcmeError {
     /// The account key is not a valid P-256 ECDSA PKCS#8 key.
     #[error("invalid key pair: {0}")]
     KeyRejected(CryptoError),
-    /// The crypto provider failed, for example to load the validation key.
+    /// The crypto provider could not load the validation key.
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
     /// A server response lacks a required header.

@@ -97,7 +97,7 @@ pub enum EventError<EC: Debug, EA: Debug> {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum OrderError {
-    /// An ACME request failed.
+    /// The ACME client failed.
     #[error("acme error: {0}")]
     Acme(#[from] AcmeError),
     /// Generating the certificate key or the CSR failed.
