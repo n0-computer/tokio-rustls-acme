@@ -17,83 +17,26 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A cache that stores certificates and account keys as files in a directory.
 ///
-/// The files hold secrets. A certificate file starts with the private key of
-/// the certificate. An account file holds the private key of the ACME account.
-/// A user who can read these files can impersonate the server or control the
-/// ACME account.
+/// The files hold private keys, and the cache trusts the files it loads. The
+/// directory must belong to the user of the server and must not be writable
+/// by others.
 ///
-/// The directory must belong to the user of the server and must not be
-/// writable by others. The cache trusts the files that it loads. A user who
-/// can write to the directory can plant a key or a certificate.
+/// Each store writes a temporary file and renames it over the old file, so a
+/// crash does not leave a truncated file. This needs write access to the
+/// directory. If the rename is not possible, the cache writes an existing file
+/// in place and logs a warning. On Unix, it does this only for a single-link
+/// file of the process user or root, and never in a world-writable directory.
 ///
-/// The cache writes each file to a temporary file in the same directory first
-/// and then renames it over the old file. Thus a crash or a full disk does not
-/// leave a truncated file behind. For this, the process needs write access to
-/// the directory, not only to the files.
+/// On Unix, new files get mode `0o600`, and a new cache directory gets mode
+/// `0o700`. A replaced file keeps the group and group bits of the old file,
+/// but not its bits for other users or its ACL.
 ///
-/// On Unix, the cache syncs the directory after the rename, so the new file
-/// survives a power loss. It also syncs the parent of each directory that it
-/// creates. The sync opens the directory, which needs read access. Without
-/// read access, or on a filesystem without directory sync, the cache skips the
-/// sync. The store then succeeds, but a power loss can undo it.
+/// A crash can leave a hidden `.tmp` file behind. You can delete it while no
+/// store runs.
 ///
-/// The rename replaces a symlink at the name of a cache file with a regular
-/// file. The cache never writes through such a symlink, and the target of the
-/// symlink keeps its old content.
-///
-/// In three cases, the cache cannot rename and writes the old file in place,
-/// as earlier releases did. It logs a warning, because a crash during this
-/// write can leave a truncated file behind. The cases are:
-///
-/// - The process cannot create a file in the directory. Give the process write
-///   access to the directory to fix this.
-/// - The rename fails with `EBUSY` or `EXDEV`, for example because the file is
-///   bind-mounted into a container. Mount the directory instead.
-/// - The rename fails with `EPERM` or `EACCES`. In a sticky directory, this
-///   happens when another user owns the old file. Let the user of the process
-///   own the file to fix this.
-///
-/// On Unix, the cache writes in place only into a regular file with a single
-/// link. The user of the process or root must own the file. Another user could
-/// plant a file at the cache name and read the key from it. The cache also
-/// never writes in place in a directory that all users can write. In these
-/// cases, the store fails with the original error.
-///
-/// On Unix, the cache writes each new file with mode `0o600`. If the directory
-/// does not exist, the cache creates it with mode `0o700`. Missing parents of
-/// the directory get the default permissions. The cache does not change the
-/// permissions of a directory that already exists.
-///
-/// A store that replaces a file keeps the group and the group bits of the old
-/// file. Thus a sidecar with group access can still read the new file. The
-/// user of the process owns the new file. The cache keeps the group only if
-/// the old file is a regular file with a single link that the user of the
-/// process or root owns. Another file could be a trap that grants its group
-/// access to the key, for example a hard link to a file of another group. If the cache does
-/// not keep the group, the new file gets no group bits. The new file never
-/// gets permission bits for other users.
-///
-/// The new file does not keep an ACL of the old file. On a file with an ACL,
-/// the group bits show the ACL mask. Thus the owning group of the new file gets
-/// the rights of that mask. Grant access through the group or through a default
-/// ACL on the directory instead. An in-place write keeps the ACL and the
-/// user and group bits of the file. It removes the bits for other users.
-///
-/// On other platforms, files and directories get the default permissions. On
-/// Windows, they inherit the ACL of the parent directory.
-///
-/// A crash or a cancelled store can leave a hidden temporary file behind. Its
-/// name ends in `.tmp`, and on Unix it has mode `0o600`. You can delete such a
-/// file safely while no store runs.
-///
-/// Earlier releases of this crate wrote these files with the default
-/// permissions. With the common umask `022`, other local users can read them.
-/// The cache does not change the mode of a file when it reads it. An old
-/// certificate file loses its bits for other users when the next renewal
-/// replaces it, but it keeps its group bits. The crate writes an account file
-/// only when it generates a new account key, so an old account file keeps its
-/// mode. If you upgrade from such a release on Unix, run `chmod 600` on the
-/// files and `chmod 700` on the directory.
+/// Earlier releases wrote the files with default permissions. After an
+/// upgrade on Unix, run `chmod 600` on the files and `chmod 700` on the
+/// directory.
 pub struct DirCache<P: AsRef<Path> + Send + Sync> {
     inner: P,
 }
@@ -120,24 +63,17 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
     }
     /// Replaces `file` in the cache directory with `contents`.
     ///
-    /// The rename also replaces an old file with open permissions or a planted
-    /// symlink, instead of writing through it. On Unix, a sync of the directory
-    /// after the rename makes the new entry survive a power loss. If that sync
-    /// fails with an unexpected error, the function returns the error although
-    /// the new file is in place. If the function cannot create the temporary
-    /// file or cannot rename it, it can write an existing regular file in
-    /// place. The [`DirCache`] docs list these cases and their limits.
+    /// If the directory sync after the rename fails, the function returns the
+    /// error although the new file is in place.
     async fn write(&self, file: &str, contents: &[u8]) -> Result<(), std::io::Error> {
         let mut dir = self.inner.as_ref();
-        // An empty path means the current directory. Neither `mkdir` nor
-        // `open` accepts it, so the cache spells it out.
+        // `mkdir` and `open` reject the empty path.
         if dir.as_os_str().is_empty() {
             dir = Path::new(".");
         }
         create_dir(dir).await?;
         let target = dir.join(file);
-        // `symlink_metadata` does not follow a symlink, so `old` is only set
-        // for a regular file. The cache never writes through a symlink.
+        // No in-place write ever follows a symlink.
         let old = match fs::symlink_metadata(&target).await {
             Ok(metadata) if metadata.is_file() => Some(metadata),
             _ => None,
@@ -174,15 +110,13 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
         }
         .await;
         if let Err(err) = result {
-            // The write error matters more to the caller than a failed cleanup.
             fs::remove_file(&temp_path).await.ok();
             return Err(err);
         }
         if let Err(err) = fs::rename(&temp_path, &target).await {
             fs::remove_file(&temp_path).await.ok();
-            // `PermissionDenied` covers a sticky directory in which another
-            // user owns the old file. If root owns it, the in-place write may
-            // still work.
+            // `PermissionDenied` covers a sticky directory. If root owns the
+            // old file there, the in-place write may still work.
             let cannot_replace = matches!(
                 err.kind(),
                 ErrorKind::ResourceBusy | ErrorKind::CrossesDevices | ErrorKind::PermissionDenied
@@ -276,12 +210,9 @@ impl<P: AsRef<Path> + Send + Sync> AccountCache for DirCache<P> {
 
 /// Creates `dir` and its missing parents, `dir` on Unix with mode `0o700`.
 ///
-/// Missing parents get the default permissions, because they hold no secrets
-/// and other users may need to traverse them. A directory that already exists
-/// keeps its permissions. On Unix, the function syncs the parent of each
-/// directory that it creates, so the new directory survives a power loss.
+/// Parents get the default permissions, so other users can traverse them.
+/// On Unix, the function syncs the parent of each directory it creates.
 async fn create_dir(dir: &Path) -> Result<(), std::io::Error> {
-    // `dir` and those of its parents that do not exist, innermost first.
     let mut missing = Vec::new();
     for path in dir.ancestors() {
         // The empty parent of a relative path is the current directory.
@@ -332,11 +263,8 @@ fn parent_dir(path: &Path) -> &Path {
 
 /// Syncs `dir` to disk, so a new entry in it survives a power loss.
 ///
-/// Some filesystems do not support a sync of a directory and fail with
-/// `EINVAL` or `ENOTSUP`. The function ignores these errors, as PostgreSQL
-/// does, because the change in the directory has already succeeded. It also
-/// ignores `EACCES`, because the sync must open the directory, which needs
-/// read access. A process can change a directory with write access alone.
+/// Ignores `EINVAL` and `ENOTSUP` from filesystems without directory sync, as
+/// PostgreSQL does. Ignores `EACCES`, because the open needs read access.
 #[cfg(unix)]
 async fn sync_dir(dir: &Path) -> Result<(), std::io::Error> {
     let result = match fs::File::open(dir).await {
@@ -358,10 +286,8 @@ async fn sync_dir(dir: &Path) -> Result<(), std::io::Error> {
 
 /// Creates a new temporary file for `file` in `dir`, on Unix with mode `0o600`.
 ///
-/// The file name holds the process ID and a counter, so concurrent writers do
-/// not collide. `create_new` fails on any existing path, a symlink included.
-/// If the name exists, for example as a file that a crash left behind, the
-/// function tries the next counter value.
+/// `create_new` refuses any existing path, a symlink included. On a collision,
+/// the function tries the next counter value.
 async fn create_temp_file(dir: &Path, file: &str) -> Result<(PathBuf, fs::File), std::io::Error> {
     loop {
         let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -380,8 +306,7 @@ async fn create_temp_file(dir: &Path, file: &str) -> Result<(PathBuf, fs::File),
 
 /// Writes `contents` to `file`, syncs it to disk, and closes it.
 ///
-/// The function takes `file` by value and closes it before it returns. Thus
-/// the cache holds no open handle to the file during the rename.
+/// Takes `file` by value, so no handle stays open during the rename.
 async fn write_and_sync(mut file: fs::File, contents: &[u8]) -> Result<(), std::io::Error> {
     file.write_all(contents).await?;
     // `sync_all` does not report errors of buffered writes, `flush` does.
@@ -391,15 +316,10 @@ async fn write_and_sync(mut file: fs::File, contents: &[u8]) -> Result<(), std::
 
 /// Gives the new `file` the group and the group bits of the `old` file.
 ///
-/// The file keeps mode `0o600` if the old file has no group bits or if the
-/// function cannot change the group. It also keeps that mode if neither the
-/// user of the process nor root owns the old file. Another user could plant
-/// a file with a group of their choice, and a process of root could join it.
-/// Bits for other users never carry over. The function sets the mode
-/// explicitly, so the umask does not apply.
-///
-/// The calls only change the open file, so the function runs them directly
-/// instead of on a blocking thread.
+/// Requires that `old` passes [`may_overwrite`], because another user could
+/// plant a file with a group of their choice. Otherwise, or if the group
+/// cannot be set, the file keeps mode `0o600`. The calls only touch the open
+/// file, so they do not need a blocking thread.
 #[cfg(unix)]
 async fn keep_group_access(file: fs::File, old: &Metadata) -> Result<fs::File, std::io::Error> {
     let group_bits = old.mode() & 0o070;
@@ -420,8 +340,8 @@ async fn keep_group_access(file: fs::File, old: &Metadata) -> Result<fs::File, s
         match std::os::unix::fs::fchown(&file, None, Some(old.gid())) {
             Ok(()) => 0o600 | group_bits,
             Err(err) => {
-                // Group bits for another group would grant access to users
-                // that the operator did not choose.
+                // Group bits for another group would grant access the
+                // operator did not choose.
                 log::warn!(
                     "cannot give the new cache file the group {} of the old file: {err}. \
                      The new file gets no group access.",
@@ -437,10 +357,8 @@ async fn keep_group_access(file: fs::File, old: &Metadata) -> Result<fs::File, s
 
 /// Returns whether the cache may write an existing file in `dir` in place.
 ///
-/// On Unix, the function refuses a directory that other users can write. Such
-/// a user can plant a regular file at a cache name, for example in `/tmp`. An
-/// in-place write would put the key into that file, and its owner could read
-/// it. A rename replaces a planted file instead, so it needs no such check.
+/// On Unix, refuses a directory that other users can write. They could plant
+/// a file at a cache name and read the key from it.
 #[cfg(unix)]
 async fn may_write_in_place(dir: &Path) -> bool {
     match fs::metadata(dir).await {
@@ -462,14 +380,10 @@ async fn may_write_in_place(_dir: &Path) -> bool {
     true
 }
 
-/// Opens `target` for an in-place write if the cache may write it there.
+/// Opens `target` for an in-place write, or returns `None` if it must not.
 ///
-/// The function returns `None` if the cache must not write the file. It
-/// opens the file without truncating it. It then checks that the handle
-/// refers to the `old` file. Thus it does not write through a symlink
-/// that replaced the file after the check. On Unix, the file must also pass
-/// [`may_overwrite`]. The open does not follow a symlink and does not block on
-/// a FIFO.
+/// Checks the open handle against `old`, so a file swapped in after the first
+/// check is not written.
 async fn open_in_place(target: &Path, old: &Metadata) -> Result<Option<fs::File>, std::io::Error> {
     let mut options = fs::OpenOptions::new();
     options.write(true);
@@ -498,10 +412,7 @@ async fn open_in_place(target: &Path, old: &Metadata) -> Result<Option<fs::File>
 
 /// Overwrites the opened `file` with `contents` and syncs it.
 ///
-/// On Unix, the function first removes the permission bits for other users,
-/// so a file from an earlier release no longer exposes the key. The user and
-/// group bits stay. A crash during the write can leave a truncated file
-/// behind.
+/// On Unix, the function first removes the permission bits for other users.
 async fn overwrite(file: fs::File, contents: &[u8]) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
@@ -523,8 +434,8 @@ fn is_same_file(a: &Metadata, b: &Metadata) -> bool {
 
 /// Returns whether `a` and `b` describe the same file.
 ///
-/// Other platforms have no stable file ID in `std`, so the function only
-/// checks that `a` is a regular file.
+/// Other platforms have no stable file ID in `std`, so this only checks that
+/// `a` is a regular file.
 #[cfg(not(unix))]
 fn is_same_file(a: &Metadata, _b: &Metadata) -> bool {
     a.is_file()
@@ -538,9 +449,6 @@ fn euid() -> u32 {
 }
 
 /// Returns whether the cache trusts a file that the user `uid` owns.
-///
-/// The cache trusts files of the user `euid` of the process and of root.
-/// Another user could plant a file at a cache name to read the key.
 #[cfg(unix)]
 fn is_trusted_owner(uid: u32, euid: u32) -> bool {
     uid == euid || uid == 0
@@ -548,9 +456,7 @@ fn is_trusted_owner(uid: u32, euid: u32) -> bool {
 
 /// Returns whether the cache may write the file with `metadata` in place.
 ///
-/// The file must be a regular file with a single link, and its owner must
-/// pass [`is_trusted_owner`]. A second link could expose the key under a
-/// name that the cache does not control.
+/// A second link could expose the key under a name the cache does not control.
 #[cfg(unix)]
 fn may_overwrite(metadata: &Metadata, euid: u32) -> bool {
     metadata.is_file() && metadata.nlink() == 1 && is_trusted_owner(metadata.uid(), euid)
@@ -570,9 +476,6 @@ mod tests {
     }
 
     /// A hard-linked old file does not pass its group bits to the new file.
-    ///
-    /// A hard link at the cache name could point to a file of a group that
-    /// the attacker belongs to.
     #[tokio::test]
     async fn hard_linked_old_file_keeps_no_group_access() {
         let dir = tempfile::tempdir().unwrap();

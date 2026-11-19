@@ -1,10 +1,7 @@
 //! Platform-independent tests for `DirCache`.
 //!
-//! Each store writes a temporary file and renames it over the cache entry.
-//! These tests run on every platform, so CI covers the rename on Windows too.
-//!
-//! One test changes the current directory of the process. All other tests in
-//! this file must use absolute paths.
+//! One test changes the current directory, so all other tests must use
+//! absolute paths.
 
 use std::fs;
 
@@ -59,9 +56,6 @@ async fn second_store_replaces_entries_without_temp_files() {
 }
 
 /// An empty cache path stores the entries in the current directory.
-///
-/// Earlier releases accepted the empty path, for example from
-/// `env::var(..).unwrap_or_default()`. The cache must keep accepting it.
 #[tokio::test]
 async fn empty_path_uses_current_directory() {
     let dir = tempfile::tempdir().unwrap();

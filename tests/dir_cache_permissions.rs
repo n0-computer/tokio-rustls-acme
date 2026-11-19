@@ -1,7 +1,4 @@
-//! Tests for the file permissions of `DirCache`.
-//!
-//! `DirCache` stores the TLS private key and the ACME account key. Other
-//! local users must not be able to read these files.
+//! Tests that other local users cannot read the private keys in `DirCache`.
 
 #![cfg(unix)]
 
@@ -15,10 +12,7 @@ use tokio_rustls_acme::{AccountCache, CertCache, caches::DirCache};
 
 const DIRECTORY_URL: &str = "https://acme.example/directory";
 
-/// Sets the umask that most systems use by default.
-///
-/// With a stricter umask of the caller, the tests would pass whatever
-/// `DirCache` does.
+/// Sets umask `022`, so a stricter umask of the caller cannot hide a bug.
 fn set_common_umask() {
     // SAFETY: `umask` only replaces the file mode creation mask of the
     // process and cannot fail. All tests in this binary set the same value.
@@ -45,8 +39,6 @@ fn group_and_other_bits(path: &Path) -> u32 {
 }
 
 /// Returns the permission bits of `path` as an octal string.
-///
-/// Octal strings make a failure readable.
 fn mode(path: &Path) -> String {
     format!(
         "{:o}",
@@ -138,9 +130,7 @@ async fn stored_account_key_is_owner_only() {
     );
 }
 
-/// Stores a certificate, sets the mode of its file, and stores a renewal.
-///
-/// Returns the mode of the cache file after the renewal.
+/// Stores a certificate with `old_mode`, renews it, and returns the new mode.
 async fn renew_with_old_mode(old_mode: u32) -> String {
     set_common_umask();
     let dir = tempfile::tempdir().unwrap();
@@ -163,18 +153,13 @@ async fn renew_with_old_mode(old_mode: u32) -> String {
     mode(&file)
 }
 
-/// A renewed TLS private key drops the world bits of a world-readable file.
-///
-/// Earlier releases wrote the files with mode `0o644` under the common umask.
-/// The group bits stay, because an operator may have granted them on purpose.
+/// A renewed TLS private key drops the world bits but keeps the group bits.
 #[tokio::test]
 async fn renewed_certificate_key_drops_world_bits() {
     assert_eq!(renew_with_old_mode(0o644).await, "640");
 }
 
 /// A renewed TLS private key keeps the group access of the old file.
-///
-/// A sidecar that reads the files through group access keeps working.
 #[tokio::test]
 async fn renewed_certificate_key_keeps_group_bits() {
     assert_eq!(renew_with_old_mode(0o640).await, "640");
@@ -198,9 +183,6 @@ fn other_group() -> Option<u32> {
 }
 
 /// A renewed TLS private key keeps the group of the old file.
-///
-/// The test uses a supplementary group of the process, so the new file does
-/// not get that group by default.
 #[tokio::test]
 async fn renewed_certificate_key_keeps_group() {
     let Some(gid) = other_group() else {
@@ -230,9 +212,6 @@ async fn renewed_certificate_key_keeps_group() {
 }
 
 /// A store into a directory without write access replaces the content in place.
-///
-/// Earlier releases wrote the files in place, so a setup with a read-only
-/// directory and writable files worked. The cache must keep it working.
 #[tokio::test]
 async fn store_into_read_only_directory_writes_in_place() {
     if is_root() {
@@ -251,8 +230,7 @@ async fn store_into_read_only_directory_writes_in_place() {
     let file = cache_file(&cache_dir, "cached_cert_");
     fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).unwrap();
 
-    // The new content is shorter than the old one, so a missing truncation
-    // would leave old bytes at the end of the file.
+    // Shorter content catches a missing truncation.
     let result = cache.store_cert(&domains, DIRECTORY_URL, b"new key").await;
 
     fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -267,8 +245,6 @@ async fn store_into_read_only_directory_writes_in_place() {
 }
 
 /// An in-place write removes the bits for other users from an old file.
-///
-/// Earlier releases wrote cache files with mode `0o644` under umask `022`.
 #[tokio::test]
 async fn store_into_read_only_directory_drops_world_bits() {
     if is_root() {
@@ -298,9 +274,7 @@ async fn store_into_read_only_directory_drops_world_bits() {
 
 /// A store into a directory that other users can write never writes in place.
 ///
-/// Another user could plant a file at the cache name and read the key from
-/// it. The mode `0o507` denies write access to the owner only. Thus the cache
-/// cannot create a temporary file, and the in-place fallback must refuse.
+/// Mode `0o507` denies the owner write access, which forces the in-place path.
 #[tokio::test]
 async fn store_into_world_writable_directory_does_not_write_in_place() {
     if is_root() {
@@ -351,9 +325,6 @@ async fn store_of_new_entry_into_read_only_directory_fails() {
 }
 
 /// A store succeeds in a directory that the process can write but not read.
-///
-/// The sync of the directory opens it, which needs read access. The rename
-/// has already replaced the entry, so the store must not fail.
 #[tokio::test]
 async fn store_into_unreadable_directory_succeeds() {
     if is_root() {
@@ -378,10 +349,6 @@ async fn store_into_unreadable_directory_succeeds() {
 }
 
 /// A symlink at the name of a cache file does not redirect the TLS private key.
-///
-/// The cache directory must not be writable by others, so no other user can
-/// plant such a symlink. The rename is defense in depth: a stray symlink does
-/// not send the key to another file.
 #[tokio::test]
 async fn certificate_key_is_not_written_through_symlink() {
     set_common_umask();
@@ -391,7 +358,7 @@ async fn certificate_key_is_not_written_through_symlink() {
     let cache = DirCache::new(&cache_dir);
     let domains = ["example.com".to_string()];
 
-    // Find the file name of the cache entry, then plant the symlink there.
+    // The first store reveals the file name for the symlink.
     cache
         .store_cert(&domains, DIRECTORY_URL, b"first key and chain")
         .await
