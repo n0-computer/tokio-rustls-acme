@@ -119,6 +119,5 @@ required-features = ["tls-webpki-roots"]
 name = "low_level"
 required-features = ["tls-webpki-roots"]
 
-# Reads the effective user ID, which `DirCache` compares with file owners.
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

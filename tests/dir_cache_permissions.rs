@@ -4,7 +4,7 @@
 
 use std::{
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -139,123 +139,15 @@ async fn renew_with_old_mode(old_mode: u32) -> String {
     mode(&file)
 }
 
-/// A renewed TLS private key keeps the group bits of the old file but no world bits.
+/// A renewed TLS private key is owner-only, whatever the mode of the old file.
 #[tokio::test]
-async fn renewed_certificate_key_keeps_only_group_bits() {
-    for (old_mode, expected) in [(0o644, "640"), (0o600, "600")] {
-        let mode = renew_with_old_mode(old_mode).await;
-        assert_eq!(mode, expected, "old mode {old_mode:o}");
-    }
+async fn renewed_certificate_key_is_owner_only() {
+    assert_eq!(renew_with_old_mode(0o644).await, "600");
 }
 
-/// Returns a supplementary group of the process other than its effective group.
-fn other_group() -> Option<u32> {
-    let mut groups = vec![0; 256];
-    // SAFETY: The buffer holds `groups.len()` entries.
-    let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
-    // SAFETY: `getegid` only reads the effective group ID and cannot fail.
-    let egid = unsafe { libc::getegid() };
-    let count = usize::try_from(count).ok()?;
-    groups[..count].iter().copied().find(|gid| *gid != egid)
-}
-
-/// A renewed TLS private key keeps the group of the old file.
+/// A store into a directory without write access fails and leaves no file.
 #[tokio::test]
-async fn renewed_certificate_key_keeps_group() {
-    let Some(gid) = other_group() else {
-        return;
-    };
-    set_common_umask();
-    let dir = tempfile::tempdir().unwrap();
-    let cache = DirCache::new(dir.path());
-    let domains = ["example.com".to_string()];
-
-    cache
-        .store_cert(&domains, DIRECTORY_URL, b"old key and chain")
-        .await
-        .unwrap();
-    let file = cache_file(dir.path(), "cached_cert_");
-    std::os::unix::fs::chown(&file, None, Some(gid)).unwrap();
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
-
-    cache
-        .store_cert(&domains, DIRECTORY_URL, b"new key and chain")
-        .await
-        .unwrap();
-
-    assert_eq!(fs::read(&file).unwrap(), b"new key and chain");
-    assert_eq!(fs::metadata(&file).unwrap().gid(), gid);
-    assert_eq!(mode(&file), "640", "cache file {file:?}");
-}
-
-/// A store into a directory without write access replaces the content in place.
-///
-/// The in-place write also removes the bits for other users from the old file.
-#[tokio::test]
-async fn store_into_read_only_directory_writes_in_place() {
-    if is_root() {
-        return;
-    }
-    set_common_umask();
-    let dir = tempfile::tempdir().unwrap();
-    let cache_dir = dir.path().join("cache");
-    let cache = DirCache::new(&cache_dir);
-    let domains = ["example.com".to_string()];
-
-    cache
-        .store_cert(&domains, DIRECTORY_URL, b"old key and chain")
-        .await
-        .unwrap();
-    let file = cache_file(&cache_dir, "cached_cert_");
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).unwrap();
-
-    // Shorter content catches a missing truncation.
-    let result = cache.store_cert(&domains, DIRECTORY_URL, b"new key").await;
-
-    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    result.unwrap();
-    assert_eq!(fs::read(&file).unwrap(), b"new key");
-    assert_eq!(mode(&file), "640", "cache file {file:?}");
-    assert_eq!(
-        fs::read_dir(&cache_dir).unwrap().count(),
-        1,
-        "the cache directory holds files other than the certificate"
-    );
-}
-
-/// A store into a directory that other users can write never writes in place.
-///
-/// Mode `0o507` denies the owner write access, which forces the in-place path.
-#[tokio::test]
-async fn store_into_world_writable_directory_does_not_write_in_place() {
-    if is_root() {
-        return;
-    }
-    set_common_umask();
-    let dir = tempfile::tempdir().unwrap();
-    let cache_dir = dir.path().join("cache");
-    let cache = DirCache::new(&cache_dir);
-    let domains = ["example.com".to_string()];
-
-    cache
-        .store_cert(&domains, DIRECTORY_URL, b"old key and chain")
-        .await
-        .unwrap();
-    let file = cache_file(&cache_dir, "cached_cert_");
-    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o507)).unwrap();
-
-    let result = cache.store_cert(&domains, DIRECTORY_URL, b"new key").await;
-
-    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let err = result.expect_err("the store wrote in place in a world-writable directory");
-    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-    assert_eq!(fs::read(&file).unwrap(), b"old key and chain");
-}
-
-/// A store of a new entry into a directory without write access fails.
-#[tokio::test]
-async fn store_of_new_entry_into_read_only_directory_fails() {
+async fn store_into_read_only_directory_fails() {
     if is_root() {
         return;
     }
