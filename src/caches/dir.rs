@@ -53,9 +53,11 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///   happens when another user owns the old file. Let the user of the process
 ///   own the file to fix this.
 ///
-/// On Unix, the cache never writes in place in a directory that other users
-/// can write. Such a user could plant a file there and read the key from it.
-/// The store then fails with the original error.
+/// On Unix, the cache writes in place only into a regular file with a single
+/// link. The user of the process or root must own the file. Another user could
+/// plant a file at the cache name and read the key from it. The cache also
+/// never writes in place in a directory that all users can write. In these
+/// cases, the store fails with the original error.
 ///
 /// On Unix, the cache writes each new file with mode `0o600`. If the directory
 /// does not exist, the cache creates it with mode `0o700`. Missing parents of
@@ -64,9 +66,11 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// A store that replaces a file keeps the group and the group bits of the old
 /// file. Thus a sidecar with group access can still read the new file. The
-/// user of the process owns the new file. If the cache cannot give the new file
-/// the group of the old file, the new file gets no group bits. The new file
-/// never gets permission bits for other users.
+/// user of the process owns the new file. The cache keeps the group only if
+/// the user of the process or root owns the old file. A file of another user
+/// could be a trap that grants its group access to the key. If the cache does
+/// not keep the group, the new file gets no group bits. The new file never
+/// gets permission bits for other users.
 ///
 /// The new file does not keep an ACL of the old file. On a file with an ACL,
 /// the group bits show the ACL mask. Thus the owning group of the new file gets
@@ -146,13 +150,16 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
                 if !may_write_in_place(dir).await {
                     return Err(err);
                 }
+                let Some(handle) = open_in_place(&target, &old).await? else {
+                    return Err(err);
+                };
                 log::warn!(
                     "cannot create a temporary file in {}: {err}. Writing {} in place. \
                      Give the process write access to the directory for crash-safe writes.",
                     dir.display(),
                     target.display(),
                 );
-                return write_in_place(&target, &old, contents).await;
+                return overwrite(handle, contents).await;
             }
             Err(err) => return Err(err),
         };
@@ -173,24 +180,26 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
         if let Err(err) = fs::rename(&temp_path, &target).await {
             fs::remove_file(&temp_path).await.ok();
             // `PermissionDenied` covers a sticky directory in which another
-            // user owns the old file. The in-place write may still work there.
+            // user owns the old file. If root owns it, the in-place write may
+            // still work.
             let cannot_replace = matches!(
                 err.kind(),
                 ErrorKind::ResourceBusy | ErrorKind::CrossesDevices | ErrorKind::PermissionDenied
             );
             let in_place = old.is_some() && cannot_replace && may_write_in_place(dir).await;
-            return match old {
-                Some(old) if in_place => {
-                    log::warn!(
-                        "cannot replace {}: {err}. Writing it in place. \
-                         A crash during this write can leave a truncated file. \
-                         See the DirCache docs for setups with crash-safe writes.",
-                        target.display(),
-                    );
-                    write_in_place(&target, &old, contents).await
-                }
-                _ => Err(err),
+            let Some(old) = old.filter(|_| in_place) else {
+                return Err(err);
             };
+            let Some(handle) = open_in_place(&target, &old).await? else {
+                return Err(err);
+            };
+            log::warn!(
+                "cannot replace {}: {err}. Writing it in place. \
+                 A crash during this write can leave a truncated file. \
+                 See the DirCache docs for setups with crash-safe writes.",
+                target.display(),
+            );
+            return overwrite(handle, contents).await;
         }
         #[cfg(unix)]
         sync_dir(dir).await?;
@@ -382,8 +391,11 @@ async fn write_and_sync(mut file: fs::File, contents: &[u8]) -> Result<(), std::
 /// Gives the new `file` the group and the group bits of the `old` file.
 ///
 /// The file keeps mode `0o600` if the old file has no group bits or if the
-/// function cannot change the group. Bits for other users never carry over.
-/// The function sets the mode explicitly, so the umask does not apply.
+/// function cannot change the group. It also keeps that mode if neither the
+/// user of the process nor root owns the old file. Another user could plant
+/// a file with a group of their choice, and a process of root could join it.
+/// Bits for other users never carry over. The function sets the mode
+/// explicitly, so the umask does not apply.
 ///
 /// The calls only change the open file, so the function runs them directly
 /// instead of on a blocking thread.
@@ -391,6 +403,13 @@ async fn write_and_sync(mut file: fs::File, contents: &[u8]) -> Result<(), std::
 async fn keep_group_access(file: fs::File, old: &Metadata) -> Result<fs::File, std::io::Error> {
     let group_bits = old.mode() & 0o070;
     if group_bits == 0 {
+        return Ok(file);
+    }
+    if !is_trusted_owner(old.uid(), euid()) {
+        log::warn!(
+            "the old cache file belongs to user {}, so the new file gets no group access.",
+            old.uid(),
+        );
         return Ok(file);
     }
     let file = file.into_std().await;
@@ -442,24 +461,44 @@ async fn may_write_in_place(_dir: &Path) -> bool {
     true
 }
 
-/// Overwrites the existing regular file `target` with `contents` in place.
+/// Opens `target` for an in-place write if the cache may write it there.
 ///
-/// The function checks that the opened file is still the `old` file. Thus it
-/// does not write through a symlink that replaced the file after the check.
+/// The function returns `None` if the cache must not write the file. It opens the file without truncating it. It then checks that the
+/// handle refers to the `old` file. Thus it does not write through a symlink
+/// that replaced the file after the check. On Unix, the file must also pass
+/// [`may_overwrite`]. The open does not follow a symlink and does not block on
+/// a FIFO.
+async fn open_in_place(target: &Path, old: &Metadata) -> Result<Option<fs::File>, std::io::Error> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(target).await?;
+    let metadata = file.metadata().await?;
+    if !is_same_file(&metadata, old) {
+        log::warn!(
+            "{} changed during the store, so the cache does not write it in place.",
+            target.display()
+        );
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    if !may_overwrite(&metadata, euid()) {
+        log::warn!(
+            "{} is not a regular file with one link of this user or root, \
+             so the cache does not write it in place.",
+            target.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+/// Overwrites the opened `file` with `contents` and syncs it.
+///
 /// The file keeps its mode. A crash during the write can leave a truncated
 /// file behind.
-async fn write_in_place(
-    target: &Path,
-    old: &Metadata,
-    contents: &[u8],
-) -> Result<(), std::io::Error> {
-    let file = fs::OpenOptions::new().write(true).open(target).await?;
-    if !is_same_file(&file.metadata().await?, old) {
-        return Err(std::io::Error::other(format!(
-            "{} changed during the store",
-            target.display()
-        )));
-    }
+async fn overwrite(file: fs::File, contents: &[u8]) -> Result<(), std::io::Error> {
     file.set_len(0).await?;
     write_and_sync(file, contents).await
 }
@@ -477,4 +516,66 @@ fn is_same_file(a: &Metadata, b: &Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_same_file(a: &Metadata, _b: &Metadata) -> bool {
     a.is_file()
+}
+
+/// Returns the effective user ID of the process.
+#[cfg(unix)]
+fn euid() -> u32 {
+    // SAFETY: `geteuid` only reads the effective user ID and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Returns whether the cache trusts a file that the user `uid` owns.
+///
+/// The cache trusts files of the user `euid` of the process and of root.
+/// Another user could plant a file at a cache name to read the key.
+#[cfg(unix)]
+fn is_trusted_owner(uid: u32, euid: u32) -> bool {
+    uid == euid || uid == 0
+}
+
+/// Returns whether the cache may write the file with `metadata` in place.
+///
+/// The file must be a regular file with a single link, and its owner must
+/// pass [`is_trusted_owner`]. A second link could expose the key under a
+/// name that the cache does not control.
+#[cfg(unix)]
+fn may_overwrite(metadata: &Metadata, euid: u32) -> bool {
+    metadata.is_file() && metadata.nlink() == 1 && is_trusted_owner(metadata.uid(), euid)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusts_own_files_and_files_of_root() {
+        assert!(is_trusted_owner(1000, 1000));
+        assert!(is_trusted_owner(0, 1000));
+        assert!(is_trusted_owner(0, 0));
+        assert!(!is_trusted_owner(1001, 1000));
+        assert!(!is_trusted_owner(1000, 0));
+    }
+
+    #[test]
+    fn overwrites_only_single_linked_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"key").unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let owner = metadata.uid();
+        assert!(may_overwrite(&metadata, owner));
+
+        // A user ID that neither owns the file nor is root.
+        let stranger = if owner == 1 { 2 } else { 1 };
+        assert_eq!(may_overwrite(&metadata, stranger), owner == 0);
+
+        std::fs::hard_link(&file, dir.path().join("link")).unwrap();
+        assert!(!may_overwrite(&std::fs::metadata(&file).unwrap(), owner));
+
+        assert!(!may_overwrite(
+            &std::fs::metadata(dir.path()).unwrap(),
+            owner
+        ));
+    }
 }
