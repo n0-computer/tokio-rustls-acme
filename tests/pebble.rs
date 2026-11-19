@@ -1,36 +1,49 @@
-//! Integration tests against a Pebble ACME test server.
+//! Integration tests against a Pebble ACME test server that validates challenges.
 //!
-//! These tests require a running Pebble instance.
-//! Start it with: `docker compose -f docker-compose.pebble.yml up -d`
+//! They require Pebble and `challtestsrv` from `docker-compose.pebble.yml`:
+//! `docker compose -f docker-compose.pebble.yml up -d`
+//!
+//! Each test resolves its domains to its own loopback address, from `127.0.0.2` up, and serves
+//! port 5001 there. Thus the tests can run in parallel.
 //!
 //! Set `PEBBLE_MINICA_CERT` to the path of Pebble's minica root cert:
 //!   `docker compose -f docker-compose.pebble.yml cp pebble:/test/certs/pebble.minica.pem ./pebble.minica.pem`
 //!   `export PEBBLE_MINICA_CERT=./pebble.minica.pem`
 //!
-//! Run with: `cargo test --test pebble -- --ignored`
+//! Run with: `cargo test --test pebble -- --ignored`, or all of the above with `cargo make test`.
 
-use std::{convert::TryFrom, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::StreamExt;
 use rustls::{
     ClientConfig, DEFAULT_VERSIONS, RootCertStore, ServerConfig,
+    client::{WebPkiServerVerifier, danger::ServerCertVerifier},
     crypto::CryptoProvider,
-    pki_types::{CertificateDer, ServerName},
+    pki_types::{CertificateDer, ServerName, UnixTime},
 };
-use tokio_rustls::TlsAcceptor;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    task::JoinSet,
+};
+use tokio_rustls::TlsConnector;
 use tokio_rustls_acme::{
-    AccountCache, AcmeConfig, CertCache, EventOk, ResolvesServerCertAcme,
+    AccountCache, AcmeAcceptor, AcmeConfig, AcmeState, CertCache, EventError, EventOk, OrderError,
     caches::{DirCache, NoCache},
 };
 
 const PEBBLE_DIRECTORY: &str = "https://localhost:14000/dir";
 const PEBBLE_MGMT: &str = "https://localhost:15000";
-const TEST_DOMAIN: &str = "pebble-test.example.com";
-const TEST_DOMAINS: &[&str] = &[
-    "pebble-multi-1.example.com",
-    "pebble-multi-2.example.com",
-    "pebble-multi-3.example.com",
-];
+/// Management API of `challtestsrv`, the DNS server that Pebble's VA queries.
+const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8055";
+/// The tls-alpn-01 port, `tlsPort` in `test/pebble-config.json`.
+const TLS_ALPN_PORT: u16 = 5001;
+const ORDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Read the Pebble minica root cert from the path in PEBBLE_MINICA_CERT.
 fn load_minica_cert() -> Vec<u8> {
@@ -65,6 +78,12 @@ fn pebble_client_config() -> Arc<ClientConfig> {
     )
 }
 
+fn pebble_config(domains: &[&str]) -> AcmeConfig<io::Error> {
+    AcmeConfig::new_with_client_tls_config(domains, pebble_client_config())
+        .directory(PEBBLE_DIRECTORY)
+        .cache(NoCache::new())
+}
+
 /// Reqwest client that talks to Pebble's management API.
 ///
 /// Installs ring as the process-wide default `CryptoProvider` so reqwest's
@@ -80,26 +99,25 @@ fn http_client() -> reqwest::Client {
         .unwrap()
 }
 
-/// Fetch Pebble's ACME-issued root + intermediate certs and build a root store
-/// for verifying certs issued by Pebble's CA.
+/// Fetches the roots of Pebble's ACME CA as a root store, without intermediates.
 async fn pebble_acme_root_store() -> RootCertStore {
     let client = http_client();
     let mut root_store = RootCertStore::empty();
 
-    // Fetch up to 2 roots and intermediates (index 1 only exists when
-    // PEBBLE_ALTERNATE_ROOTS is enabled). 404s are expected and skipped.
-    for kind in &["roots", "intermediates"] {
-        for index in 0..2 {
-            let url = format!("{PEBBLE_MGMT}/{kind}/{index}");
-            let resp = client.get(&url).send().await.unwrap_or_else(|e| {
-                panic!("failed to reach Pebble management API at {}: {}", url, e)
-            });
-            if resp.status().is_success() {
-                let pem_text = resp.text().await.unwrap();
-                for p in pem::parse_many(&pem_text).unwrap() {
-                    let der = CertificateDer::from(p.into_contents());
-                    let _ = root_store.add(der);
-                }
+    // Index 1 only exists with PEBBLE_ALTERNATE_ROOTS, so a 404 there is expected.
+    for index in 0..2 {
+        let url = format!("{PEBBLE_MGMT}/roots/{index}");
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("failed to reach Pebble management API at {url}: {e}"));
+        if resp.status().is_success() {
+            let pem_text = resp.text().await.unwrap();
+            for p in pem::parse_many(&pem_text).unwrap() {
+                root_store
+                    .add(CertificateDer::from(p.into_contents()))
+                    .expect("failed to add Pebble root to root store");
             }
         }
     }
@@ -111,6 +129,185 @@ async fn pebble_acme_root_store() -> RootCertStore {
     root_store
 }
 
+/// Makes the DNS server of Pebble's VA resolve `domain` to `addr` only.
+async fn set_dns_record(domain: &str, addr: IpAddr) {
+    let kind = match addr {
+        IpAddr::V4(_) => "a",
+        IpAddr::V6(_) => "aaaa",
+    };
+    let host = format!("{domain}.");
+    let client = http_client();
+    // `add-a` appends to the records of earlier runs, so clear them first.
+    for (path, body) in [
+        (format!("clear-{kind}"), serde_json::json!({ "host": host })),
+        (
+            format!("add-{kind}"),
+            serde_json::json!({ "host": host, "addresses": [addr.to_string()] }),
+        ),
+    ] {
+        let url = format!("{CHALLTESTSRV_MGMT}/{path}");
+        let resp = client
+            .post(&url)
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("failed to reach challtestsrv at {url}: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "{url} returned {}",
+            resp.status()
+        );
+    }
+}
+
+/// An ACME state machine whose own [`AcmeAcceptor`] answers Pebble's tls-alpn-01 validation.
+struct Site {
+    state: AcmeState<io::Error>,
+    listeners: JoinSet<()>,
+}
+
+impl Site {
+    async fn bind(config: AcmeConfig<io::Error>, addrs: &[IpAddr]) -> Self {
+        let state = config.state();
+        let acceptor = state.acceptor();
+        let server_config = Arc::new(
+            ServerConfig::builder_with_provider(state.crypto_provider())
+                .with_protocol_versions(DEFAULT_VERSIONS)
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(state.resolver()),
+        );
+        let mut listeners = JoinSet::new();
+        for &addr in addrs {
+            let listener = TcpListener::bind((addr, TLS_ALPN_PORT))
+                .await
+                .unwrap_or_else(|e| panic!("failed to bind {addr}:{TLS_ALPN_PORT}: {e}"));
+            listeners.spawn(serve(listener, acceptor.clone(), server_config.clone()));
+        }
+        Self { state, listeners }
+    }
+
+    /// Polls the state machine until it deploys a new certificate or an order fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics on other errors and after [`ORDER_TIMEOUT`].
+    // The crate returns `OrderError` by value in its events too.
+    #[allow(clippy::result_large_err)]
+    async fn deploy(&mut self) -> Result<(), OrderError> {
+        tokio::time::timeout(ORDER_TIMEOUT, async {
+            loop {
+                match self.state.next().await {
+                    Some(Ok(EventOk::DeployedNewCert)) => return Ok(()),
+                    Some(Ok(_)) => {}
+                    Some(Err(EventError::Order(err))) => return Err(err),
+                    Some(Err(err)) => panic!("ACME error: {err:?}"),
+                    None => panic!("state stream ended unexpectedly"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for certificate deployment")
+    }
+
+    /// Closes the listeners and waits until their ports are free.
+    async fn close(mut self) {
+        self.listeners.shutdown().await;
+    }
+}
+
+async fn serve(listener: TcpListener, acceptor: AcmeAcceptor, server_config: Arc<ServerConfig>) {
+    let mut connections = JoinSet::new();
+    loop {
+        let (tcp, peer) = listener.accept().await.expect("accept failed");
+        while connections.try_join_next().is_some() {}
+        let acceptor = acceptor.clone();
+        let server_config = server_config.clone();
+        connections.spawn(async move {
+            match acceptor.accept(tcp).await {
+                Ok(None) => eprintln!("served tls-alpn-01 challenge to {peer}"),
+                Ok(Some(start)) => {
+                    if let Err(err) = start.into_stream(server_config).await {
+                        eprintln!("TLS handshake with {peer} failed: {err}");
+                    }
+                }
+                Err(err) => eprintln!("TLS accept from {peer} failed: {err}"),
+            }
+        });
+    }
+}
+
+/// Connects to `addr` on the tls-alpn-01 port and returns the verified chain served for `name`.
+async fn fetch_chain(addr: IpAddr, name: ServerName<'static>) -> Vec<CertificateDer<'static>> {
+    let connector = TlsConnector::from(Arc::new(
+        ClientConfig::builder_with_provider(test_crypto_provider())
+            .with_protocol_versions(DEFAULT_VERSIONS)
+            .unwrap()
+            .with_root_certificates(pebble_acme_root_store().await)
+            .with_no_client_auth(),
+    ));
+    let tcp = TcpStream::connect((addr, TLS_ALPN_PORT))
+        .await
+        .unwrap_or_else(|e| panic!("failed to connect to {addr}:{TLS_ALPN_PORT}: {e}"));
+    let tls = connector
+        .connect(name.clone(), tcp)
+        .await
+        .unwrap_or_else(|e| panic!("TLS handshake with {addr} as {name:?} failed: {e}"));
+    let chain = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .expect("no peer certificates");
+    assert!(!chain.is_empty(), "should have received certificates");
+    chain.to_vec()
+}
+
+async fn fetch_chain_for(addr: IpAddr, domain: &str) -> Vec<CertificateDer<'static>> {
+    fetch_chain(addr, ServerName::try_from(domain.to_owned()).unwrap()).await
+}
+
+/// Asserts that `chain` verifies for `domain` against Pebble's roots only with its intermediates.
+async fn assert_needs_intermediates(chain: &[CertificateDer<'static>], domain: &str) {
+    let roots = Arc::new(pebble_acme_root_store().await);
+    let verifier = WebPkiServerVerifier::builder_with_provider(roots, test_crypto_provider())
+        .build()
+        .unwrap();
+    let name = ServerName::try_from(domain.to_owned()).unwrap();
+    let now = UnixTime::now();
+    let (leaf, intermediates) = chain.split_first().expect("empty chain");
+    verifier
+        .verify_server_cert(leaf, intermediates, &name, &[], now)
+        .expect("chain should verify against Pebble's roots");
+    assert!(
+        verifier
+            .verify_server_cert(leaf, &[], &name, &[], now)
+            .is_err(),
+        "leaf without intermediates should not verify against Pebble's roots"
+    );
+}
+
+/// Returns the path of the only file in `dir` whose name starts with `prefix`.
+fn cache_file(dir: &Path, prefix: &str) -> PathBuf {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "expected one {prefix}* file in {}",
+        dir.display()
+    );
+    files.remove(0)
+}
+
 /// Collected events from a single ACME state machine run.
 #[derive(Default, Debug)]
 struct AcmeEvents {
@@ -118,28 +315,22 @@ struct AcmeEvents {
     deployed_new: bool,
     cert_cache_store: bool,
     account_cache_store: bool,
+    cached_cert_parse_error: bool,
 }
 
-/// Run the ACME state machine until a certificate is deployed, collecting events.
-async fn acquire_cert_with_cache<C>(
-    client_config: Arc<ClientConfig>,
-    cache: C,
-) -> (Arc<ResolvesServerCertAcme>, AcmeEvents)
+async fn acquire_cert_with_cache<C>(domain: &str, addr: IpAddr, cache: C) -> (Site, AcmeEvents)
 where
     C: CertCache<EC = io::Error> + AccountCache<EA = io::Error> + Send + Sync + 'static,
 {
-    let config: AcmeConfig<io::Error> =
-        AcmeConfig::new_with_client_tls_config([TEST_DOMAIN], client_config)
-            .directory(PEBBLE_DIRECTORY)
-            .cache(cache);
-
-    let mut state = config.state();
-    let resolver = state.resolver();
+    let config = AcmeConfig::new_with_client_tls_config([domain], pebble_client_config())
+        .directory(PEBBLE_DIRECTORY)
+        .cache(cache);
+    let mut site = Site::bind(config, &[addr]).await;
     let mut events = AcmeEvents::default();
 
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(ORDER_TIMEOUT, async {
         loop {
-            match state.next().await {
+            match site.state.next().await {
                 Some(Ok(EventOk::DeployedCachedCert)) => {
                     eprintln!("event: DeployedCachedCert");
                     events.deployed_cached = true;
@@ -149,7 +340,7 @@ where
                     eprintln!("event: DeployedNewCert");
                     events.deployed_new = true;
                     // Continue to collect the CertCacheStore event that follows.
-                    // Event ordering: AccountCacheStore → DeployedNewCert → CertCacheStore.
+                    // Event order: AccountCacheStore, DeployedNewCert, CertCacheStore.
                 }
                 Some(Ok(EventOk::CertCacheStore)) => {
                     eprintln!("event: CertCacheStore");
@@ -160,6 +351,10 @@ where
                     eprintln!("event: AccountCacheStore");
                     events.account_cache_store = true;
                 }
+                Some(Err(EventError::CachedCertParse(err))) => {
+                    eprintln!("event: CachedCertParse: {err}");
+                    events.cached_cert_parse_error = true;
+                }
                 Some(Err(err)) => panic!("ACME error: {:?}", err),
                 None => panic!("state stream ended unexpectedly"),
             }
@@ -168,61 +363,7 @@ where
     .await
     .expect("timed out waiting for certificate deployment");
 
-    (resolver, events)
-}
-
-/// Run the ACME state machine with NoCache until a certificate is deployed.
-async fn acquire_cert(client_config: Arc<ClientConfig>) -> Arc<ResolvesServerCertAcme> {
-    let (resolver, _) = acquire_cert_with_cache(client_config, NoCache::new()).await;
-    resolver
-}
-
-/// Do an in-process TLS handshake using the resolver and verify it succeeds.
-async fn verify_tls_handshake(
-    resolver: Arc<ResolvesServerCertAcme>,
-    root_store: RootCertStore,
-) -> Vec<CertificateDer<'static>> {
-    verify_tls_handshake_for(resolver, root_store, TEST_DOMAIN).await
-}
-
-/// Do an in-process TLS handshake against a specific domain name.
-async fn verify_tls_handshake_for(
-    resolver: Arc<ResolvesServerCertAcme>,
-    root_store: RootCertStore,
-    domain: &str,
-) -> Vec<CertificateDer<'static>> {
-    let server_config = Arc::new(
-        ServerConfig::builder_with_provider(test_crypto_provider())
-            .with_protocol_versions(DEFAULT_VERSIONS)
-            .unwrap()
-            .with_no_client_auth()
-            .with_cert_resolver(resolver),
-    );
-    let acceptor = TlsAcceptor::from(server_config);
-
-    let client_config = Arc::new(
-        ClientConfig::builder_with_provider(test_crypto_provider())
-            .with_protocol_versions(DEFAULT_VERSIONS)
-            .unwrap()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    );
-    let connector = tokio_rustls::TlsConnector::from(client_config);
-
-    let (client_io, server_io) = tokio::io::duplex(4096);
-    let server_name = ServerName::try_from(domain).unwrap().to_owned();
-
-    let (client_result, server_result) = tokio::join!(
-        connector.connect(server_name, client_io),
-        acceptor.accept(server_io),
-    );
-
-    let _ = server_result.expect("TLS server handshake failed");
-    let client_tls = client_result.expect("TLS client handshake failed");
-    let (_, conn) = client_tls.get_ref();
-    conn.peer_certificates()
-        .expect("no peer certificates")
-        .to_vec()
+    (site, events)
 }
 
 /// Obtain a cert with the default chain and verify it can serve TLS.
@@ -234,13 +375,16 @@ async fn verify_tls_handshake_for(
 async fn test_default_chain() {
     let _ = simple_logger::init_with_level(log::Level::Info);
 
-    let client_config = pebble_client_config();
-    let resolver = acquire_cert(client_config).await;
+    let domain = "default-chain.example.com";
+    let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+    set_dns_record(domain, addr).await;
 
-    let root_store = pebble_acme_root_store().await;
-    let peer_certs = verify_tls_handshake(resolver, root_store).await;
-    assert!(!peer_certs.is_empty(), "should have received certificates");
+    let mut site = Site::bind(pebble_config(&[domain]), &[addr]).await;
+    site.deploy().await.expect("order failed");
+
+    let peer_certs = fetch_chain_for(addr, domain).await;
     eprintln!("default chain: received {} certificates", peer_certs.len());
+    assert_needs_intermediates(&peer_certs, domain).await;
 }
 
 /// Verify that DirCache persists certs and a second run loads from cache.
@@ -253,13 +397,15 @@ async fn test_default_chain() {
 async fn test_dir_cache_stores_and_reloads() {
     let _ = simple_logger::init_with_level(log::Level::Info);
 
+    let domain = "dir-cache.example.com";
+    let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+    set_dns_record(domain, addr).await;
     let cache_dir = tempfile::tempdir().unwrap();
     let cache_path: PathBuf = cache_dir.path().into();
 
     // First run: fresh order, should store to cache.
-    let client_config = pebble_client_config();
-    let (resolver, events) =
-        acquire_cert_with_cache(client_config.clone(), DirCache::new(cache_path.clone())).await;
+    let (site, events) =
+        acquire_cert_with_cache(domain, addr, DirCache::new(cache_path.clone())).await;
     assert!(events.deployed_new, "first run should deploy a new cert");
     assert!(
         events.cert_cache_store,
@@ -267,13 +413,11 @@ async fn test_dir_cache_stores_and_reloads() {
     );
 
     // Verify the cert works.
-    let root_store = pebble_acme_root_store().await;
-    let peer_certs = verify_tls_handshake(resolver, root_store).await;
-    assert!(!peer_certs.is_empty());
+    fetch_chain_for(addr, domain).await;
+    site.close().await;
 
     // Second run: same cache dir, should load from cache without ordering.
-    let (resolver2, events2) =
-        acquire_cert_with_cache(client_config, DirCache::new(cache_path)).await;
+    let (_site, events2) = acquire_cert_with_cache(domain, addr, DirCache::new(cache_path)).await;
     assert!(
         events2.deployed_cached,
         "second run should deploy cached cert"
@@ -284,249 +428,116 @@ async fn test_dir_cache_stores_and_reloads() {
     );
 
     // Verify the cached cert also works.
-    let root_store = pebble_acme_root_store().await;
-    let peer_certs = verify_tls_handshake(resolver2, root_store).await;
-    assert!(!peer_certs.is_empty());
+    fetch_chain_for(addr, domain).await;
 }
 
-/// Verify that the account key is cached and reused across runs.
-///
-/// Without account caching, every run generates a new ACME account. With
-/// DirCache, the account key should be stored on first run and loaded on
-/// subsequent runs, avoiding unnecessary account registrations.
+/// A cached cert that cannot be parsed triggers re-issuance with the cached account key.
 #[tokio::test]
 #[ignore]
-async fn test_account_cache_reuse() {
+async fn test_corrupted_cache_reissues_with_cached_account() {
     let _ = simple_logger::init_with_level(log::Level::Info);
 
+    let domain = "corrupted-cache.example.com";
+    let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5));
+    set_dns_record(domain, addr).await;
     let cache_dir = tempfile::tempdir().unwrap();
     let cache_path: PathBuf = cache_dir.path().into();
 
-    // First run: registers a new account, stores it.
-    let client_config = pebble_client_config();
-    let (_, events) =
-        acquire_cert_with_cache(client_config.clone(), DirCache::new(cache_path.clone())).await;
+    let (site, events) =
+        acquire_cert_with_cache(domain, addr, DirCache::new(cache_path.clone())).await;
     assert!(
-        events.account_cache_store,
-        "first run should store account to cache"
+        events.deployed_new && events.account_cache_store,
+        "first run should issue a cert and store the account, got {events:?}"
     );
+    site.close().await;
 
-    // Check that account file was written.
-    let entries: Vec<_> = std::fs::read_dir(&cache_path)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("cached_account_"))
-        })
-        .collect();
-    assert_eq!(entries.len(), 1, "should have exactly one cached account");
+    let account_file = cache_file(&cache_path, "cached_account_");
+    let account_key = std::fs::read(&account_file).unwrap();
+    std::fs::write(cache_file(&cache_path, "cached_cert_"), b"not a valid PEM").unwrap();
 
-    // Second run: should load the cached account (no AccountCacheStore event).
-    let (_, events2) = acquire_cert_with_cache(client_config, DirCache::new(cache_path)).await;
+    let (_site, events) = acquire_cert_with_cache(domain, addr, DirCache::new(cache_path)).await;
     assert!(
-        !events2.account_cache_store,
+        events.cached_cert_parse_error && events.deployed_new && !events.deployed_cached,
+        "second run should reject the cached cert and issue a new one, got {events:?}"
+    );
+    assert!(
+        !events.account_cache_store,
         "second run should load cached account, not store a new one"
     );
-}
-
-/// Verify that a corrupted cache file triggers re-issuance instead of crashing.
-///
-/// If a cached cert PEM is truncated or invalid, the state machine should
-/// emit a CachedCertParse error but recover by placing a new ACME order,
-/// ultimately deploying a fresh certificate.
-#[tokio::test]
-#[ignore]
-async fn test_corrupted_cache_triggers_reissue() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
-
-    let cache_dir = tempfile::tempdir().unwrap();
-    let cache_path: PathBuf = cache_dir.path().into();
-
-    // First run: obtain and cache a valid cert.
-    let client_config = pebble_client_config();
-    let (_, events) =
-        acquire_cert_with_cache(client_config.clone(), DirCache::new(cache_path.clone())).await;
-    assert!(events.deployed_new);
-
-    // Corrupt the cached cert file.
-    let cert_file = std::fs::read_dir(&cache_path)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .find(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("cached_cert_"))
-        })
-        .expect("should have a cached cert file");
-    std::fs::write(cert_file.path(), b"not a valid PEM").unwrap();
-
-    // Second run: should detect corruption, fall back to new order.
-    let config: AcmeConfig<io::Error> =
-        AcmeConfig::new_with_client_tls_config([TEST_DOMAIN], client_config)
-            .directory(PEBBLE_DIRECTORY)
-            .cache(DirCache::new(cache_path));
-
-    let mut state = config.state();
-    let resolver = state.resolver();
-
-    let mut saw_parse_error = false;
-    let mut deployed_new = false;
-
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match state.next().await {
-                Some(Ok(EventOk::DeployedNewCert)) => {
-                    deployed_new = true;
-                }
-                Some(Ok(EventOk::CertCacheStore)) => {
-                    return;
-                }
-                Some(Ok(_)) => {}
-                Some(Err(err)) => {
-                    let msg = format!("{:?}", err);
-                    if msg.contains("CachedCertParse") {
-                        eprintln!("got expected CachedCertParse error");
-                        saw_parse_error = true;
-                    } else {
-                        panic!("unexpected ACME error: {:?}", err);
-                    }
-                }
-                None => panic!("state stream ended unexpectedly"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for recovery from corrupted cache");
-
-    assert!(
-        saw_parse_error,
-        "should have seen CachedCertParse error for corrupted file"
+    assert_eq!(
+        std::fs::read(&account_file).unwrap(),
+        account_key,
+        "second run should not replace the cached account key"
     );
-    assert!(deployed_new, "should have recovered by issuing a new cert");
-
-    // Verify the fresh cert works.
-    let root_store = pebble_acme_root_store().await;
-    let peer_certs = verify_tls_handshake(resolver, root_store).await;
-    assert!(!peer_certs.is_empty());
+    fetch_chain_for(addr, domain).await;
 }
 
 /// Verify that the state machine automatically renews an expiring certificate.
 ///
-/// Pebble is configured with a 10-second certificate validity period. The
-/// renewal timer fires at 2/3 of the validity window (~6.7s), so within
-/// about 10 seconds the state machine should issue a second certificate
-/// without any external prompting.
+/// Pebble picks a random profile from `test/pebble-config.json`, so every profile there must
+/// keep the validity short enough to renew within [`ORDER_TIMEOUT`].
 #[tokio::test]
 #[ignore]
 async fn test_automatic_renewal() {
     let _ = simple_logger::init_with_level(log::Level::Info);
 
-    let cache_dir = tempfile::tempdir().unwrap();
-    let client_config = pebble_client_config();
-    let config: AcmeConfig<io::Error> =
-        AcmeConfig::new_with_client_tls_config([TEST_DOMAIN], client_config)
-            .directory(PEBBLE_DIRECTORY)
-            .cache(DirCache::new(cache_dir.path().to_path_buf()));
+    let domain = "renewal.example.com";
+    let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 6));
+    set_dns_record(domain, addr).await;
 
-    let mut state = config.state();
-    let resolver = state.resolver();
+    let mut site = Site::bind(pebble_config(&[domain]), &[addr]).await;
+    site.deploy().await.expect("initial order failed");
+    site.deploy().await.expect("renewal order failed");
 
-    let mut deploy_count = 0u32;
-
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match state.next().await {
-                Some(Ok(EventOk::DeployedNewCert)) => {
-                    deploy_count += 1;
-                    eprintln!("deployed new cert #{deploy_count}");
-                    if deploy_count >= 2 {
-                        return;
-                    }
-                }
-                Some(Ok(event)) => eprintln!("event: {event:?}"),
-                Some(Err(err)) => {
-                    eprintln!("ACME error (continuing): {:?}", err);
-                }
-                None => panic!("state stream ended unexpectedly"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for automatic renewal");
-
-    assert!(
-        deploy_count >= 2,
-        "should have deployed at least 2 certs (initial + renewal), got {}",
-        deploy_count
-    );
-
-    // Verify the renewed cert works.
-    let root_store = pebble_acme_root_store().await;
-    let peer_certs = verify_tls_handshake(resolver, root_store).await;
-    assert!(!peer_certs.is_empty());
+    fetch_chain_for(addr, domain).await;
 }
 
 /// Issue a certificate with multiple SAN domains and verify all are present.
-///
-/// Exercises the multi-domain code path in `new_order`, where the order
-/// contains multiple identifiers. The resulting certificate should list
-/// all requested domains as Subject Alternative Names.
 #[tokio::test]
 #[ignore]
 async fn test_multi_domain_san() {
     let _ = simple_logger::init_with_level(log::Level::Info);
 
-    let client_config = pebble_client_config();
-    let config: AcmeConfig<io::Error> =
-        AcmeConfig::new_with_client_tls_config(TEST_DOMAINS, client_config)
-            .directory(PEBBLE_DIRECTORY)
-            .cache(NoCache::new());
-
-    let mut state = config.state();
-    let resolver = state.resolver();
-
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match state.next().await {
-                Some(Ok(EventOk::DeployedNewCert)) => return,
-                Some(Ok(_)) => {}
-                Some(Err(err)) => panic!("ACME error: {:?}", err),
-                None => panic!("state stream ended unexpectedly"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for multi-domain cert");
-
-    let root_store = pebble_acme_root_store().await;
-    let peer_certs = verify_tls_handshake_for(resolver, root_store, TEST_DOMAINS[0]).await;
-    assert!(!peer_certs.is_empty());
-
-    // Parse the leaf certificate and check SANs.
-    let leaf_der = &peer_certs[0];
-    let (_, leaf) = x509_parser::parse_x509_certificate(leaf_der.as_ref()).unwrap();
-    let sans: Vec<String> = leaf
-        .subject_alternative_name()
-        .expect("SAN extension missing")
-        .expect("SAN extension empty")
-        .value
-        .general_names
-        .iter()
-        .filter_map(|name| match name {
-            x509_parser::extensions::GeneralName::DNSName(dns) => Some(dns.to_string()),
-            _ => None,
-        })
-        .collect();
-
-    for domain in TEST_DOMAINS {
-        assert!(
-            sans.contains(&domain.to_string()),
-            "SAN should contain {}, got: {:?}",
-            domain,
-            sans
-        );
+    let hosts = [
+        ("multi-1.example.com", Ipv4Addr::new(127, 0, 0, 7)),
+        ("multi-2.example.com", Ipv4Addr::new(127, 0, 0, 8)),
+        ("multi-3.example.com", Ipv4Addr::new(127, 0, 0, 9)),
+    ]
+    .map(|(domain, addr)| (domain, IpAddr::V4(addr)));
+    for (domain, addr) in hosts {
+        set_dns_record(domain, addr).await;
     }
-    eprintln!("multi-domain SANs: {sans:?}");
+    let domains = hosts.map(|(domain, _)| domain);
+    let addrs = hosts.map(|(_, addr)| addr);
+
+    let mut site = Site::bind(pebble_config(&domains), &addrs).await;
+    site.deploy().await.expect("order failed");
+
+    for (domain, addr) in hosts {
+        let peer_certs = fetch_chain_for(addr, domain).await;
+
+        let (_, leaf) = x509_parser::parse_x509_certificate(peer_certs[0].as_ref()).unwrap();
+        let sans: Vec<String> = leaf
+            .subject_alternative_name()
+            .expect("SAN extension missing")
+            .expect("SAN extension empty")
+            .value
+            .general_names
+            .iter()
+            .filter_map(|name| match name {
+                x509_parser::extensions::GeneralName::DNSName(dns) => Some(dns.to_string()),
+                _ => None,
+            })
+            .collect();
+
+        for domain in domains {
+            assert!(
+                sans.contains(&domain.to_string()),
+                "SAN should contain {}, got: {:?}",
+                domain,
+                sans
+            );
+        }
+        eprintln!("multi-domain SANs served on {addr}: {sans:?}");
+    }
 }
