@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls-acme"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
