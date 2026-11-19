@@ -41,14 +41,17 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// file. The cache never writes through such a symlink, and the target of the
 /// symlink keeps its old content.
 ///
-/// In two cases, the cache cannot rename and writes the old file in place, as
-/// earlier releases did. It logs a warning, because a crash during this write
-/// can leave a truncated file behind. The cases are:
+/// In three cases, the cache cannot rename and writes the old file in place,
+/// as earlier releases did. It logs a warning, because a crash during this
+/// write can leave a truncated file behind. The cases are:
 ///
 /// - The process cannot create a file in the directory. Give the process write
 ///   access to the directory to fix this.
 /// - The rename fails with `EBUSY` or `EXDEV`, for example because the file is
 ///   bind-mounted into a container. Mount the directory instead.
+/// - The rename fails with `EPERM` or `EACCES`. In a sticky directory, this
+///   happens when another user owns the old file. Let the user of the process
+///   own the file to fix this.
 ///
 /// On Unix, the cache writes each new file with mode `0o600`. If the directory
 /// does not exist, the cache creates it with mode `0o700`. Missing parents of
@@ -56,11 +59,16 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// permissions of a directory that already exists.
 ///
 /// A store that replaces a file keeps the group and the group bits of the old
-/// file, so a sidecar with group access can still read the new file. The user
-/// of the process owns the new file. If the cache cannot give the new file the
-/// group of the old file, the new file gets no group bits. The new file never
-/// gets permission bits for other users. An in-place write keeps the mode of
-/// the file as it is.
+/// file. Thus a sidecar with group access can still read the new file. The
+/// user of the process owns the new file. If the cache cannot give the new file
+/// the group of the old file, the new file gets no group bits. The new file
+/// never gets permission bits for other users.
+///
+/// The new file does not keep an ACL of the old file. On a file with an ACL,
+/// the group bits show the ACL mask. Thus the owning group of the new file gets
+/// the rights of that mask. Grant access through the group or through a default
+/// ACL on the directory instead. An in-place write keeps the mode and the ACL
+/// of the file as they are.
 ///
 /// On other platforms, files and directories get the default permissions. On
 /// Windows, they inherit the ACL of the parent directory.
@@ -107,7 +115,9 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
     /// symlink, instead of writing through it. On Unix, a sync of the directory
     /// after the rename makes the new entry survive a power loss. If that sync
     /// fails with an unexpected error, the function returns the error although
-    /// the new file is in place.
+    /// the new file is in place. If the function cannot create the temporary
+    /// file or cannot rename it, it writes an existing regular file in place.
+    /// The [`DirCache`] docs list these cases.
     async fn write(&self, file: &str, contents: &[u8]) -> Result<(), std::io::Error> {
         let mut dir = self.inner.as_ref();
         // An empty path means the current directory. Neither `mkdir` nor
@@ -155,15 +165,18 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
         }
         if let Err(err) = fs::rename(&temp_path, &target).await {
             fs::remove_file(&temp_path).await.ok();
+            // `PermissionDenied` covers a sticky directory in which another
+            // user owns the old file. The in-place write may still work there.
             let cannot_replace = matches!(
                 err.kind(),
-                ErrorKind::ResourceBusy | ErrorKind::CrossesDevices
+                ErrorKind::ResourceBusy | ErrorKind::CrossesDevices | ErrorKind::PermissionDenied
             );
             return match old {
                 Some(old) if cannot_replace => {
                     log::warn!(
                         "cannot replace {}: {err}. Writing it in place. \
-                         Mount the cache directory instead of single files for crash-safe writes.",
+                         A crash during this write can leave a truncated file. \
+                         See the DirCache docs for setups with crash-safe writes.",
                         target.display(),
                     );
                     write_in_place(&target, &old, contents).await
@@ -396,7 +409,7 @@ async fn keep_group_access(file: fs::File, old: &Metadata) -> Result<fs::File, s
 
 /// Overwrites the existing regular file `target` with `contents` in place.
 ///
-/// The function checks that the opened file is still the `old` file, so it
+/// The function checks that the opened file is still the `old` file. Thus it
 /// does not write through a symlink that replaced the file after the check.
 /// The file keeps its mode. A crash during the write can leave a truncated
 /// file behind.
