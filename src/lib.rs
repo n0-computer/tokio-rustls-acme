@@ -142,7 +142,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod acceptor;
-/// Low-level ACME client (RFC 8555), not covered by stability promises.
+/// ACME server objects and errors (RFC 8555), and the Let's Encrypt directory URLs.
 pub mod acme;
 /// Acceptor for serving through `axum_server`.
 #[cfg(feature = "axum")]
