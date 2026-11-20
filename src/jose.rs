@@ -161,6 +161,8 @@ struct JwkThumb<'a> {
 #[non_exhaustive]
 pub enum JoseError {
     /// Serializing the payload or header failed.
+    ///
+    /// Usually downcasts to `serde_json::Error`. The concrete type is not covered by semver.
     #[error("json serialization failed: {0}")]
     Json(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The crypto backend failed.

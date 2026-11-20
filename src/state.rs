@@ -101,6 +101,8 @@ pub enum OrderError {
     #[error("acme error: {0}")]
     Acme(#[from] AcmeError),
     /// Generating the certificate key or the CSR failed.
+    ///
+    /// Usually downcasts to `rcgen::Error`. The concrete type is not covered by semver.
     #[error("certificate generation error: {0}")]
     Rcgen(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The server marked the order invalid.
@@ -122,9 +124,13 @@ pub enum OrderError {
 #[non_exhaustive]
 pub enum CertParseError {
     /// The end-entity certificate is not valid X.509.
+    ///
+    /// Usually downcasts to `x509_parser::nom::Err<x509_parser::error::X509Error>`. The concrete type is not covered by semver.
     #[error("X509 parsing error: {0}")]
     X509(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The data is not valid PEM.
+    ///
+    /// Usually downcasts to `pem::PemError`. The concrete type is not covered by semver.
     #[error("expected 2 or more pem, got: {0}")]
     Pem(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The bundle holds fewer than two PEM blocks, so the key or the certificate is missing.

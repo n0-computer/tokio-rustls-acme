@@ -64,6 +64,8 @@ pub enum HttpsRequestError {
     #[error("io error: {0:?}")]
     Io(#[from] std::io::Error),
     /// The HTTP client failed.
+    ///
+    /// Usually downcasts to `reqwest::Error`. The concrete type is not covered by semver.
     #[error("http error: {0:?}")]
     Http(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// The server answered with a status outside 2xx.

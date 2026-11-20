@@ -406,12 +406,16 @@ pub enum AcmeError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// Generating the validation certificate or its key failed.
+    ///
+    /// Usually downcasts to `rcgen::Error`. The concrete type is not covered by semver.
     #[error("certificate generation error: {0}")]
     Rcgen(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// Signing a request or computing the key authorization failed.
     #[error("JOSE error: {0}")]
     Jose(#[from] JoseError),
     /// A request could not be serialized, or a response could not be parsed.
+    ///
+    /// Usually downcasts to `serde_json::Error`. The concrete type is not covered by semver.
     #[error("JSON error: {0}")]
     Json(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// An HTTP request failed or returned a non-2xx status.
