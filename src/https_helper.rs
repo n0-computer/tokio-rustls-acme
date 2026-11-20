@@ -55,16 +55,28 @@ impl From<reqwest::Error> for HttpsRequestError {
     }
 }
 
+/// An error from an HTTP request to the ACME server.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum HttpsRequestError {
+    /// An I/O error.
     #[error("io error: {0:?}")]
     Io(#[from] std::io::Error),
+    /// The URL host is not a valid DNS name.
     #[error("invalid dns name: {0:?}")]
     InvalidDnsName(#[from] InvalidDnsNameError),
+    /// The HTTP client failed.
     #[error("http error: {0:?}")]
     Http(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// The server answered with a status outside 2xx.
     #[error("non 2xx http status: {status_code} {body:?}")]
-    Non2xxStatus { status_code: u16, body: String },
+    Non2xxStatus {
+        /// HTTP status code.
+        status_code: u16,
+        /// Response body.
+        body: String,
+    },
+    /// The URL has no host.
     #[error("could not determine host from url")]
     UndefinedHost,
 }

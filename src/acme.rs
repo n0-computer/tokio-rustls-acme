@@ -6,8 +6,10 @@ use crate::crypto::rand::SystemRandom;
 use crate::crypto::signature::{
     ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm,
 };
-use crate::https_helper::{HttpsRequestError, Method, Response, https};
-use crate::jose::{JoseError, key_authorization_sha256, sign, sign_eab};
+pub use crate::https_helper::HttpsRequestError;
+use crate::https_helper::{Method, Response, https};
+pub use crate::jose::JoseError;
+use crate::jose::{key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rcgen::{CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};

@@ -156,10 +156,14 @@ struct JwkThumb<'a> {
     y: &'a str,
 }
 
+/// An error from signing a request.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum JoseError {
+    /// Serializing the payload or header failed.
     #[error("json serialization failed: {0}")]
     Json(#[from] serde_json::Error),
+    /// The crypto backend failed.
     #[error("crypto error: {0}")]
     Crypto(#[from] crate::crypto::CryptoError),
 }

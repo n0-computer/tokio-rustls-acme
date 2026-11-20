@@ -118,3 +118,6 @@ required-features = ["tls-webpki-roots"]
 [[example]]
 name = "low_level"
 required-features = ["tls-webpki-roots"]
+
+[lints.rust]
+unnameable_types = "warn"
