@@ -52,6 +52,10 @@ impl Account {
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(ALG, &rng).unwrap();
         pkcs8.as_ref().to_vec()
     }
+    /// Returns an error if `key_pair` is not a PKCS#8 key that an account can use.
+    pub(crate) fn check_key_pair(key_pair: &[u8]) -> Result<(), CryptoError> {
+        crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, key_pair).map(drop)
+    }
     /// Registers the account for `key_pair` at the server, or looks up the existing one.
     pub async fn create_with_keypair<'a, S, I>(
         client_config: &Arc<ClientConfig>,
