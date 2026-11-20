@@ -47,8 +47,7 @@ impl<
     EA: Debug + 'static,
 > Incoming<TCP, ETCP, ITCP, EC, EA>
 {
-    /// Creates an [`Incoming`] that uses `server_config` for application TLS.
-    pub fn new_with_server(
+    pub(crate) fn new_with_server(
         tcp_incoming: ITCP,
         state: AcmeState<EC, EA>,
         acceptor: AcmeAcceptor,
@@ -64,8 +63,7 @@ impl<
         }
     }
 
-    /// Creates an [`Incoming`] that offers `alpn_protocols` to application clients.
-    pub fn new(
+    pub(crate) fn new(
         tcp_incoming: ITCP,
         state: AcmeState<EC, EA>,
         acceptor: AcmeAcceptor,

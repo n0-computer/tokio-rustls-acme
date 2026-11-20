@@ -256,8 +256,7 @@ impl Directory {
 
         serde_json::from_slice(&body).map_err(json_err)
     }
-    /// Fetches a fresh replay nonce from the `newNonce` URL.
-    pub async fn nonce(&self, client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
+    async fn nonce(&self, client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
         let response = &https(client_config, &self.new_nonce.as_str(), Method::Head, None).await?;
         get_header(response, "replay-nonce")
     }
