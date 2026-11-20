@@ -402,9 +402,6 @@ pub struct Problem {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum AcmeError {
-    /// An I/O error, currently not produced by this crate.
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
     /// Generating the validation certificate or its key failed.
     ///
     /// Usually downcasts to `rcgen::Error`. The concrete type is not covered by semver.

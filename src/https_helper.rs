@@ -60,9 +60,6 @@ impl HttpsRequestError {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum HttpsRequestError {
-    /// An I/O error.
-    #[error("io error: {0:?}")]
-    Io(#[from] std::io::Error),
     /// The HTTP client failed.
     ///
     /// Usually downcasts to `reqwest::Error`. The concrete type is not covered by semver.
@@ -76,7 +73,4 @@ pub enum HttpsRequestError {
         /// Response body.
         body: String,
     },
-    /// The URL has no host.
-    #[error("could not determine host from url")]
-    UndefinedHost,
 }
