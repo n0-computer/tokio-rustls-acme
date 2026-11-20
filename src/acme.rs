@@ -1,3 +1,5 @@
+use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 pub use crate::crypto::CryptoError;
@@ -126,13 +128,23 @@ impl Account {
         log::debug!("response: {body:?}");
         Ok((location, body))
     }
+    /// Create a new order for `domains`, which may contain DNS names and IP addresses.
+    ///
+    /// If `profile` is set, it is sent as the order's certificate profile (see
+    /// [`AcmeConfig::profile`](crate::AcmeConfig::profile)).
     pub async fn new_order(
         &self,
         client_config: &Arc<ClientConfig>,
         domains: Vec<String>,
+        profile: Option<&str>,
     ) -> Result<(String, Order), AcmeError> {
-        let domains: Vec<Identifier> = domains.into_iter().map(Identifier::Dns).collect();
-        let payload = format!("{{\"identifiers\":{}}}", serde_json::to_string(&domains)?);
+        let identifiers: Vec<Identifier> = domains.into_iter().map(Identifier::from).collect();
+        let mut payload = json!({ "identifiers": identifiers });
+        if let Some(profile) = profile {
+            // draft-ietf-acme-profiles
+            payload["profile"] = profile.into();
+        }
+        let payload = payload.to_string();
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
             .await?;
@@ -305,10 +317,50 @@ pub enum AuthStatus {
     Deactivated,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// ACME identifier per RFC 8555 §9.7.7.
+///
+/// Serializes as `{"type":"dns","value":"..."}` or `{"type":"ip","value":"..."}`.
+/// IP identifier support is defined in RFC 8738.
+///
+/// Converting from a string picks [`Identifier::Ip`] if the string parses as an IP address and
+/// [`Identifier::Dns`] otherwise. IP addresses are stored in their canonical text form (RFC 5952
+/// for IPv6), as RFC 8738 §3 requires.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum Identifier {
     Dns(String),
+    Ip(String),
+}
+
+impl Identifier {
+    /// Extract the inner value regardless of variant.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Identifier::Dns(v) | Identifier::Ip(v) => v,
+        }
+    }
+}
+
+impl From<String> for Identifier {
+    fn from(s: String) -> Self {
+        match s.parse::<IpAddr>() {
+            Ok(ip) => Identifier::Ip(ip.to_string()),
+            Err(_) => Identifier::Dns(s),
+        }
+    }
+}
+
+impl From<&str> for Identifier {
+    fn from(s: &str) -> Self {
+        s.to_owned().into()
+    }
+}
+
+impl fmt::Display for Identifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,6 +421,63 @@ fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifier_from_str() {
+        assert_eq!(
+            Identifier::from("example.com"),
+            Identifier::Dns("example.com".into())
+        );
+        assert_eq!(
+            Identifier::from("192.0.2.1"),
+            Identifier::Ip("192.0.2.1".into())
+        );
+        assert_eq!(
+            Identifier::from("2001:db8::1".to_string()),
+            Identifier::Ip("2001:db8::1".into())
+        );
+        // Not a valid IPv4 address (leading zero), so it falls through to DNS.
+        assert_eq!(
+            Identifier::from("010.1.1.1"),
+            Identifier::Dns("010.1.1.1".into())
+        );
+    }
+
+    #[test]
+    fn identifier_ipv6_is_canonicalized() {
+        // RFC 5952: lowercase, longest zero run compressed, no leading zeros.
+        for input in ["2001:DB8:0:0::1", "2001:0db8:0000:0000:0000:0000:0000:0001"] {
+            assert_eq!(
+                Identifier::from(input),
+                Identifier::Ip("2001:db8::1".into()),
+                "{input}"
+            );
+        }
+        assert_eq!(Identifier::from("0:0::1").as_str(), "::1");
+    }
+
+    #[test]
+    fn identifier_wire_format() {
+        let ids = [
+            Identifier::from("example.com"),
+            Identifier::from("192.0.2.1"),
+            Identifier::from("2001:DB8::1"),
+        ];
+        let json = serde_json::to_string(&ids).unwrap();
+        assert_eq!(
+            json,
+            r#"[{"type":"dns","value":"example.com"},{"type":"ip","value":"192.0.2.1"},{"type":"ip","value":"2001:db8::1"}]"#
+        );
+        let parsed: Vec<Identifier> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ids);
+    }
+
+    #[test]
+    fn identifier_display() {
+        assert_eq!(Identifier::from("::1").to_string(), "::1");
+        assert_eq!(Identifier::from("example.com").to_string(), "example.com");
+    }
+
     use rustls::crypto::KeyProvider;
     use rustls::sign::SigningKey;
 
