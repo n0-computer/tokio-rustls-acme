@@ -7,7 +7,7 @@ use crate::crypto::signature::{
     ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, EcdsaSigningAlgorithm,
 };
 pub use crate::https_helper::HttpsRequestError;
-use crate::https_helper::{Method, Response, https};
+use crate::https_helper::{self, Method, Response, https};
 pub use crate::jose::JoseError;
 use crate::jose::{key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
@@ -107,6 +107,7 @@ impl Account {
             &directory.new_account,
             Method::Post,
             Some(body),
+            directory.https_only(),
         )
         .await?;
         let kid = get_header(&response, "Location")?;
@@ -129,9 +130,17 @@ impl Account {
             url.as_ref(),
             payload,
         )?;
-        let response = https(client_config, url.as_ref(), Method::Post, Some(body)).await?;
+        let https_only = self.directory.https_only();
+        let response = https(
+            client_config,
+            url.as_ref(),
+            Method::Post,
+            Some(body),
+            https_only,
+        )
+        .await?;
         let location = get_header(&response, "Location").ok();
-        let body = response.text().await.map_err(HttpsRequestError::http)?;
+        let body = https_helper::text(response).await?;
         log::debug!("response: {body:?}");
         Ok((location, body))
     }
@@ -251,15 +260,24 @@ impl Directory {
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<Self, AcmeError> {
-        let response = https(client_config, url, Method::Get, None).await?;
-        let body = response.bytes().await.map_err(HttpsRequestError::http)?;
+        let https_only = https_helper::is_https(url.as_ref());
+        let response = https(client_config, url, Method::Get, None, https_only).await?;
+        let body = https_helper::bytes(response).await?;
 
         serde_json::from_slice(&body).map_err(json_err)
     }
     /// Fetches a fresh replay nonce from the `newNonce` URL.
     pub async fn nonce(&self, client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
-        let response = &https(client_config, &self.new_nonce.as_str(), Method::Head, None).await?;
+        let url = self.new_nonce.as_str();
+        let response = &https(client_config, url, Method::Head, None, self.https_only()).await?;
         get_header(response, "replay-nonce")
+    }
+
+    /// Returns whether requests must refuse plain HTTP, which holds once any endpoint uses HTTPS.
+    fn https_only(&self) -> bool {
+        [&self.new_nonce, &self.new_account, &self.new_order]
+            .iter()
+            .any(|url| https_helper::is_https(url))
     }
 }
 
@@ -499,5 +517,23 @@ mod tests {
 
         let result = account.tls_alpn_01(&provider, &challenges, "example.com".into());
         assert!(matches!(result, Err(AcmeError::Crypto(_))));
+    }
+
+    #[test]
+    fn directory_https_only() {
+        let cases = [
+            ("https://ca.test", "https://ca.test", true),
+            ("HTTPS://ca.test", "http://ca.test", true),
+            ("http://ca.test", "http://ca.test", false),
+            ("http://https.test", "", false),
+        ];
+        for (new_nonce, new_order, expected) in cases {
+            let directory = Directory {
+                new_nonce: new_nonce.into(),
+                new_account: new_nonce.into(),
+                new_order: new_order.into(),
+            };
+            assert_eq!(directory.https_only(), expected, "{new_nonce} {new_order}");
+        }
     }
 }
