@@ -72,12 +72,14 @@ optional = true
 simple_logger = "5.0"
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
-tokio = { version = "1.19.2", features = ["full"] }
+# `test-util` gives tests a paused clock.
+tokio = { version = "1.19.2", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1.9", features = ["net"] }
 tokio-util = { version = "0.7.3", features = ["compat"] }
 warp = "0.3"
 tempfile = "3"
-x509-parser = "0.18"
+# `verify` checks the challenge certificate self-signature in tests.
+x509-parser = { version = "0.18", features = ["verify"] }
 # Pulled in only for the integration tests so they can construct a
 # `CryptoProvider` regardless of which crate features are enabled. Cargo
 # applies dev-dep features to test/example/bench builds only, so this does
