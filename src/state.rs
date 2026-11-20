@@ -11,7 +11,7 @@ use futures::{FutureExt, Stream, ready};
 use rcgen::{CertificateParams, DistinguishedName, PKCS_ECDSA_P256_SHA256};
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -136,8 +136,8 @@ pub enum CertParseError {
     /// The bundle holds fewer than two PEM blocks, so the key or the certificate is missing.
     #[error("expected 2 or more pem, got: {0}")]
     TooFewPem(usize),
-    /// The crypto provider cannot load the private key.
-    #[error("unsupported private key type")]
+    /// The crypto provider cannot load the private key, or it does not match the certificate.
+    #[error("private key is unsupported or does not match the certificate")]
     InvalidPrivateKey,
 }
 
@@ -249,11 +249,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
         let pk_bytes = pems.remove(0).into_contents();
         let pk_der: PrivatePkcs8KeyDer<'static> = pk_bytes.into();
-        let pk_der: PrivateKeyDer<'static> = pk_der.into();
-        let pk = match crypto_provider.key_provider.load_private_key(pk_der) {
-            Ok(pk) => pk,
-            Err(_) => return Err(CertParseError::InvalidPrivateKey),
-        };
         let cert_chain: Vec<RustlsCertificate> =
             pems.into_iter().map(|p| p.into_contents().into()).collect();
         let validity = match parse_x509_certificate(cert_chain[0].as_ref()) {
@@ -263,7 +258,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             }
             Err(err) => return Err(CertParseError::X509(err.into())),
         };
-        let cert = CertifiedKey::new(cert_chain, pk);
+        let cert =
+            CertifiedKey::from_der(cert_chain, pk_der.into(), crypto_provider).map_err(|err| {
+                log::warn!("rejecting certificate and private key: {err}");
+                CertParseError::InvalidPrivateKey
+            })?;
         Ok((cert, validity))
     }
 
