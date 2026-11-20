@@ -1,4 +1,4 @@
-use rustls::{ClientConfig, pki_types::InvalidDnsNameError};
+use rustls::ClientConfig;
 use thiserror::Error;
 
 pub(crate) use reqwest::Response;
@@ -30,7 +30,8 @@ pub(crate) async fn https(
     let client = reqwest::ClientBuilder::new()
         .tls_backend_preconfigured(client_config.clone())
         .user_agent(concat!("tokio-rustls-acme/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+        .build()
+        .map_err(HttpsRequestError::http)?;
     let mut request = client.request(method, url.as_ref());
     if let Some(body) = body {
         request = request
@@ -38,20 +39,20 @@ pub(crate) async fn https(
             .header("Content-Type", "application/jose+json");
     }
 
-    let response = request.send().await?;
+    let response = request.send().await.map_err(HttpsRequestError::http)?;
     let status = response.status();
     if !status.is_success() {
         return Err(HttpsRequestError::Non2xxStatus {
             status_code: status.into(),
-            body: response.text().await?,
+            body: response.text().await.map_err(HttpsRequestError::http)?,
         });
     }
     Ok(response)
 }
 
-impl From<reqwest::Error> for HttpsRequestError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Http(e.into())
+impl HttpsRequestError {
+    pub(crate) fn http(err: reqwest::Error) -> Self {
+        Self::Http(err.into())
     }
 }
 
@@ -62,9 +63,6 @@ pub enum HttpsRequestError {
     /// An I/O error.
     #[error("io error: {0:?}")]
     Io(#[from] std::io::Error),
-    /// The URL host is not a valid DNS name.
-    #[error("invalid dns name: {0:?}")]
-    InvalidDnsName(#[from] InvalidDnsNameError),
     /// The HTTP client failed.
     #[error("http error: {0:?}")]
     Http(Box<dyn std::error::Error + Send + Sync + 'static>),

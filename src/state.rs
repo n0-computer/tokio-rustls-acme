@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures::future::try_join_all;
 use futures::{FutureExt, Stream, ready};
-use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, DistinguishedName, PKCS_ECDSA_P256_SHA256};
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -102,7 +102,7 @@ pub enum OrderError {
     Acme(#[from] AcmeError),
     /// Generating the certificate key or the CSR failed.
     #[error("certificate generation error: {0}")]
-    Rcgen(#[from] RcgenError),
+    Rcgen(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The server marked the order invalid.
     #[error("bad order object: {0:?}")]
     BadOrder(Order),
@@ -123,16 +123,20 @@ pub enum OrderError {
 pub enum CertParseError {
     /// The end-entity certificate is not valid X.509.
     #[error("X509 parsing error: {0}")]
-    X509(#[from] x509_parser::nom::Err<x509_parser::error::X509Error>),
+    X509(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The data is not valid PEM.
     #[error("expected 2 or more pem, got: {0}")]
-    Pem(#[from] pem::PemError),
+    Pem(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The bundle holds fewer than two PEM blocks, so the key or the certificate is missing.
     #[error("expected 2 or more pem, got: {0}")]
     TooFewPem(usize),
     /// The crypto provider cannot load the private key.
     #[error("unsupported private key type")]
     InvalidPrivateKey,
+}
+
+fn rcgen_err(err: rcgen::Error) -> OrderError {
+    OrderError::Rcgen(err.into())
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
@@ -233,7 +237,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         crypto_provider: &CryptoProvider,
         pem: &[u8],
     ) -> Result<(CertifiedKey, [OffsetDateTime; 2]), CertParseError> {
-        let mut pems = pem::parse_many(pem)?;
+        let mut pems = pem::parse_many(pem).map_err(|err| CertParseError::Pem(err.into()))?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
         }
@@ -251,7 +255,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let validity = cert.validity();
                 [validity.not_before, validity.not_after].map(|t| t.to_datetime())
             }
-            Err(err) => return Err(CertParseError::X509(err)),
+            Err(err) => return Err(CertParseError::X509(err.into())),
         };
         let cert = CertifiedKey::new(cert_chain, pk);
         Ok((cert, validity))
@@ -308,9 +312,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         )
         .await?;
 
-        let mut params = CertificateParams::new(config.domains.clone())?;
+        let mut params = CertificateParams::new(config.domains.clone()).map_err(rcgen_err)?;
         params.distinguished_name = DistinguishedName::new();
-        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(rcgen_err)?;
 
         let (order_url, mut order) = account
             .new_order(&config.client_config, config.domains.clone())
@@ -341,7 +345,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
                 OrderStatus::Ready => {
                     log::info!("sending csr");
-                    let csr = params.serialize_request(&key_pair)?;
+                    let csr = params.serialize_request(&key_pair).map_err(rcgen_err)?;
                     order = account
                         .finalize(&config.client_config, order.finalize, csr.der().to_vec())
                         .await?

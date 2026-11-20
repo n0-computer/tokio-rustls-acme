@@ -31,7 +31,7 @@ pub(crate) fn sign(
         payload,
         signature,
     };
-    Ok(serde_json::to_string(&body)?)
+    serde_json::to_string(&body).map_err(json_err)
 }
 
 pub(crate) fn sign_eab(
@@ -41,7 +41,7 @@ pub(crate) fn sign_eab(
     url: &str,
 ) -> Result<Body, JoseError> {
     let protected = Protected::hmac_base64(kid, url)?;
-    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Jwk::new(key))?);
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Jwk::new(key)).map_err(json_err)?);
     let combined = format!("{}.{}", protected, payload);
     let signature = hmac::sign(eab_key, combined.as_bytes());
     let signature = URL_SAFE_NO_PAD.encode(signature.as_ref());
@@ -95,7 +95,7 @@ impl<'a> Protected<'a> {
             nonce,
             url,
         };
-        let protected = serde_json::to_vec(&protected)?;
+        let protected = serde_json::to_vec(&protected).map_err(json_err)?;
         Ok(URL_SAFE_NO_PAD.encode(protected))
     }
 
@@ -107,7 +107,7 @@ impl<'a> Protected<'a> {
             nonce: None,
             url,
         };
-        let protected = serde_json::to_vec(&protected)?;
+        let protected = serde_json::to_vec(&protected).map_err(json_err)?;
         Ok(URL_SAFE_NO_PAD.encode(protected))
     }
 }
@@ -142,7 +142,7 @@ impl Jwk {
             x: &self.x,
             y: &self.y,
         };
-        let json = serde_json::to_vec(&jwk_thumb)?;
+        let json = serde_json::to_vec(&jwk_thumb).map_err(json_err)?;
         let hash = digest(&SHA256, &json);
         Ok(URL_SAFE_NO_PAD.encode(hash))
     }
@@ -162,10 +162,14 @@ struct JwkThumb<'a> {
 pub enum JoseError {
     /// Serializing the payload or header failed.
     #[error("json serialization failed: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The crypto backend failed.
     #[error("crypto error: {0}")]
     Crypto(#[from] crate::crypto::CryptoError),
+}
+
+fn json_err(err: serde_json::Error) -> JoseError {
+    JoseError::Json(err.into())
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ pub use crate::jose::JoseError;
 use crate::jose::{key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rcgen::{CustomExtension, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CustomExtension, PKCS_ECDSA_P256_SHA256};
 use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig,
@@ -131,7 +131,7 @@ impl Account {
         )?;
         let response = https(client_config, url.as_ref(), Method::Post, Some(body)).await?;
         let location = get_header(&response, "Location").ok();
-        let body = response.text().await.map_err(HttpsRequestError::from)?;
+        let body = response.text().await.map_err(HttpsRequestError::http)?;
         log::debug!("response: {body:?}");
         Ok((location, body))
     }
@@ -141,12 +141,15 @@ impl Account {
         domains: Vec<String>,
     ) -> Result<(String, Order), AcmeError> {
         let domains: Vec<Identifier> = domains.into_iter().map(Identifier::Dns).collect();
-        let payload = format!("{{\"identifiers\":{}}}", serde_json::to_string(&domains)?);
+        let payload = format!(
+            "{{\"identifiers\":{}}}",
+            serde_json::to_string(&domains).map_err(json_err)?
+        );
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
             .await?;
         let url = response.0.ok_or(AcmeError::MissingHeader("Location"))?;
-        let order = serde_json::from_str(&response.1)?;
+        let order = serde_json::from_str(&response.1).map_err(json_err)?;
         Ok((url, order))
     }
     /// Fetches the authorization object at `url`.
@@ -157,7 +160,7 @@ impl Account {
     ) -> Result<Auth, AcmeError> {
         let payload = "".to_string();
         let response = self.request(client_config, url, &payload).await?;
-        Ok(serde_json::from_str(&response.1)?)
+        serde_json::from_str(&response.1).map_err(json_err)
     }
     /// Tells the server that the challenge at `url` is ready for validation.
     pub async fn challenge(
@@ -175,7 +178,7 @@ impl Account {
         url: impl AsRef<str>,
     ) -> Result<Order, AcmeError> {
         let response = self.request(client_config, &url, "").await?;
-        Ok(serde_json::from_str(&response.1)?)
+        serde_json::from_str(&response.1).map_err(json_err)
     }
     /// Sends the DER-encoded `csr` to the finalize `url` and returns the updated order.
     pub async fn finalize(
@@ -186,7 +189,7 @@ impl Account {
     ) -> Result<Order, AcmeError> {
         let payload = format!("{{\"csr\":\"{}\"}}", URL_SAFE_NO_PAD.encode(csr),);
         let response = self.request(client_config, &url, &payload).await?;
-        Ok(serde_json::from_str(&response.1)?)
+        serde_json::from_str(&response.1).map_err(json_err)
     }
     /// Downloads the PEM certificate chain at `url`.
     pub async fn certificate(
@@ -211,12 +214,12 @@ impl Account {
             Some(challenge) => challenge,
             None => return Err(AcmeError::NoTlsAlpn01Challenge),
         };
-        let mut params = rcgen::CertificateParams::new(vec![domain])?;
+        let mut params = rcgen::CertificateParams::new(vec![domain]).map_err(rcgen_err)?;
         let key_auth = key_authorization_sha256(&self.key_pair, &challenge.token)?;
         params.custom_extensions = vec![CustomExtension::new_acme_identifier(key_auth.as_ref())];
 
-        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
-        let cert = params.self_signed(&key_pair)?;
+        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(rcgen_err)?;
+        let cert = params.self_signed(&key_pair).map_err(rcgen_err)?;
 
         let pk_bytes = key_pair.serialize_der();
         let pk_der: PrivatePkcs8KeyDer<'static> = pk_bytes.into();
@@ -249,9 +252,9 @@ impl Directory {
         url: impl AsRef<str>,
     ) -> Result<Self, AcmeError> {
         let response = https(client_config, url, Method::Get, None).await?;
-        let body = response.bytes().await.map_err(HttpsRequestError::from)?;
+        let body = response.bytes().await.map_err(HttpsRequestError::http)?;
 
-        Ok(serde_json::from_slice(&body)?)
+        serde_json::from_slice(&body).map_err(json_err)
     }
     /// Fetches a fresh replay nonce from the `newNonce` URL.
     pub async fn nonce(&self, client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
@@ -404,13 +407,13 @@ pub enum AcmeError {
     Io(#[from] std::io::Error),
     /// Generating the validation certificate or its key failed.
     #[error("certificate generation error: {0}")]
-    Rcgen(#[from] RcgenError),
+    Rcgen(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// Signing a request or computing the key authorization failed.
     #[error("JOSE error: {0}")]
     Jose(#[from] JoseError),
     /// A request could not be serialized, or a response could not be parsed.
     #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// An HTTP request failed or returned a non-2xx status.
     #[error("http request error: {0}")]
     HttpRequest(#[from] HttpsRequestError),
@@ -426,6 +429,14 @@ pub enum AcmeError {
     /// The authorization offers no `tls-alpn-01` challenge.
     #[error("no tls-alpn-01 challenge found")]
     NoTlsAlpn01Challenge,
+}
+
+fn json_err(err: serde_json::Error) -> AcmeError {
+    AcmeError::Json(err.into())
+}
+
+fn rcgen_err(err: rcgen::Error) -> AcmeError {
+    AcmeError::Rcgen(err.into())
 }
 
 fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeError> {
