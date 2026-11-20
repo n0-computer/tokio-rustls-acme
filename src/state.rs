@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures::future::try_join_all;
 use futures::{FutureExt, Stream, ready};
-use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, DistinguishedName, PKCS_ECDSA_P256_SHA256};
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -28,7 +28,7 @@ use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 type Timer = std::pin::Pin<Box<Sleep>>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-pub fn after(d: std::time::Duration) -> Timer {
+pub(crate) fn after(d: std::time::Duration) -> Timer {
     Box::pin(tokio::time::sleep(d))
 }
 
@@ -50,60 +50,99 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     wait: Option<Timer>,
 }
 
+/// Item of the [`AcmeState`] stream, reporting the outcome of one step.
 pub type Event<EC, EA> = Result<EventOk, EventError<EC, EA>>;
 
+/// A successful step of [`AcmeState`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EventOk {
+    /// A certificate from the cache is now served.
     DeployedCachedCert,
+    /// A newly issued certificate is now served.
     DeployedNewCert,
+    /// The newly issued certificate was stored in the cache.
     CertCacheStore,
+    /// A newly generated account key was stored in the cache.
     AccountCacheStore,
 }
 
+/// A failed step of [`AcmeState`].
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum EventError<EC: Debug, EA: Debug> {
+    /// Loading the certificate from the cache failed.
     #[error("cert cache load: {0}")]
     CertCacheLoad(EC),
     #[error("account cache load: {0}")]
     AccountCacheLoad(EA),
+    /// Storing the newly issued certificate in the cache failed.
     #[error("cert cache store: {0}")]
     CertCacheStore(EC),
+    /// Storing the newly generated account key in the cache failed.
     #[error("account cache store: {0}")]
     AccountCacheStore(EA),
+    /// The certificate from the cache could not be parsed.
     #[error("cached cert parse: {0}")]
     CachedCertParse(CertParseError),
+    /// Ordering a certificate failed, and the next order follows after a backoff.
     #[error("order: {0}")]
     Order(OrderError),
+    /// The newly issued certificate could not be parsed.
     #[error("new cert parse: {0}")]
     NewCertParse(CertParseError),
 }
 
+/// An error that stopped a certificate order.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum OrderError {
+    /// The ACME client failed.
     #[error("acme error: {0}")]
     Acme(#[from] AcmeError),
+    /// Generating the certificate key or the CSR failed.
+    ///
+    /// Usually downcasts to `rcgen::Error`. The concrete type is not covered by semver.
     #[error("certificate generation error: {0}")]
-    Rcgen(#[from] RcgenError),
+    Rcgen(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The server marked the order invalid.
     #[error("bad order object: {0:?}")]
     BadOrder(Order),
+    /// An authorization reached a status other than pending or valid.
     #[error("bad auth object: {0:?}")]
     BadAuth(Auth),
+    /// The authorization for the given domain was still pending after the last check.
     #[error("authorization for {0} failed too many times")]
     TooManyAttemptsAuth(String),
+    /// The order was still processing after the last check.
     #[error("order status stayed on processing too long")]
     ProcessingTimeout(Order),
 }
 
+/// An error from parsing a PEM bundle of private key and certificate chain.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum CertParseError {
+    /// The end-entity certificate is not valid X.509.
+    ///
+    /// Usually downcasts to `x509_parser::nom::Err<x509_parser::error::X509Error>`. The concrete type is not covered by semver.
     #[error("X509 parsing error: {0}")]
-    X509(#[from] x509_parser::nom::Err<x509_parser::error::X509Error>),
+    X509(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The data is not valid PEM.
+    ///
+    /// Usually downcasts to `pem::PemError`. The concrete type is not covered by semver.
     #[error("expected 2 or more pem, got: {0}")]
-    Pem(#[from] pem::PemError),
+    Pem(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The bundle holds fewer than two PEM blocks, so the key or the certificate is missing.
     #[error("expected 2 or more pem, got: {0}")]
     TooFewPem(usize),
+    /// The crypto provider cannot load the private key.
     #[error("unsupported private key type")]
     InvalidPrivateKey,
+}
+
+fn rcgen_err(err: rcgen::Error) -> OrderError {
+    OrderError::Rcgen(err.into())
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
@@ -153,6 +192,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         self.config.crypto_provider().clone()
     }
 
+    /// Returns an [`AxumAcceptor`] that uses `rustls_config` for application TLS.
+    ///
+    /// [`AxumAcceptor`]: crate::axum::AxumAcceptor
     #[cfg(feature = "axum")]
     pub fn axum_acceptor(
         &self,
@@ -201,7 +243,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         crypto_provider: &CryptoProvider,
         pem: &[u8],
     ) -> Result<(CertifiedKey, [OffsetDateTime; 2]), CertParseError> {
-        let mut pems = pem::parse_many(pem)?;
+        let mut pems = pem::parse_many(pem).map_err(|err| CertParseError::Pem(err.into()))?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
         }
@@ -219,7 +261,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let validity = cert.validity();
                 [validity.not_before, validity.not_after].map(|t| t.to_datetime())
             }
-            Err(err) => return Err(CertParseError::X509(err)),
+            Err(err) => return Err(CertParseError::X509(err.into())),
         };
         let cert = CertifiedKey::new(cert_chain, pk);
         Ok((cert, validity))
@@ -276,9 +318,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         )
         .await?;
 
-        let mut params = CertificateParams::new(config.domains.clone())?;
+        let mut params = CertificateParams::new(config.domains.clone()).map_err(rcgen_err)?;
         params.distinguished_name = DistinguishedName::new();
-        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(rcgen_err)?;
 
         let (order_url, mut order) = account
             .new_order(&config.client_config, config.domains.clone())
@@ -309,7 +351,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
                 OrderStatus::Ready => {
                     log::info!("sending csr");
-                    let csr = params.serialize_request(&key_pair)?;
+                    let csr = params.serialize_request(&key_pair).map_err(rcgen_err)?;
                     order = account
                         .finalize(&config.client_config, order.finalize, csr.der().to_vec())
                         .await?

@@ -28,6 +28,7 @@ impl<EC: Debug, EA: Debug> Default for NoCache<EC, EA> {
 }
 
 impl<EC: Debug, EA: Debug> NoCache<EC, EA> {
+    /// Creates a cache that stores nothing.
     pub fn new() -> Self {
         Self::default()
     }

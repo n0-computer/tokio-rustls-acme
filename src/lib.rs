@@ -142,10 +142,13 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod acceptor;
+/// Low-level ACME client (RFC 8555), not covered by stability promises.
 pub mod acme;
+/// Acceptor for serving through `axum_server`.
 #[cfg(feature = "axum")]
 pub mod axum;
 mod cache;
+/// Ready-made [`Cache`] implementations.
 pub mod caches;
 mod config;
 mod crypto;

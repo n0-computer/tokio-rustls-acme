@@ -94,16 +94,11 @@ rustdoc-args = ["--cfg", "doc_auto_cfg"]
 allowed_external_types = [
     "axum_server::*",
     "futures_core::*",
-    "nom::*",
-    "pem::*",
-    "rcgen::*",
     "rustls::*",
     "serde_core::*",
-    "serde_json::*",
     "tokio::*",
     "tokio_rustls",
     "tokio_rustls::*",
-    "x509_parser::*",
 ]
 
 [features]
@@ -135,3 +130,6 @@ required-features = ["tls-webpki-roots"]
 [[example]]
 name = "low_level"
 required-features = ["tls-webpki-roots"]
+
+[lints.rust]
+unnameable_types = "warn"
