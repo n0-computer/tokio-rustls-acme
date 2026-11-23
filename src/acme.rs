@@ -336,6 +336,18 @@ pub enum OrderStatus {
     Processing,
 }
 
+impl OrderStatus {
+    /// Returns the position of this status in the RFC 8555 order lifecycle.
+    pub(crate) fn progress(&self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Ready => 1,
+            Self::Processing => 2,
+            Self::Valid { .. } | Self::Invalid => 3,
+        }
+    }
+}
+
 /// An authorization object (RFC 8555 section 7.1.4).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

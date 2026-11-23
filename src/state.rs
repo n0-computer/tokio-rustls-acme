@@ -39,16 +39,6 @@ const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
 /// Number of order rounds that can fail to advance the order status before the order fails.
 const MAX_STALLED_ROUNDS: u32 = 10;
 
-/// Returns the position of `status` in the RFC 8555 order lifecycle.
-fn order_progress(status: &OrderStatus) -> u8 {
-    match status {
-        OrderStatus::Pending => 0,
-        OrderStatus::Ready => 1,
-        OrderStatus::Processing => 2,
-        OrderStatus::Valid { .. } | OrderStatus::Invalid => 3,
-    }
-}
-
 /// Returns the time left from `now` until `deadline`, or `None` once it is reached.
 fn time_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
     let left: Duration = (deadline - now).try_into().ok()?;
@@ -365,7 +355,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             .await?;
         let mut stalled_rounds = 0;
         loop {
-            let previous_progress = order_progress(&order.status);
+            let previous_progress = order.status.progress();
             match order.status {
                 OrderStatus::Pending => {
                     let auth_futures = order
@@ -411,7 +401,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 OrderStatus::Invalid => return Err(OrderError::BadOrder(order)),
             }
             // A CA can lag in updating the status, and a broken CA can move it backwards.
-            if order_progress(&order.status) <= previous_progress {
+            if order.status.progress() <= previous_progress {
                 let Some(delay) = stall_delay(stalled_rounds) else {
                     return Err(OrderError::ProcessingTimeout(order));
                 };
