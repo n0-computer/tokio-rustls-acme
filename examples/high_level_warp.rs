@@ -49,10 +49,11 @@ async fn main() {
         .filter_map(|tcp| async move {
             match tcp {
                 Ok(tcp) => Some(Ok::<_, io::Error>(tcp)),
+                Err(err) if is_connection_error(&err) => None,
                 Err(err) => {
                     log::error!("TCP accept failed: {err:?}");
                     // Accept fails again at once while no file descriptor is free.
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
                     None
                 }
             }
@@ -90,4 +91,17 @@ async fn main() {
     }
 
     unreachable!()
+}
+
+/// Pause after an accept error, as in axum's `serve`.
+const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
+
+/// Returns whether `err` concerns only one connection, so accepting can go on at once.
+fn is_connection_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
 }

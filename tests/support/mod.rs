@@ -45,6 +45,9 @@ pub fn provider() -> Arc<CryptoProvider> {
 /// ALPN protocol of the tls-alpn-01 challenge, RFC 8737 section 6.2.
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
+/// How often `wait_for_hits` checks the request count.
+const HIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// OID of the `acmeIdentifier` extension, RFC 8737 section 6.1.
 pub const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
 
@@ -451,7 +454,7 @@ impl MockAcme {
     pub async fn wait_for_hits(&self, route: &str, count: usize, limit: Duration) {
         let reached = tokio::time::timeout(limit, async {
             while self.state().hits(route) < count {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(HIT_POLL_INTERVAL).await;
             }
         })
         .await;

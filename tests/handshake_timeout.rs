@@ -30,11 +30,17 @@ const HANDSHAKE_LIMIT: Duration = Duration::from_secs(1);
 /// Handshake timeout below the default.
 const CONFIGURED_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Handshake timeout that applies when none is configured.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Handshake timeout above the default.
+const LONG_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Configured handshake timeouts and the timeouts they result in.
 const TIMEOUT_CASES: [(Option<Duration>, Duration); 3] = [
-    (None, Duration::from_secs(10)),
+    (None, DEFAULT_TIMEOUT),
     (Some(CONFIGURED_TIMEOUT), CONFIGURED_TIMEOUT),
-    (Some(Duration::from_secs(30)), Duration::from_secs(30)),
+    (Some(LONG_TIMEOUT), LONG_TIMEOUT),
 ];
 
 /// Allowed difference between the configured and the observed timeout.
@@ -331,6 +337,8 @@ async fn incoming_answers_tls_alpn_01_validation() {
 #[tokio::test(start_paused = true)]
 async fn incoming_answers_all_client_hellos_of_one_wakeup() {
     const ANSWER_LIMIT: Duration = Duration::from_secs(1);
+    /// Paused-clock step that lets `Incoming` take the connections.
+    const SETTLE: Duration = Duration::from_millis(1);
 
     // Two connections are not enough to show the fault: `FuturesUnordered`
     // wakes its task once more when it polled all of its futures.
@@ -338,7 +346,7 @@ async fn incoming_answers_all_client_hellos_of_one_wakeup() {
         (0..3).map(|_| tokio::io::duplex(64 * 1024)).unzip();
     let incoming = serve(incoming(Cache::new(), servers));
     // Let `Incoming` take the connections and wait for their ClientHellos.
-    tokio::time::sleep(Duration::from_millis(1)).await;
+    tokio::time::sleep(SETTLE).await;
 
     // All writes finish before the task of `Incoming` runs again. No client
     // answers the server flight, so no later event wakes that task.

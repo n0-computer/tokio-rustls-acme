@@ -1,5 +1,6 @@
 use clap::Parser;
 use rustls::{DEFAULT_VERSIONS, ServerConfig};
+use std::io;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,10 +69,11 @@ async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u
     loop {
         let tcp = match listener.accept().await {
             Ok((tcp, _)) => tcp,
+            Err(err) if is_connection_error(&err) => continue,
             Err(err) => {
                 log::error!("TCP accept failed: {err:?}");
                 // Accept fails again at once while no file descriptor is free.
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
                 continue;
             }
         };
@@ -107,7 +109,21 @@ async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u
     }
 }
 
+/// Limit for one TLS handshake, the default of axum-server.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pause after an accept error, as in axum's `serve`.
+const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
+
+/// Returns whether `err` concerns only one connection, so accepting can go on at once.
+fn is_connection_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
+}
 
 const HELLO: &[u8] = br#"HTTP/1.1 200 OK
 Content-Length: 10
