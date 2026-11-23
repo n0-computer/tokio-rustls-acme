@@ -4,6 +4,7 @@ mod support;
 
 use std::{
     convert::Infallible,
+    fmt::Debug,
     io,
     sync::{Arc, Mutex},
     time::Duration,
@@ -29,8 +30,8 @@ type Events = Arc<Mutex<Vec<Result<String, String>>>>;
 /// Polls `state` in the background and records its events.
 fn drive<EC, EA>(mut state: AcmeState<EC, EA>) -> (JoinHandle<()>, Events)
 where
-    EC: std::fmt::Debug + Send + 'static,
-    EA: std::fmt::Debug + Send + 'static,
+    EC: Debug + Send + 'static,
+    EA: Debug + Send + 'static,
 {
     let events = Events::default();
     let driver = tokio::spawn({
