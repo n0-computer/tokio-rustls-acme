@@ -12,7 +12,9 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::server::TlsStream;
 
-/// Logs a failed handshake. Peers can cause the common failures, so those log at debug.
+/// Logs a failed handshake.
+///
+/// Peers can cause the common failures, so those log at debug.
 fn log_handshake_error(err: &io::Error) {
     match err.kind() {
         io::ErrorKind::TimedOut => log::debug!("TLS handshake timed out"),

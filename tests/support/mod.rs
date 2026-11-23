@@ -37,11 +37,6 @@ use x509_parser::{
     certificate::X509Certificate, certification_request::X509CertificationRequest, prelude::FromDer,
 };
 
-/// Returns the provider all tests use for TLS, whatever the crate features select.
-pub fn provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
-}
-
 /// ALPN protocol of the tls-alpn-01 challenge, RFC 8737 section 6.2.
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
@@ -50,6 +45,11 @@ const HIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// OID of the `acmeIdentifier` extension, RFC 8737 section 6.1.
 pub const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
+
+/// Returns the provider all tests use for TLS, whatever the crate features select.
+pub fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
 
 pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
     Arc::new(
@@ -66,7 +66,10 @@ pub fn client_config_without_roots() -> Arc<ClientConfig> {
     client_config(RootCertStore::empty())
 }
 
-/// Accepts any certificate but checks the handshake signature, via x509-parser since webpki rejects `acmeIdentifier`.
+/// Accepts any certificate, but still checks the handshake signature.
+///
+/// It reads the public key with x509-parser because webpki rejects the
+/// critical `acmeIdentifier` extension.
 #[derive(Debug)]
 pub struct AcceptAnyCert(pub Arc<CryptoProvider>);
 

@@ -58,6 +58,9 @@
 //! use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 //! use tokio_stream::wrappers::TcpListenerStream;
 //!
+//! /// Pause after an accept error, as in axum's `serve`.
+//! const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
+//!
 //! #[tokio::main]
 //! async fn main() {
 //!     simple_logger::init_with_level(log::Level::Info).unwrap();
@@ -87,9 +90,6 @@
 //!         });
 //!     }
 //! }
-//!
-//! /// Pause after an accept error, as in axum's `serve`.
-//! const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
 //!
 //! /// Returns whether `err` concerns only one connection, so accepting can go on at once.
 //! fn is_connection_error(err: &io::Error) -> bool {

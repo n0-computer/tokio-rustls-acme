@@ -13,6 +13,9 @@ use tokio_rustls_acme::caches::DirCache;
 use tokio_stream::wrappers::TcpListenerStream;
 use warp::Filter;
 
+/// Pause after an accept error, as in axum's `serve`.
+const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
+
 #[derive(Parser, Debug)]
 struct Args {
     /// Domains
@@ -92,9 +95,6 @@ async fn main() {
 
     unreachable!()
 }
-
-/// Pause after an accept error, as in axum's `serve`.
-const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
 
 /// Returns whether `err` concerns only one connection, so accepting can go on at once.
 fn is_connection_error(err: &io::Error) -> bool {

@@ -17,6 +17,7 @@ use tokio::{
 };
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTls, server::TlsStream as ServerTls};
 use tokio_rustls_acme::{AcmeConfig, Incoming, caches::TestCache};
+use tokio_stream::wrappers::ReceiverStream;
 use x509_parser::{certificate::X509Certificate, oid_registry::Oid, prelude::FromDer};
 
 const DOMAIN: &str = "example.com";
@@ -37,10 +38,19 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const LONG_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configured handshake timeouts and the timeouts they result in.
-const TIMEOUT_CASES: [(Option<Duration>, Duration); 3] = [
-    (None, DEFAULT_TIMEOUT),
-    (Some(CONFIGURED_TIMEOUT), CONFIGURED_TIMEOUT),
-    (Some(LONG_TIMEOUT), LONG_TIMEOUT),
+const TIMEOUT_CASES: [TimeoutCase; 3] = [
+    TimeoutCase {
+        configured: None,
+        expected: DEFAULT_TIMEOUT,
+    },
+    TimeoutCase {
+        configured: Some(CONFIGURED_TIMEOUT),
+        expected: CONFIGURED_TIMEOUT,
+    },
+    TimeoutCase {
+        configured: Some(LONG_TIMEOUT),
+        expected: LONG_TIMEOUT,
+    },
 ];
 
 /// Allowed difference between the configured and the observed timeout.
@@ -48,6 +58,20 @@ const MARGIN: Duration = Duration::from_millis(100);
 
 /// Upper bound for each step against the mock ACME server, which needs the real clock.
 const MOCK_LIMIT: Duration = Duration::from_secs(5);
+
+/// Upper bound for the server's answer to a ClientHello.
+const ANSWER_LIMIT: Duration = Duration::from_secs(1);
+
+/// Paused-clock step that lets `Incoming` take the connections.
+const SETTLE: Duration = Duration::from_millis(1);
+
+/// A handshake timeout to configure and the timeout it results in.
+#[derive(Debug, Clone, Copy)]
+struct TimeoutCase {
+    /// Timeout passed to `handshake_timeout`, or `None` to keep the default.
+    configured: Option<Duration>,
+    expected: Duration,
+}
 
 type Cache = TestCache<io::Error, io::Error>;
 
@@ -88,8 +112,6 @@ fn axum_acceptor_of<EC: std::fmt::Debug + 'static, EA: std::fmt::Debug + 'static
 
 #[cfg(feature = "axum")]
 async fn axum_acceptor(cache: Cache) -> tokio_rustls_acme::axum::AxumAcceptor {
-    use tokio_rustls_acme::EventOk;
-
     let mut state =
         AcmeConfig::new_with_client_tls_config([DOMAIN], support::client_config_without_roots())
             .cache(cache)
@@ -98,7 +120,7 @@ async fn axum_acceptor(cache: Cache) -> tokio_rustls_acme::axum::AxumAcceptor {
     // The resolver has no certificate until the state loads it from the cache.
     loop {
         match state.next().await {
-            Some(Ok(EventOk::DeployedCachedCert)) => return acceptor,
+            Some(Ok(tokio_rustls_acme::EventOk::DeployedCachedCert)) => return acceptor,
             Some(Ok(_)) => {}
             event => panic!("the state did not deploy the cached certificate: {event:?}"),
         }
@@ -124,31 +146,28 @@ async fn assert_closed_after(client: &mut DuplexStream, start: Instant, timeout:
     );
 }
 
-async fn assert_incoming_drops_silent_connection(configured: Option<Duration>, timeout: Duration) {
+async fn assert_incoming_drops_silent_connection(case: TimeoutCase) {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let start = Instant::now();
     let mut incoming = incoming(Cache::new(), [server]);
-    if let Some(configured) = configured {
+    if let Some(configured) = case.configured {
         incoming = incoming.handshake_timeout(configured);
     }
     let incoming = serve(incoming);
 
-    assert_closed_after(&mut client, start, timeout).await;
+    assert_closed_after(&mut client, start, case.expected).await;
     incoming.abort();
 }
 
 #[cfg(feature = "axum")]
-async fn assert_axum_acceptor_gives_up_on_silent_connection(
-    configured: Option<Duration>,
-    timeout: Duration,
-) {
+async fn assert_axum_acceptor_gives_up_on_silent_connection(case: TimeoutCase) {
     let mut acceptor = axum_acceptor(Cache::new()).await;
-    if let Some(configured) = configured {
+    if let Some(configured) = case.configured {
         acceptor = acceptor.handshake_timeout(configured);
     }
 
     let (_client, server) = tokio::io::duplex(64 * 1024);
-    assert_axum_accept_times_out(&acceptor, server, timeout).await;
+    assert_axum_accept_times_out(&acceptor, server, case.expected).await;
 }
 
 #[cfg(feature = "axum")]
@@ -272,8 +291,8 @@ async fn incoming_yields_connection_after_handshake() {
 
 #[tokio::test(start_paused = true)]
 async fn incoming_drops_silent_connection_after_handshake_timeout() {
-    for (configured, timeout) in TIMEOUT_CASES {
-        assert_incoming_drops_silent_connection(configured, timeout).await;
+    for case in TIMEOUT_CASES {
+        assert_incoming_drops_silent_connection(case).await;
     }
 }
 
@@ -302,44 +321,35 @@ async fn incoming_applies_one_deadline_to_whole_handshake() {
 #[tokio::test]
 async fn incoming_answers_tls_alpn_01_validation() {
     let mock = pending_mock().await;
-    let (connections, tcp) = futures::channel::mpsc::unbounded::<DuplexStream>();
-    let mut incoming = mock_config(&mock)
-        .incoming(tcp.map(Ok::<_, io::Error>), Vec::new())
+    let (connections, tcp) = tokio::sync::mpsc::channel::<DuplexStream>(1);
+    let incoming = mock_config(&mock)
+        .incoming(ReceiverStream::new(tcp).map(Ok::<_, io::Error>), Vec::new())
         .handshake_timeout(STALL_LIMIT);
-    let (yielded_tx, mut yielded) = tokio::sync::mpsc::unbounded_channel();
-    let served = tokio::spawn(async move {
-        while let Some(connection) = incoming.next().await {
-            yielded_tx.send(connection.is_ok()).unwrap();
-        }
-    });
+    let served = tokio::spawn(async move { incoming.count().await });
     mock.wait_for_hits("POST /chall/1", 1, MOCK_LIMIT).await;
 
     // The second validation shows that `Incoming` still accepts connections.
     let mut clients = Vec::new();
     for _ in 0..2 {
         let (client, server) = tokio::io::duplex(64 * 1024);
-        connections.unbounded_send(server).unwrap();
+        connections.send(server).await.unwrap();
         clients.push(validate(client).await);
     }
 
     // `Incoming` ends with the TCP stream once no handshake is left.
     drop(connections);
-    tokio::time::timeout(MOCK_LIMIT, served)
+    let yielded = tokio::time::timeout(MOCK_LIMIT, served)
         .await
         .unwrap_or_else(|_| panic!("`Incoming` did not end in {MOCK_LIMIT:?}"))
         .unwrap();
-    assert!(
-        yielded.recv().await.is_none(),
+    assert_eq!(
+        yielded, 0,
         "`Incoming` yielded an item for a validation request"
     );
 }
 
 #[tokio::test(start_paused = true)]
 async fn incoming_answers_all_client_hellos_of_one_wakeup() {
-    const ANSWER_LIMIT: Duration = Duration::from_secs(1);
-    /// Paused-clock step that lets `Incoming` take the connections.
-    const SETTLE: Duration = Duration::from_millis(1);
-
     // Two connections are not enough to show the fault: `FuturesUnordered`
     // wakes its task once more when it polled all of its futures.
     let (mut clients, servers): (Vec<_>, Vec<_>) =
@@ -388,8 +398,8 @@ async fn axum_acceptor_returns_connection_after_handshake() {
 #[cfg(feature = "axum")]
 #[tokio::test(start_paused = true)]
 async fn axum_acceptor_gives_up_on_silent_connection_after_handshake_timeout() {
-    for (configured, timeout) in TIMEOUT_CASES {
-        assert_axum_acceptor_gives_up_on_silent_connection(configured, timeout).await;
+    for case in TIMEOUT_CASES {
+        assert_axum_acceptor_gives_up_on_silent_connection(case).await;
     }
 }
 

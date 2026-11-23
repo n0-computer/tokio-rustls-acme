@@ -10,6 +10,12 @@ use tokio_rustls_acme::caches::DirCache;
 use tokio_rustls_acme::{AcmeAcceptor, AcmeConfig};
 use tokio_stream::StreamExt;
 
+/// Limit for one TLS handshake, the default of axum-server.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pause after an accept error, as in axum's `serve`.
+const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
+
 #[derive(Parser, Debug)]
 struct Args {
     /// Domains
@@ -108,12 +114,6 @@ async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u
         });
     }
 }
-
-/// Limit for one TLS handshake, the default of axum-server.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Pause after an accept error, as in axum's `serve`.
-const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
 
 /// Returns whether `err` concerns only one connection, so accepting can go on at once.
 fn is_connection_error(err: &io::Error) -> bool {
