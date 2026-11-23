@@ -16,9 +16,7 @@ allow = [
 
 [advisories]
 yanked = "deny"
-ignore = [
-  "RUSTSEC-2026-0258", # dev-only: warp -> hyper 0.14 -> h2 0.3; remove once warp moves to hyper 1.x
-]
+ignore = []
 
 [sources]
 allow-git = []
