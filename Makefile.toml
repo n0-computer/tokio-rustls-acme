@@ -2,48 +2,43 @@
 # Crate features for the pebble tests. CI runs them once per crypto backend.
 PEBBLE_FEATURES = { value = "tls-webpki-roots,tls-ring", condition = { env_not_set = ["PEBBLE_FEATURES"] } }
 
-[tasks.pebble-up]
-description = "Start Pebble ACME test server and its DNS server"
+[tasks.pebble-install]
+description = "Download the Pebble and challtestsrv binaries to target/pebble"
+env = { "PEBBLE_VERSION" = "v2.10.3" }
 script = '''
-docker compose -f docker-compose.pebble.yml up -d
-echo "Waiting for Pebble and challtestsrv to be ready..."
-# challtestsrv answers 404 on /, which is enough to show that it runs.
-for url in https://localhost:14000/dir http://127.0.0.1:8055/; do
-    ready=
-    for i in $(seq 1 30); do
-        if curl -sk -o /dev/null "$url"; then
-            ready=1
-            break
-        fi
-        sleep 1
-    done
-    if [ -z "$ready" ]; then
-        echo "No response from $url"
-        docker compose -f docker-compose.pebble.yml logs
-        exit 1
-    fi
+set -eu
+dir=target/pebble
+if [ "$(cat "$dir/version" 2>/dev/null)" = "$PEBBLE_VERSION" ]; then
+    exit 0
+fi
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64) platform=linux-amd64 ;;
+    Linux-aarch64) platform=linux-arm64 ;;
+    Darwin-x86_64) platform=darwin-amd64 ;;
+    Darwin-arm64) platform=darwin-arm64 ;;
+    *) echo "No Pebble release for $(uname -s) $(uname -m)"; exit 1 ;;
+esac
+if command -v sha256sum > /dev/null; then
+    sha256="sha256sum"
+else
+    sha256="shasum -a 256"
+fi
+mkdir -p "$dir"
+for name in pebble pebble-challtestsrv; do
+    archive="$name-$platform.tar.gz"
+    curl -sSfL -o "$dir/$archive" \
+        "https://github.com/letsencrypt/pebble/releases/download/$PEBBLE_VERSION/$archive"
+    grep " $archive\$" test/pebble.sha256 | (cd "$dir" && $sha256 -c -)
+    tar -xzf "$dir/$archive" -C "$dir" --strip-components 3
+    chmod +x "$dir/$name"
+    rm "$dir/$archive"
 done
-echo "Pebble and challtestsrv are ready"
-'''
-
-[tasks.pebble-down]
-description = "Stop Pebble ACME test server and its DNS server"
-script = '''
-docker compose -f docker-compose.pebble.yml down
-rm -f pebble.minica.pem
-'''
-
-[tasks.pebble-cert]
-description = "Extract Pebble minica root cert"
-dependencies = ["pebble-up"]
-script = '''
-docker compose -f docker-compose.pebble.yml cp pebble:/test/certs/pebble.minica.pem ./pebble.minica.pem
+echo "$PEBBLE_VERSION" > "$dir/version"
 '''
 
 [tasks.pebble-test-run]
 description = "Run Pebble integration tests"
-dependencies = ["pebble-cert"]
-env = { "PEBBLE_MINICA_CERT" = "./pebble.minica.pem" }
+dependencies = ["pebble-install"]
 command = "cargo"
 args = [
     "test",
@@ -60,8 +55,8 @@ args = [
 
 [tasks.test]
 clear = true
-description = "Run Pebble integration tests e2e (start server, test, stop)"
-run_task = { name = ["pebble-test-run"], fork = true, cleanup_task = "pebble-down" }
+description = "Run Pebble integration tests e2e (install Pebble, test)"
+run_task = "pebble-test-run"
 
 [tasks.check-external-types]
 description = "Run cargo check-external-types on workspace crates"
