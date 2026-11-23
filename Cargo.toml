@@ -76,7 +76,8 @@ axum = "0.8"
 tokio = { version = "1.19.2", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1.9", features = ["net"] }
 tokio-util = { version = "0.7.3", features = ["compat"] }
-warp = "0.3"
+warp = "0.4"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 tempfile = "3"
 # `verify` checks the challenge certificate self-signature in tests.
 x509-parser = { version = "0.18", features = ["verify"] }
