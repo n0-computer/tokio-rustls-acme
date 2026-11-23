@@ -36,7 +36,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    simple_logger::init_with_level(log::Level::Info).unwrap();
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     let tcp_listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, args.port))
