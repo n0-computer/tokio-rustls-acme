@@ -102,8 +102,8 @@ async fn wait_for_event(events: &Events, wanted: impl Fn(&Result<String, String>
     );
 }
 
-fn is_new_cert_parse_error(err: &str) -> bool {
-    err.starts_with("NewCertParse(")
+fn is_expired_error(err: &str) -> bool {
+    err == "NewCertParse(Expired)"
 }
 
 #[tokio::test]
@@ -155,15 +155,13 @@ async fn renewal_keeps_previous_certificate_when_new_certificate_is_expired() {
     let (driver, events) = drive(state);
 
     wait_for_event(&events, |event| {
-        event
-            .as_ref()
-            .is_err_and(|err| is_new_cert_parse_error(err))
+        event.as_ref().is_err_and(|err| is_expired_error(err))
     })
     .await;
     assert_retry_delay(&mock, "POST /order").await;
     driver.abort();
 
-    assert_only_expected_errors(&events, is_new_cert_parse_error);
+    assert_only_expected_errors(&events, is_expired_error);
     assert_reached(&mock, "POST /cert/1");
     {
         let events = events.lock().expect("poisoned");

@@ -17,7 +17,6 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
-use x509_parser::error::X509Error;
 use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
@@ -163,6 +162,9 @@ pub enum CertParseError {
     /// The crypto provider cannot load the private key, or it does not match the certificate.
     #[error("private key is unsupported or does not match the certificate")]
     InvalidPrivateKey,
+    /// The newly issued certificate has already expired.
+    #[error("certificate has already expired")]
+    Expired,
 }
 
 fn rcgen_err(err: rcgen::Error) -> OrderError {
@@ -309,9 +311,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             log::warn!(
                 "the CA issued a certificate that expired at {not_after}, keeping the deployed one"
             );
-            // A dedicated error variant needs the API break of #67, so reuse `InvalidDate`.
-            let err = x509_parser::nom::Err::Error(X509Error::InvalidDate);
-            return Err(EventError::NewCertParse(CertParseError::X509(err.into())));
+            return Err(EventError::NewCertParse(CertParseError::Expired));
         }
         self.resolver.set_cert(Arc::new(cert));
         self.renew_at = Some(not_after - (not_after - not_before) / 3_i32);
