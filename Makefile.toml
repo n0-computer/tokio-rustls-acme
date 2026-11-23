@@ -1,10 +1,11 @@
 [env]
 # Crate features for the pebble tests. CI runs them once per crypto backend.
 PEBBLE_FEATURES = { value = "tls-webpki-roots,tls-ring", condition = { env_not_set = ["PEBBLE_FEATURES"] } }
+# Pebble release for the pebble tests. After changing it, run `cargo make pebble-update-checksums`.
+PEBBLE_VERSION = "v2.10.3"
 
 [tasks.pebble-install]
 description = "Download the Pebble and challtestsrv binaries to target/pebble"
-env = { "PEBBLE_VERSION" = "v2.10.3" }
 script = '''
 set -eu
 dir=target/pebble
@@ -34,6 +35,28 @@ for name in pebble pebble-challtestsrv; do
     rm "$dir/$archive"
 done
 echo "$PEBBLE_VERSION" > "$dir/version"
+'''
+
+[tasks.pebble-update-checksums]
+description = "Write the checksums of the Pebble release PEBBLE_VERSION to test/pebble.sha256"
+script = '''
+set -eu
+if command -v sha256sum > /dev/null; then
+    sha256="sha256sum"
+else
+    sha256="shasum -a 256"
+fi
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+for name in pebble pebble-challtestsrv; do
+    for platform in darwin-amd64 darwin-arm64 linux-amd64 linux-arm64; do
+        archive="$name-$platform.tar.gz"
+        curl -sSfL -o "$dir/$archive" \
+            "https://github.com/letsencrypt/pebble/releases/download/$PEBBLE_VERSION/$archive"
+    done
+done
+(cd "$dir" && $sha256 *.tar.gz) > test/pebble.sha256
+cat test/pebble.sha256
 '''
 
 [tasks.pebble-test-run]
