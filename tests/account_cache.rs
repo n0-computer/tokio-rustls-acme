@@ -120,8 +120,8 @@ async fn account_rejection_switches_to_unstored_key() {
         let mock = MockAcme::start().await;
         let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate key");
         let key = key_pair.serialize_der();
-        let point = key_pair.public_key_raw().to_vec();
-        mock.state().deactivated_key = reject_account.then(|| point.clone());
+        let point: [u8; 65] = key_pair.public_key_raw().try_into().expect("P-256 point");
+        mock.state().deactivated_key = reject_account.then_some(point);
         mock.state().reject_finalize = reject_finalize;
         let stored_accounts = Arc::default();
         let cache = FixedCache {

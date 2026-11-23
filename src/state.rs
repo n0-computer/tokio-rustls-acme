@@ -57,6 +57,13 @@ fn stall_delay(round: u32) -> Option<Duration> {
     (round < MAX_STALLED_ROUNDS).then(|| BACKOFF_BASE_DELAY * (1 << round))
 }
 
+/// A failed order.
+struct OrderFailure {
+    error: OrderError,
+    /// Whether the CA rejected the account key at `newAccount`.
+    account_rejected: bool,
+}
+
 /// Returns whether a `newAccount` error shows a deactivated or unknown account, RFC 8555 section 7.3.6.
 fn rejects_account(err: &AcmeError) -> bool {
     let AcmeError::HttpRequest(HttpsRequestError::Non2xxStatus { body, .. }) = err else {
@@ -87,7 +94,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     early_action: Option<BoxFuture<Event<EC, EA>>>,
     load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
-    order: Option<BoxFuture<Result<Vec<u8>, (OrderError, bool)>>>,
+    order: Option<BoxFuture<Result<Vec<u8>, OrderFailure>>>,
     backoff_cnt: usize,
     wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
@@ -357,13 +364,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }));
         Event::Ok(EventOk::DeployedNewCert)
     }
-    /// Runs one order, and on failure reports whether the CA rejected the account key.
+    /// Runs one order.
     #[allow(clippy::result_large_err)]
     async fn order(
         config: Arc<AcmeConfig<EC, EA>>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
-    ) -> Result<Vec<u8>, (OrderError, bool)> {
+    ) -> Result<Vec<u8>, OrderFailure> {
         let account = async {
             let directory =
                 Directory::discover(&config.client_config, &config.directory_url).await?;
@@ -377,14 +384,17 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             .await
         }
         .await
-        .map_err(|err| {
-            let rejected = rejects_account(&err);
-            (err.into(), rejected)
+        .map_err(|err| OrderFailure {
+            account_rejected: rejects_account(&err),
+            error: err.into(),
         })?;
         // CAs also use `unauthorized` for order problems, so only account errors count.
         Self::order_with_account(&config, &resolver, &account)
             .await
-            .map_err(|err| (err, false))
+            .map_err(|error| OrderFailure {
+                error,
+                account_rejected: false,
+            })
     }
     async fn order_with_account(
         config: &AcmeConfig<EC, EA>,
@@ -582,7 +592,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         }
                         return Poll::Ready(event);
                     }
-                    Err((err, account_rejected)) => {
+                    Err(OrderFailure {
+                        error,
+                        account_rejected,
+                    }) => {
                         // Keeps the stored key, so a wrong CA answer cannot lose a valid account.
                         if account_rejected {
                             error!(
@@ -591,7 +604,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                             self.account_key = Some(Account::generate_key_pair());
                         }
                         self.back_off();
-                        return Poll::Ready(Err(EventError::Order(err)));
+                        return Poll::Ready(Err(EventError::Order(error)));
                     }
                 }
             }

@@ -363,12 +363,15 @@ pub fn decode_jws(body: &[u8]) -> Option<(Value, Vec<u8>)> {
 }
 
 /// Returns the uncompressed public point of the P-256 key in `jwk`.
-pub fn jwk_public_point(jwk: &Value) -> Vec<u8> {
+pub fn jwk_public_point(jwk: &Value) -> [u8; 65] {
     let coordinate = |name: &str| {
         let value = jwk[name].as_str().expect("JWK coordinate");
         URL_SAFE_NO_PAD.decode(value).expect("base64url coordinate")
     };
-    [vec![0x04], coordinate("x"), coordinate("y")].concat()
+    [vec![0x04], coordinate("x"), coordinate("y")]
+        .concat()
+        .try_into()
+        .expect("P-256 point")
 }
 
 fn unauthorized() -> Response {
@@ -403,7 +406,7 @@ pub struct MockAcmeState {
     /// JWK of the most recent `newAccount` request.
     pub account_jwk: Option<Value>,
     /// Public point of an account key whose `newAccount` requests fail with `unauthorized`.
-    pub deactivated_key: Option<Vec<u8>>,
+    pub deactivated_key: Option<[u8; 65]>,
     /// Answers the next finalization with `unauthorized`, then resets.
     pub reject_finalize: bool,
     /// Number of requests per `"METHOD /path"`.
