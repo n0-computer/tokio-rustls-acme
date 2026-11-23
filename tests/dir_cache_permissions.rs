@@ -11,13 +11,21 @@ use std::{
 use tokio_rustls_acme::{AccountCache, CertCache, caches::DirCache};
 
 const DIRECTORY_URL: &str = "https://acme.example/directory";
+/// Umask that lets group and others read new files.
+const COMMON_UMASK: libc::mode_t = 0o022;
+/// Mask of the permission bits in a file mode.
+const PERMISSION_BITS: u32 = 0o777;
+/// Expected mode of cache files.
+const FILE_MODE: u32 = 0o600;
+/// Expected mode of cache directories.
+const DIR_MODE: u32 = 0o700;
 
 /// Sets umask `022`, so a stricter umask of the caller cannot hide a bug.
 fn set_common_umask() {
     // SAFETY: `umask` only replaces the file mode creation mask of the
     // process and cannot fail. The other test in this binary does not depend on
     // the umask.
-    unsafe { libc::umask(0o022) };
+    unsafe { libc::umask(COMMON_UMASK) };
 }
 
 /// Returns the only file in `dir` whose name starts with `prefix`.
@@ -38,7 +46,7 @@ fn cache_file(dir: &Path, prefix: &str) -> PathBuf {
 
 /// Returns the permission bits of `path`.
 fn mode(path: &Path) -> u32 {
-    fs::metadata(path).unwrap().permissions().mode() & 0o777
+    fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS
 }
 
 /// New files are `0600` and new directories, including missing parents, are `0700`.
@@ -61,10 +69,10 @@ async fn new_files_and_directories_are_owner_only() {
 
     for prefix in ["cached_cert_", "cached_account_"] {
         let file = cache_file(&cache_dir, prefix);
-        assert_eq!(mode(&file), 0o600, "{file:?}");
+        assert_eq!(mode(&file), FILE_MODE, "{file:?}");
     }
-    assert_eq!(mode(&cache_dir), 0o700, "{cache_dir:?}");
-    assert_eq!(mode(&parent), 0o700, "{parent:?}");
+    assert_eq!(mode(&cache_dir), DIR_MODE, "{cache_dir:?}");
+    assert_eq!(mode(&parent), DIR_MODE, "{parent:?}");
 }
 
 /// A symlink at the name of a cache file is replaced, not written through.

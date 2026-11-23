@@ -7,6 +7,10 @@ use std::io::{ErrorKind, Write};
 use std::path::Path;
 use tokio::fs;
 
+/// Mode of directories that [`DirCache`] creates.
+#[cfg(unix)]
+const DIR_MODE: u32 = 0o700;
+
 /// A cache that stores certificates and account keys as files in a directory.
 ///
 /// The files hold private keys. Files are written owner-only (`0600`) on Unix
@@ -45,8 +49,9 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             let mut builder = std::fs::DirBuilder::new();
             builder.recursive(true);
             #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, DIR_MODE);
             builder.create(&dir)?;
+            // `NamedTempFile` creates the file with mode `0600` on Unix.
             let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
             tmp.write_all(&contents)?;
             tmp.as_file().sync_all()?;
