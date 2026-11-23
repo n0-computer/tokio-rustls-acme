@@ -49,7 +49,7 @@ fn test_crypto_provider() -> Arc<CryptoProvider> {
 /// An ACME state machine whose own [`AcmeAcceptor`] answers Pebble's tls-alpn-01 validation.
 struct Site {
     state: AcmeState<io::Error>,
-    listeners: JoinSet<()>,
+    server: JoinSet<()>,
 }
 
 impl Site {
@@ -68,9 +68,9 @@ impl Site {
         let listener = TcpListener::bind((LOCALHOST, port))
             .await
             .unwrap_or_else(|e| panic!("failed to bind {LOCALHOST}:{port}: {e}"));
-        let mut listeners = JoinSet::new();
-        listeners.spawn(serve(listener, acceptor, server_config));
-        Self { state, listeners }
+        let mut server = JoinSet::new();
+        server.spawn(serve(listener, acceptor, server_config));
+        Self { state, server }
     }
 
     /// Polls the state machine until it deploys a new certificate or an order fails.
@@ -100,7 +100,7 @@ impl Site {
 
     /// Closes the listener and waits until its port is free.
     async fn close(mut self) {
-        self.listeners.shutdown().await;
+        self.server.shutdown().await;
     }
 }
 

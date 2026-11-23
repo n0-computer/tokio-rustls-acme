@@ -3,6 +3,8 @@
 //! The binaries come from `PEBBLE_BIN` and `CHALLTESTSRV_BIN`, or else from `target/pebble/`,
 //! where `cargo make pebble-install` puts them.
 
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::{
     env,
     fs::{self, File},
@@ -99,7 +101,10 @@ impl Pebble {
 
     /// Fetches the roots of the ACME CA as a root store, without intermediates.
     pub async fn acme_root_store(&self) -> RootCertStore {
-        let client = management_client();
+        let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(ClientConfig::clone(&self.client_config))
+            .build()
+            .expect("failed to build management API client");
         let mut root_store = RootCertStore::empty();
 
         // Index 1 only exists with PEBBLE_ALTERNATE_ROOTS, so a 404 there is expected.
@@ -268,7 +273,7 @@ fn take_free_port(held: &mut Vec<TcpListener>) -> io::Result<u16> {
     Ok(port)
 }
 
-/// The TLS identity of Pebble's ACME and management API.
+/// The TLS identity of Pebble's ACME and management API, which share one certificate.
 struct WfeTls {
     cert_path: PathBuf,
     key_path: PathBuf,
@@ -315,6 +320,8 @@ struct Process {
 impl Process {
     /// Spawns `command` with its output in `<dir>/<name>.log`.
     fn spawn(name: &'static str, mut command: Command, dir: &Path) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        kill_with_parent(&mut command);
         let log_path = dir.join(format!("{name}.log"));
         let log = File::create(&log_path)?;
         let child = command
@@ -360,6 +367,29 @@ impl Drop for Process {
     }
 }
 
+/// Makes the kernel kill the process that `command` starts once the calling thread exits.
+///
+/// This stops Pebble also when the test process is killed and cannot run [`Process`]'s drop.
+/// Each test runs on its own thread, which ends only after the test dropped its [`Pebble`].
+#[cfg(target_os = "linux")]
+fn kill_with_parent(command: &mut Command) {
+    let parent = std::process::id();
+    // SAFETY: The closure runs between fork and exec. It only calls `prctl` and `getppid`, which
+    // are async-signal-safe, and does not allocate.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // No signal comes if the parent exited before `prctl`.
+            if libc::getppid() as u32 != parent {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Returns an error if any of `processes` exited.
 fn check_running(processes: &mut [Process]) -> io::Result<()> {
     processes.iter_mut().try_for_each(Process::check_running)
@@ -377,20 +407,4 @@ fn binary(var: &str, name: &str) -> PathBuf {
     env::var_os(var)
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(INSTALL_DIR).join(name))
-}
-
-/// Returns a client for Pebble's management API, which serves the same certificate as the
-/// ACME API.
-///
-/// Installs ring as the process-wide default `CryptoProvider` so reqwest's
-/// `rustls-no-provider` build path can construct its own TLS config without
-/// panicking. The pebble tests pin ring for TLS (via the `rustls`
-/// dev-dependency) whatever backend the crate features select, and the
-/// default only affects this test binary.
-fn management_client() -> reqwest::Client {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap()
 }
