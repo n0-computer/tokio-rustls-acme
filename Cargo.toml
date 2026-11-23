@@ -14,7 +14,6 @@ keywords = ["acme", "rustls", "tls", "letsencrypt"]
 categories = ["asynchronous", "cryptography", "network-programming"]
 
 [dependencies]
-# `FusedStream` is part of the public API and n0-future does not re-export it.
 futures-core = "0.3"
 n0-future = "0.3.2"
 rcgen = { version = "0.14", default-features = false, features = ["pem"] }
