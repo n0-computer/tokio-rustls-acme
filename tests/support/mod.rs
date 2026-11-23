@@ -293,9 +293,8 @@ pub enum OrderScript {
 pub struct MockAcmeState {
     pub authz_status: &'static str,
     pub order_script: OrderScript,
-    pub issue_expired: bool,
-    /// Issues certificates that are valid but already due for renewal.
-    pub issue_due: bool,
+    /// Validity of the certificates that the server issues.
+    pub issue_validity: Validity,
     /// Token of the tls-alpn-01 challenge.
     pub token: String,
     /// Domain of the most recent order.
@@ -352,8 +351,7 @@ impl MockAcme {
         let state = Arc::new(Mutex::new(MockAcmeState {
             authz_status: "valid",
             order_script: OrderScript::Normal,
-            issue_expired: false,
-            issue_due: false,
+            issue_validity: Validity::Fresh,
             token: "bW9jay1hY21lLXRva2Vu".to_string(),
             domain: String::new(),
             account_jwk: None,
@@ -489,12 +487,7 @@ fn handle_acme(
             let csr = URL_SAFE_NO_PAD
                 .decode(csr["csr"].as_str().unwrap_or_default())
                 .unwrap_or_default();
-            let validity = match (state.issue_expired, state.issue_due) {
-                (true, _) => Validity::Expired,
-                (false, true) => Validity::Due,
-                (false, false) => Validity::Fresh,
-            };
-            state.issued = Some(ca.issue_for_csr(&csr, &state.domain, validity));
+            state.issued = Some(ca.issue_for_csr(&csr, &state.domain, state.issue_validity));
             Response::json(200, &order_json(base, &state))
         }
         "POST /cert/1" => {

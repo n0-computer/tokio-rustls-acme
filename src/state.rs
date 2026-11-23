@@ -25,18 +25,21 @@ use crate::acme::{
 };
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
-type Timer = std::pin::Pin<Box<Sleep>>;
-type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
-pub(crate) fn after(d: std::time::Duration) -> Timer {
-    Box::pin(tokio::time::sleep(d))
-}
+/// First delay of the order backoffs, which double it on each retry.
+const BACKOFF_BASE_DELAY: Duration = Duration::from_secs(1);
 
 /// Longest renewal sleep, because the monotonic timer misses clock corrections and host suspend.
 const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
 
 /// Number of order rounds that can fail to advance the order status before the order fails.
 const MAX_STALLED_ROUNDS: u32 = 10;
+
+type Timer = std::pin::Pin<Box<Sleep>>;
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+pub(crate) fn after(d: std::time::Duration) -> Timer {
+    Box::pin(tokio::time::sleep(d))
+}
 
 /// Returns the time left from `now` until `deadline`, or `None` once it is reached.
 fn time_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
@@ -51,7 +54,7 @@ fn renewal_sleep(renew_at: OffsetDateTime, now: OffsetDateTime) -> Option<Durati
 
 /// Returns the delay after stalled order round `round`, or `None` once the order should fail.
 fn stall_delay(round: u32) -> Option<Duration> {
-    (round < MAX_STALLED_ROUNDS).then(|| Duration::from_secs(1 << round))
+    (round < MAX_STALLED_ROUNDS).then(|| BACKOFF_BASE_DELAY * (1 << round))
 }
 
 /// Drives ACME orders and renewals, surfacing lifecycle events as a [`Stream`].
@@ -452,8 +455,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
         Err(OrderError::TooManyAttemptsAuth(domain))
     }
+    /// Delays the next order with an exponential backoff.
     fn back_off(&mut self) {
-        self.wait = Some(after(Duration::from_secs(1 << self.backoff_cnt)));
+        self.wait = Some(after(BACKOFF_BASE_DELAY * (1 << self.backoff_cnt)));
         self.backoff_cnt = (self.backoff_cnt + 1).min(16);
     }
     fn poll_next_infinite(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Event<EC, EA>> {

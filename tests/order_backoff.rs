@@ -20,6 +20,8 @@ const DOMAIN: &str = "example.com";
 const LIMIT: Duration = Duration::from_secs(30);
 /// Shortest accepted delay before the first retry, which the client sets to one second.
 const MIN_RETRY_DELAY: Duration = Duration::from_millis(900);
+/// Interval at which the tests check for new events.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The events of a state machine, formatted with `Debug`.
 type Events = Arc<Mutex<Vec<Result<String, String>>>>;
@@ -63,6 +65,7 @@ fn assert_only_expected_errors(events: &Events, expected: impl Fn(&str) -> bool)
     assert!(unexpected.is_empty(), "unexpected errors: {unexpected:#?}");
 }
 
+/// Panics if the client never sent a request to `route`.
 fn assert_reached(mock: &MockAcme, route: &str) {
     assert!(
         mock.state().hits(route) > 0,
@@ -84,14 +87,16 @@ async fn assert_retry_delay(mock: &MockAcme, route: &str) {
     );
 }
 
+/// Returns whether any recorded event matches `wanted`.
 fn has_event(events: &Events, wanted: impl Fn(&Result<String, String>) -> bool) -> bool {
     events.lock().expect("poisoned").iter().any(wanted)
 }
 
+/// Waits for an event that matches `wanted`, and panics after [`LIMIT`].
 async fn wait_for_event(events: &Events, wanted: impl Fn(&Result<String, String>) -> bool) {
     let reached = tokio::time::timeout(LIMIT, async {
         while !has_event(events, &wanted) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     })
     .await;
@@ -102,6 +107,7 @@ async fn wait_for_event(events: &Events, wanted: impl Fn(&Result<String, String>
     );
 }
 
+/// Returns whether `err` is the `Debug` output of an expired new certificate error.
 fn is_expired_error(err: &str) -> bool {
     err == "NewCertParse(Expired)"
 }
@@ -127,7 +133,7 @@ async fn order_round_backs_off_while_order_status_does_not_advance() {
 #[tokio::test]
 async fn renewal_backs_off_when_new_certificate_is_already_due() {
     let mock = MockAcme::start().await;
-    mock.state().issue_due = true;
+    mock.state().issue_validity = Validity::Due;
     let (driver, events) = drive(state(&mock));
 
     assert_retry_delay(&mock, "POST /order").await;
@@ -143,7 +149,7 @@ async fn renewal_backs_off_when_new_certificate_is_already_due() {
 #[tokio::test]
 async fn renewal_keeps_previous_certificate_when_new_certificate_is_expired() {
     let mock = MockAcme::start().await;
-    mock.state().issue_expired = true;
+    mock.state().issue_validity = Validity::Expired;
     // The cached certificate is still valid but due for renewal, so an order starts at once.
     let cached = MockCa::new().issue_with_key(DOMAIN, Validity::Due);
     let cache = RecordingCache::new(cached);
