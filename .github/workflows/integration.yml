@@ -9,7 +9,6 @@ on:
 env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: -Dwarnings
-  SCCACHE_GHA_ENABLED: "on"
   RUSTC_WRAPPER: "sccache"
 
 # Default to read-only; jobs that need more grant it explicitly.
