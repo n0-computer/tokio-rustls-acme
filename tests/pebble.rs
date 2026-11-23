@@ -27,6 +27,7 @@ use rustls::{
     crypto::CryptoProvider,
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use serde_json::json;
 use tokio::{
     net::{TcpListener, TcpStream},
     task::JoinSet,
@@ -78,6 +79,7 @@ fn pebble_client_config() -> Arc<ClientConfig> {
     )
 }
 
+/// Returns a config for `domains` against Pebble, without a cache.
 fn pebble_config(domains: &[&str]) -> AcmeConfig<io::Error> {
     AcmeConfig::new_with_client_tls_config(domains, pebble_client_config())
         .directory(PEBBLE_DIRECTORY)
@@ -113,8 +115,8 @@ async fn pebble_acme_root_store() -> RootCertStore {
             .await
             .unwrap_or_else(|e| panic!("failed to reach Pebble management API at {url}: {e}"));
         if resp.status().is_success() {
-            let pem_text = resp.text().await.unwrap();
-            for p in pem::parse_many(&pem_text).unwrap() {
+            let pem_text = resp.text().await.expect("failed to read Pebble root");
+            for p in pem::parse_many(&pem_text).expect("failed to parse Pebble root PEM") {
                 root_store
                     .add(CertificateDer::from(p.into_contents()))
                     .expect("failed to add Pebble root to root store");
@@ -138,26 +140,25 @@ async fn set_dns_record(domain: &str, addr: IpAddr) {
     let host = format!("{domain}.");
     let client = http_client();
     // `add-a` appends to the records of earlier runs, so clear them first.
-    for (path, body) in [
-        (format!("clear-{kind}"), serde_json::json!({ "host": host })),
-        (
-            format!("add-{kind}"),
-            serde_json::json!({ "host": host, "addresses": [addr.to_string()] }),
-        ),
-    ] {
-        let url = format!("{CHALLTESTSRV_MGMT}/{path}");
-        let resp = client
-            .post(&url)
-            .body(body.to_string())
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("failed to reach challtestsrv at {url}: {e}"));
-        assert!(
-            resp.status().is_success(),
-            "{url} returned {}",
-            resp.status()
-        );
-    }
+    post_challtestsrv(&client, &format!("clear-{kind}"), json!({ "host": host })).await;
+    let body = json!({ "host": host, "addresses": [addr.to_string()] });
+    post_challtestsrv(&client, &format!("add-{kind}"), body).await;
+}
+
+/// Posts `body` to the `challtestsrv` management endpoint `path`.
+async fn post_challtestsrv(client: &reqwest::Client, path: &str, body: serde_json::Value) {
+    let url = format!("{CHALLTESTSRV_MGMT}/{path}");
+    let resp = client
+        .post(&url)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("failed to reach challtestsrv at {url}: {e}"));
+    assert!(
+        resp.status().is_success(),
+        "{url} returned {}",
+        resp.status()
+    );
 }
 
 /// An ACME state machine whose own [`AcmeAcceptor`] answers Pebble's tls-alpn-01 validation.
@@ -167,13 +168,14 @@ struct Site {
 }
 
 impl Site {
+    /// Starts the state machine and serves its acceptor on [`TLS_ALPN_PORT`] of each of `addrs`.
     async fn bind(config: AcmeConfig<io::Error>, addrs: &[IpAddr]) -> Self {
         let state = config.state();
         let acceptor = state.acceptor();
         let server_config = Arc::new(
             ServerConfig::builder_with_provider(state.crypto_provider())
                 .with_protocol_versions(DEFAULT_VERSIONS)
-                .unwrap()
+                .expect("provider should support the default protocol versions")
                 .with_no_client_auth()
                 .with_cert_resolver(state.resolver()),
         );
@@ -216,6 +218,7 @@ impl Site {
     }
 }
 
+/// Accepts connections on `listener` and answers each with `acceptor`.
 async fn serve(listener: TcpListener, acceptor: AcmeAcceptor, server_config: Arc<ServerConfig>) {
     let mut connections = JoinSet::new();
     loop {
@@ -242,7 +245,7 @@ async fn fetch_chain(addr: IpAddr, name: ServerName<'static>) -> Vec<Certificate
     let connector = TlsConnector::from(Arc::new(
         ClientConfig::builder_with_provider(test_crypto_provider())
             .with_protocol_versions(DEFAULT_VERSIONS)
-            .unwrap()
+            .expect("provider should support the default protocol versions")
             .with_root_certificates(pebble_acme_root_store().await)
             .with_no_client_auth(),
     ));
@@ -262,8 +265,10 @@ async fn fetch_chain(addr: IpAddr, name: ServerName<'static>) -> Vec<Certificate
     chain.to_vec()
 }
 
+/// Like [`fetch_chain`], with `domain` as server name.
 async fn fetch_chain_for(addr: IpAddr, domain: &str) -> Vec<CertificateDer<'static>> {
-    fetch_chain(addr, ServerName::try_from(domain.to_owned()).unwrap()).await
+    let name = ServerName::try_from(domain.to_owned()).expect("invalid domain");
+    fetch_chain(addr, name).await
 }
 
 /// Asserts that `chain` verifies for `domain` against Pebble's roots only with its intermediates.
@@ -271,8 +276,8 @@ async fn assert_needs_intermediates(chain: &[CertificateDer<'static>], domain: &
     let roots = Arc::new(pebble_acme_root_store().await);
     let verifier = WebPkiServerVerifier::builder_with_provider(roots, test_crypto_provider())
         .build()
-        .unwrap();
-    let name = ServerName::try_from(domain.to_owned()).unwrap();
+        .expect("failed to build verifier");
+    let name = ServerName::try_from(domain.to_owned()).expect("invalid domain");
     let now = UnixTime::now();
     let (leaf, intermediates) = chain.split_first().expect("empty chain");
     verifier
@@ -289,8 +294,8 @@ async fn assert_needs_intermediates(chain: &[CertificateDer<'static>], domain: &
 /// Returns the path of the only file in `dir` whose name starts with `prefix`.
 fn cache_file(dir: &Path, prefix: &str) -> PathBuf {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| entry.unwrap())
+        .expect("failed to read cache dir")
+        .map(|entry| entry.expect("failed to read cache dir entry"))
         .filter(|entry| {
             entry
                 .file_name()
@@ -318,6 +323,7 @@ struct AcmeEvents {
     cached_cert_parse_error: bool,
 }
 
+/// Runs a [`Site`] with `cache` until it deploys a certificate, collecting events.
 async fn acquire_cert_with_cache<C>(domain: &str, addr: IpAddr, cache: C) -> (Site, AcmeEvents)
 where
     C: CertCache<EC = io::Error> + AccountCache<EA = io::Error> + Send + Sync + 'static,
@@ -441,7 +447,7 @@ async fn test_corrupted_cache_reissues_with_cached_account() {
     let domain = "corrupted-cache.example.com";
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5));
     set_dns_record(domain, addr).await;
-    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().expect("failed to create temp dir");
     let cache_path: PathBuf = cache_dir.path().into();
 
     let (site, events) =
@@ -453,8 +459,9 @@ async fn test_corrupted_cache_reissues_with_cached_account() {
     site.close().await;
 
     let account_file = cache_file(&cache_path, "cached_account_");
-    let account_key = std::fs::read(&account_file).unwrap();
-    std::fs::write(cache_file(&cache_path, "cached_cert_"), b"not a valid PEM").unwrap();
+    let account_key = std::fs::read(&account_file).expect("failed to read cached account");
+    std::fs::write(cache_file(&cache_path, "cached_cert_"), b"not a valid PEM")
+        .expect("failed to corrupt cached cert");
 
     let (_site, events) = acquire_cert_with_cache(domain, addr, DirCache::new(cache_path)).await;
     assert!(
@@ -466,7 +473,7 @@ async fn test_corrupted_cache_reissues_with_cached_account() {
         "second run should load cached account, not store a new one"
     );
     assert_eq!(
-        std::fs::read(&account_file).unwrap(),
+        std::fs::read(&account_file).expect("failed to read cached account"),
         account_key,
         "second run should not replace the cached account key"
     );
@@ -517,7 +524,8 @@ async fn test_multi_domain_san() {
     for (domain, addr) in hosts {
         let peer_certs = fetch_chain_for(addr, domain).await;
 
-        let (_, leaf) = x509_parser::parse_x509_certificate(peer_certs[0].as_ref()).unwrap();
+        let (_, leaf) = x509_parser::parse_x509_certificate(peer_certs[0].as_ref())
+            .expect("failed to parse leaf certificate");
         let sans: Vec<String> = leaf
             .subject_alternative_name()
             .expect("SAN extension missing")
