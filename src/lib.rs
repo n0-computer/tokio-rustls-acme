@@ -119,9 +119,8 @@
 //!
 //! ## The acme module
 //!
-//! The underlying implementation of an async acme client may be useful to others and is exposed as
-//! a module. It is incomplete (contributions welcome) and not covered by any stability
-//! promises.
+//! The [acme] module holds the ACME server objects and errors that [OrderError] carries, and the
+//! Let's Encrypt directory URLs. The ACME client itself is internal.
 //!
 //! ## Special thanks
 //!

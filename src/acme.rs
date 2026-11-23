@@ -32,6 +32,7 @@ pub const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
 /// ALPN protocol name that marks a `tls-alpn-01` validation handshake (RFC 8737).
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
+/// An account at an ACME server, with the key that signs its requests.
 #[derive(Debug)]
 pub(crate) struct Account {
     pub(crate) key_pair: EcdsaKeyPair,
@@ -268,7 +269,7 @@ impl Directory {
     }
 }
 
-/// See RFC 8555 section 7.3.4 for more information.
+/// A key that binds a new account to an external CA account (RFC 8555 section 7.3.4).
 pub(crate) struct ExternalAccountKey {
     /// Key identifier that the CA assigned to the external account.
     pub kid: String,
