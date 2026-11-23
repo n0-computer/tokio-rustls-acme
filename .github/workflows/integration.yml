@@ -18,9 +18,11 @@ permissions:
 
 jobs:
   pebble:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     strategy:
       fail-fast: false
+      # Pebble binds fixed host ports.
+      max-parallel: 1
       matrix:
         features:
           - "tls-webpki-roots,tls-ring"
