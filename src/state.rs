@@ -34,10 +34,9 @@ const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
 /// Number of order rounds that can fail to advance the order status before the order fails.
 const MAX_STALLED_ROUNDS: u32 = 10;
 
-type Timer = std::pin::Pin<Box<Sleep>>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-pub(crate) fn after(d: std::time::Duration) -> Timer {
+pub(crate) fn after(d: Duration) -> Pin<Box<Sleep>> {
     Box::pin(tokio::time::sleep(d))
 }
 
@@ -72,7 +71,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
     order: Option<BoxFuture<Result<Vec<u8>, OrderError>>>,
     backoff_cnt: usize,
-    wait: Option<Timer>,
+    wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
 }
 
