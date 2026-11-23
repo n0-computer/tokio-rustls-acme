@@ -111,18 +111,24 @@ async fn account_key_is_stored_only_when_missing() {
     }
 }
 
+/// The request that the mock CA answers with `unauthorized`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rejected {
+    NewAccount,
+    Finalize,
+}
+
 /// A CA rejecting `newAccount` switches to a new unstored key. Other rejections keep the key.
 #[tokio::test]
 async fn account_rejection_switches_to_unstored_key() {
-    // (case, newAccount rejected, finalize rejected)
-    let cases = [("newAccount", true, false), ("finalize", false, true)];
-    for (name, reject_account, reject_finalize) in cases {
+    for rejected in [Rejected::NewAccount, Rejected::Finalize] {
+        let reject_account = rejected == Rejected::NewAccount;
         let mock = MockAcme::start().await;
         let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate key");
         let key = key_pair.serialize_der();
         let point: [u8; 65] = key_pair.public_key_raw().try_into().expect("P-256 point");
         mock.state().deactivated_key = reject_account.then_some(point);
-        mock.state().reject_finalize = reject_finalize;
+        mock.state().reject_finalize = rejected == Rejected::Finalize;
         let stored_accounts = Arc::default();
         let cache = FixedCache {
             account: Ok(Some(key)),
@@ -137,15 +143,19 @@ async fn account_rejection_switches_to_unstored_key() {
         let first = state.next().await.expect("event");
         assert!(
             matches!(first, Err(EventError::Order(_))),
-            "{name}: {first:?}"
+            "{rejected:?}: {first:?}"
         );
         deploy_new_cert(&mut state).await;
 
         assert!(
             stored_accounts.lock().expect("poisoned").is_empty(),
-            "{name}"
+            "{rejected:?}"
         );
         let jwk = mock.state().account_jwk.clone().expect("newAccount JWK");
-        assert_eq!(jwk_public_point(&jwk) != point, reject_account, "{name}");
+        assert_eq!(
+            jwk_public_point(&jwk) != point,
+            reject_account,
+            "{rejected:?}"
+        );
     }
 }

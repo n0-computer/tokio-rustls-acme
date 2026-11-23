@@ -21,9 +21,8 @@ use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
-    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus, Problem,
+    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
 };
-use crate::https_helper::HttpsRequestError;
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
 /// First delay of the order backoffs, which double it on each retry.
@@ -62,23 +61,6 @@ struct OrderFailure {
     error: OrderError,
     /// Whether the CA rejected the account key at `newAccount`.
     account_rejected: bool,
-}
-
-/// Returns whether a `newAccount` error shows a deactivated or unknown account, RFC 8555 section 7.3.6.
-fn rejects_account(err: &AcmeError) -> bool {
-    let AcmeError::HttpRequest(HttpsRequestError::Non2xxStatus { body, .. }) = err else {
-        return false;
-    };
-    let typ = serde_json::from_str::<Problem>(body)
-        .ok()
-        .and_then(|p| p.typ);
-    matches!(
-        typ.as_deref(),
-        Some(
-            "urn:ietf:params:acme:error:unauthorized"
-                | "urn:ietf:params:acme:error:accountDoesNotExist"
-        )
-    )
 }
 
 /// Drives ACME orders and renewals, surfacing lifecycle events as a [`Stream`].
@@ -365,6 +347,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Event::Ok(EventOk::DeployedNewCert)
     }
     /// Runs one order.
+    // Returns once per order, so the error size does not matter.
     #[allow(clippy::result_large_err)]
     async fn order(
         config: Arc<AcmeConfig<EC, EA>>,
@@ -385,7 +368,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
         .await
         .map_err(|err| OrderFailure {
-            account_rejected: rejects_account(&err),
+            account_rejected: err.rejects_account(),
             error: err.into(),
         })?;
         // CAs also use `unauthorized` for order problems, so only account errors count.
@@ -673,28 +656,6 @@ mod tests {
                 "renew at {renew_at}"
             );
         }
-    }
-
-    #[test]
-    fn rejects_account_on_account_problems_only() {
-        let non_2xx = |body: &str| {
-            AcmeError::HttpRequest(HttpsRequestError::Non2xxStatus {
-                status_code: 403,
-                body: body.to_string(),
-            })
-        };
-        let problem = |typ: &str| format!(r#"{{"type":"urn:ietf:params:acme:error:{typ}"}}"#);
-        let cases = [
-            (problem("unauthorized"), true),
-            (problem("accountDoesNotExist"), true),
-            (problem("rateLimited"), false),
-            ("{}".to_string(), false),
-            ("unauthorized".to_string(), false),
-        ];
-        for (body, expected) in cases {
-            assert_eq!(rejects_account(&non_2xx(&body)), expected, "{body}");
-        }
-        assert!(!rejects_account(&AcmeError::MissingHeader("location")));
     }
 
     #[test]
