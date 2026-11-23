@@ -1,5 +1,6 @@
 //! Tests for the timeouts, body limit and redirect policy of the ACME HTTP client.
 
+#[path = "../../tests/support/mod.rs"]
 mod support;
 
 use std::{
@@ -10,17 +11,14 @@ use std::{
     time::Duration,
 };
 
+use crate::acme::{Account, Directory};
+use crate::https_helper::{CONNECT_TIMEOUT, REQUEST_TIMEOUT};
 use serde_json::{Value, json};
 use support::{Request, Response, Server};
 use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::Instant};
-use tokio_rustls_acme::acme::{Account, Directory};
 
 /// Paused-clock bound far above any client timeout, so hitting it means no timeout exists.
 const STALL_LIMIT: Duration = Duration::from_secs(3600);
-
-// These mirror the private constants in `src/https_helper.rs`.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Real-clock limit for instant steps, below [`CONNECT_TIMEOUT`] to catch connect attempts.
 const QUICK_LIMIT: Duration = Duration::from_secs(5);
@@ -173,7 +171,14 @@ async fn signed_request_is_not_redirected() {
         new_order: format!("https://{addr}/order"),
     };
     let contact: [&str; 0] = [];
-    let account = Account::create(&tls.client_config, directory, &contact, &None).await;
+    let account = Account::create_with_keypair(
+        &tls.client_config,
+        directory,
+        &contact,
+        &Account::generate_key_pair(),
+        &None,
+    )
+    .await;
 
     assert!(
         account.is_err(),
@@ -214,9 +219,15 @@ async fn plain_http_object_url_is_refused_for_https_directory() {
         new_order: format!("https://{addr}/order"),
     };
     let contact: [&str; 0] = [];
-    let account = Account::create(&tls.client_config, directory, &contact, &None)
-        .await
-        .expect("the account creation failed");
+    let account = Account::create_with_keypair(
+        &tls.client_config,
+        directory,
+        &contact,
+        &Account::generate_key_pair(),
+        &None,
+    )
+    .await
+    .expect("the account creation failed");
     let order = account
         .order(&tls.client_config, format!("http://{plain_addr}/order/1"))
         .await;

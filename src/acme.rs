@@ -460,6 +460,9 @@ fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeE
 }
 
 #[cfg(test)]
+mod http_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rustls::crypto::KeyProvider;
