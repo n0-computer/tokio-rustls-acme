@@ -382,7 +382,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let auth = account.auth(&config.client_config, url).await?;
         let (domain, challenge_url) = match auth.status {
             AuthStatus::Pending => {
-                let domain = auth.identifier.as_str().to_string();
+                let domain = auth.identifier.to_string();
                 log::info!("trigger challenge for {}", domain);
                 let (challenge, auth_key) = account.tls_alpn_01(
                     config.crypto_provider(),

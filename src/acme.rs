@@ -134,7 +134,7 @@ impl Account {
         log::debug!("response: {body:?}");
         Ok((location, body))
     }
-    /// Create a new order for `domains`, which may contain DNS names and IP addresses.
+    /// Creates a new order for `domains`, which may contain DNS names and IP addresses.
     ///
     /// If `profile` is set, it is sent as the order's certificate profile (see
     /// [`AcmeConfig::profile`](crate::AcmeConfig::profile)).
@@ -377,36 +377,25 @@ pub enum AuthStatus {
     Deactivated,
 }
 
-/// ACME identifier per RFC 8555 §9.7.7.
-///
-/// Serializes as `{"type":"dns","value":"..."}` or `{"type":"ip","value":"..."}`.
-/// IP identifier support is defined in RFC 8738.
+/// An ACME identifier (RFC 8555 section 9.7.7, RFC 8738 for IP addresses).
 ///
 /// Converting from a string picks [`Identifier::Ip`] if the string parses as an IP address and
-/// [`Identifier::Dns`] otherwise. IP addresses are stored in their canonical text form (RFC 5952
-/// for IPv6), as RFC 8738 §3 requires.
+/// [`Identifier::Dns`] otherwise. IP addresses serialize in their canonical text form (RFC 5952
+/// for IPv6), as RFC 8738 section 3 requires.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum Identifier {
     /// A DNS name.
     Dns(String),
-    Ip(String),
-}
-
-impl Identifier {
-    /// Extract the inner value regardless of variant.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Identifier::Dns(v) | Identifier::Ip(v) => v,
-        }
-    }
+    /// An IP address.
+    Ip(IpAddr),
 }
 
 impl From<String> for Identifier {
     fn from(s: String) -> Self {
         match s.parse::<IpAddr>() {
-            Ok(ip) => Identifier::Ip(ip.to_string()),
+            Ok(ip) => Identifier::Ip(ip),
             Err(_) => Identifier::Dns(s),
         }
     }
@@ -420,7 +409,10 @@ impl From<&str> for Identifier {
 
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Identifier::Dns(name) => f.write_str(name),
+            Identifier::Ip(ip) => ip.fmt(f),
+        }
     }
 }
 
@@ -523,11 +515,11 @@ mod tests {
         );
         assert_eq!(
             Identifier::from("192.0.2.1"),
-            Identifier::Ip("192.0.2.1".into())
+            Identifier::Ip("192.0.2.1".parse().unwrap())
         );
         assert_eq!(
             Identifier::from("2001:db8::1".to_string()),
-            Identifier::Ip("2001:db8::1".into())
+            Identifier::Ip("2001:db8::1".parse().unwrap())
         );
         // Not a valid IPv4 address (leading zero), so it falls through to DNS.
         assert_eq!(
@@ -542,11 +534,11 @@ mod tests {
         for input in ["2001:DB8:0:0::1", "2001:0db8:0000:0000:0000:0000:0000:0001"] {
             assert_eq!(
                 Identifier::from(input),
-                Identifier::Ip("2001:db8::1".into()),
+                Identifier::Ip("2001:db8::1".parse().unwrap()),
                 "{input}"
             );
         }
-        assert_eq!(Identifier::from("0:0::1").as_str(), "::1");
+        assert_eq!(Identifier::from("0:0::1").to_string(), "::1");
     }
 
     #[test]

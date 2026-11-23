@@ -37,6 +37,7 @@ use tokio_rustls_acme::{
     AccountCache, AcmeAcceptor, AcmeConfig, AcmeState, CertCache, EventError, EventOk, OrderError,
     caches::{DirCache, NoCache},
 };
+use x509_parser::extensions::GeneralName;
 
 const PEBBLE_DIRECTORY: &str = "https://localhost:14000/dir";
 const PEBBLE_MGMT: &str = "https://localhost:15000";
@@ -45,6 +46,11 @@ const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8055";
 /// The tls-alpn-01 port, `tlsPort` in `test/pebble-config.json`.
 const TLS_ALPN_PORT: u16 = 5001;
 const ORDER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Serializes the tests that listen on `127.0.0.1` or `::1`.
+///
+/// The tests with IP identifiers share these addresses. Pebble's VA connects to the address in
+/// the identifier, and `::1` is the only IPv6 loopback address.
+static LOOPBACK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Read the Pebble minica root cert from the path in PEBBLE_MINICA_CERT.
 fn load_minica_cert() -> Vec<u8> {
@@ -562,7 +568,7 @@ fn ip_sans(cert: &CertificateDer<'_>) -> Vec<IpAddr> {
         .general_names
         .iter()
         .filter_map(|name| match name {
-            x509_parser::extensions::GeneralName::IPAddress(bytes) => match bytes.len() {
+            GeneralName::IPAddress(bytes) => match bytes.len() {
                 4 => Some(IpAddr::from(<[u8; 4]>::try_from(*bytes).unwrap())),
                 16 => Some(IpAddr::from(<[u8; 16]>::try_from(*bytes).unwrap())),
                 n => panic!("IP SAN with {n} bytes"),
@@ -571,12 +577,6 @@ fn ip_sans(cert: &CertificateDer<'_>) -> Vec<IpAddr> {
         })
         .collect()
 }
-
-/// Serializes the tests that listen on `127.0.0.1` or `::1`.
-///
-/// The tests with IP identifiers share these addresses. Pebble's VA connects to the address in
-/// the identifier, and `::1` is the only IPv6 loopback address.
-static LOOPBACK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Orders a certificate for the IP addresses `ips`, with `profile` if set.
 ///
@@ -609,7 +609,7 @@ async fn acquire_ip_cert(
     result.map(|()| chains.swap_remove(0))
 }
 
-/// Issue a certificate for an IPv4 address through real tls-alpn-01 validation.
+/// Issues a certificate for an IPv4 address through real tls-alpn-01 validation.
 ///
 /// The CA sends the reverse-DNS name `1.0.0.127.in-addr.arpa` as SNI (RFC 8738 section 6), so
 /// this fails unless the resolver serves the challenge certificate under that name.
@@ -623,8 +623,9 @@ async fn test_validated_ipv4_certificate() {
     assert_eq!(ip_sans(&chain[0]), [ip]);
 }
 
-/// Issue a certificate for an IPv6 address through real tls-alpn-01 validation, with the
-/// nibble-format reverse name under `ip6.arpa` as SNI.
+/// Issues a certificate for an IPv6 address through real tls-alpn-01 validation.
+///
+/// The CA sends the nibble-format reverse name under `ip6.arpa` as SNI.
 #[tokio::test]
 #[ignore]
 async fn test_validated_ipv6_certificate() {
@@ -635,7 +636,7 @@ async fn test_validated_ipv6_certificate() {
     assert_eq!(ip_sans(&chain[0]), [ip]);
 }
 
-/// Issue one certificate for both an IPv4 and an IPv6 address.
+/// Issues one certificate for both an IPv4 and an IPv6 address.
 #[tokio::test]
 #[ignore]
 async fn test_validated_dual_stack_certificate() {
@@ -649,7 +650,7 @@ async fn test_validated_dual_stack_certificate() {
     assert_eq!(ip_sans(&chain[0]), ips);
 }
 
-/// Issue one certificate for an IP address and a domain.
+/// Issues one certificate for an IP address and a domain.
 ///
 /// Pebble validates the IP identifier on `127.0.0.1` with the reverse-DNS name as SNI, and the
 /// domain on the address that `challtestsrv` resolves it to, with the domain as SNI.
@@ -682,20 +683,18 @@ async fn test_validated_mixed_ip_and_domain_certificate() {
         .value
         .general_names
         .iter()
-        .any(
-            |name| matches!(name, x509_parser::extensions::GeneralName::DNSName(d) if *d == domain),
-        );
+        .any(|name| matches!(name, GeneralName::DNSName(d) if *d == domain));
     assert!(has_dns, "certificate should contain a DNS SAN for {domain}");
 }
 
-/// Lifetime of a DER certificate (`notAfter - notBefore`) in seconds.
+/// Returns the lifetime of a DER certificate (`notAfter - notBefore`) in seconds.
 fn lifetime_secs(cert: &CertificateDer<'_>) -> i64 {
     let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
     let validity = cert.validity();
     validity.not_after.timestamp() - validity.not_before.timestamp()
 }
 
-/// Request certificates under specific ACME profiles and check that the CA applied them.
+/// Requests certificates under specific ACME profiles and checks that the CA applied them.
 ///
 /// `test/pebble-config.json` gives the profiles distinct validity periods. Pebble issues
 /// certificates valid for `validityPeriod - 1` seconds.

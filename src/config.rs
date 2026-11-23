@@ -37,7 +37,7 @@ impl AcmeConfig<Infallible, Infallible> {
     ///
     /// `domains` are the identifiers to request a certificate for: DNS names, or IP addresses
     /// (RFC 8738). Let's Encrypt issues IP address certificates only under the `shortlived`
-    /// profile, see [AcmeConfig::profile].
+    /// profile, see [`AcmeConfig::profile`].
     ///
     /// ```rust,no_run
     /// # use tokio_rustls_acme::AcmeConfig;
@@ -157,20 +157,20 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         .into();
         self
     }
-    /// Set the identifiers to request a certificate for, replacing the current ones.
+    /// Sets the identifiers to request a certificate for, replacing the current ones.
     ///
     /// Each identifier is a DNS name or an IP address.
     pub fn domains(mut self, contact: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         self.domains = contact.into_iter().map(|s| s.as_ref().into()).collect();
         self
     }
-    /// Add an identifier (DNS name or IP address) to request a certificate for.
+    /// Adds an identifier (DNS name or IP address) to request a certificate for.
     pub fn domains_push(mut self, contact: impl AsRef<str>) -> Self {
         self.domains.push(contact.as_ref().into());
         self
     }
 
-    /// Request certificates with the given ACME profile.
+    /// Requests certificates with the given ACME profile.
     ///
     /// Profiles are defined by the CA and listed in its directory under `meta.profiles` (see
     /// [draft-ietf-acme-profiles](https://datatracker.ietf.org/doc/draft-ietf-acme-profiles/)).
