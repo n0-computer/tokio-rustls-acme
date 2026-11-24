@@ -1,7 +1,7 @@
 use crate::AcmeState;
 use crate::acceptor::{AcmeAccept, AcmeAcceptor, server_config};
-use futures::Stream;
-use futures::stream::{FusedStream, FuturesUnordered};
+use futures_core::FusedStream;
+use n0_future::{FuturesUnordered, Stream};
 use rustls::ServerConfig;
 use std::fmt::Debug;
 use std::pin::Pin;
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{Accept, server::TlsStream};
+use tracing::{error, info};
 
 /// [`Stream`] of accepted application TLS connections.
 ///
@@ -92,8 +93,8 @@ impl<
             match Pin::new(&mut self.state).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
                     match event {
-                        Ok(ok) => log::info!("event: {ok:?}"),
-                        Err(err) => log::error!("event: {err:?}"),
+                        Ok(ok) => info!(event = ?ok, "event"),
+                        Err(err) => error!(?err, "event"),
                     }
                     continue;
                 }
@@ -101,15 +102,16 @@ impl<
                 Poll::Pending => {}
             }
             match Pin::new(&mut self.acme_accepting).poll_next(cx) {
-                Poll::Ready(Some(Ok(Some(tls)))) => self
-                    .tls_accepting
-                    .push(tls.into_stream(self.rustls_config.clone())),
+                Poll::Ready(Some(Ok(Some(tls)))) => {
+                    let accept = tls.into_stream(self.rustls_config.clone());
+                    self.tls_accepting.push(accept);
+                }
                 Poll::Ready(Some(Ok(None))) => {
-                    log::info!("received TLS-ALPN-01 validation request");
+                    info!("received TLS-ALPN-01 validation request");
                     continue;
                 }
                 Poll::Ready(Some(Err(err))) => {
-                    log::error!("tls accept failed, {err:?}");
+                    error!(?err, "tls accept failed");
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => {}
@@ -117,7 +119,7 @@ impl<
             match Pin::new(&mut self.tls_accepting).poll_next(cx) {
                 Poll::Ready(Some(Ok(tls))) => return Poll::Ready(Some(Ok(tls))),
                 Poll::Ready(Some(Err(err))) => {
-                    log::error!("tls accept failed, {err:?}");
+                    error!(?err, "tls accept failed");
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => {}
@@ -130,7 +132,10 @@ impl<
                 },
             };
             match Pin::new(tcp_incoming).poll_next(cx) {
-                Poll::Ready(Some(Ok(tcp))) => self.acme_accepting.push(self.acceptor.accept(tcp)),
+                Poll::Ready(Some(Ok(tcp))) => {
+                    let accept = self.acceptor.accept(tcp);
+                    self.acme_accepting.push(accept);
+                }
                 Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
                 Poll::Ready(None) => self.tcp_incoming = None,
                 Poll::Pending => return Poll::Pending,

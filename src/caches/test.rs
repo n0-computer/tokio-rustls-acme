@@ -8,6 +8,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicPtr;
+use tracing::{error, info};
 
 /// Test cache, which generates certificates for ACME incompatible test environments.
 /// ```rust
@@ -87,7 +88,7 @@ impl<EC: Debug, EA: Debug> CertCache for TestCache<EC, EA> {
         let cert = match params.signed_by(&key_pair, &self.ca_issuer) {
             Ok(cert) => cert,
             Err(err) => {
-                log::error!("test cache: generation error: {err:?}");
+                error!(?err, "test cache: generation error");
                 return Ok(None);
             }
         };
@@ -110,7 +111,7 @@ impl<EC: Debug, EA: Debug> CertCache for TestCache<EC, EA> {
         _directory_url: &str,
         _cert: &[u8],
     ) -> Result<(), Self::EC> {
-        log::info!("test cache configured, could not store certificate");
+        info!("test cache configured, could not store certificate");
         Ok(())
     }
 }
@@ -123,7 +124,7 @@ impl<EC: Debug, EA: Debug> AccountCache for TestCache<EC, EA> {
         _contact: &[String],
         _directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EA> {
-        log::info!("test cache configured, could not load account");
+        info!("test cache configured, could not load account");
         Ok(None)
     }
     async fn store_account(
@@ -132,7 +133,7 @@ impl<EC: Debug, EA: Debug> AccountCache for TestCache<EC, EA> {
         _directory_url: &str,
         _account: &[u8],
     ) -> Result<(), Self::EA> {
-        log::info!("test cache configured, could not store account");
+        info!("test cache configured, could not store account");
         Ok(())
     }
 }

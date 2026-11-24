@@ -5,7 +5,7 @@ mod support;
 use std::io;
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use n0_future::StreamExt;
 use tokio_rustls_acme::{
     AcmeConfig, CertCache, CertParseError, EventError,
     caches::{NoCache, TestCache},
