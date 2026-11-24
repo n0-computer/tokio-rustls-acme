@@ -10,7 +10,7 @@
 
 use std::{convert::TryFrom, io, sync::Arc, time::Duration};
 
-use futures::StreamExt;
+use n0_future::StreamExt;
 use rustls::{
     ClientConfig, DEFAULT_VERSIONS, RootCertStore,
     crypto::CryptoProvider,

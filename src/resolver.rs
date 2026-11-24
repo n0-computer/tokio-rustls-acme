@@ -4,6 +4,7 @@ use rustls::sign::CertifiedKey;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tracing::debug;
 
 /// Cert resolver that serves the issued certificate to application traffic
 /// and per-domain validation certificates to `tls-alpn-01` clients.
@@ -45,7 +46,7 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
         if is_acme_challenge {
             match client_hello.server_name() {
                 None => {
-                    log::debug!("client did not supply SNI");
+                    debug!("client did not supply SNI");
                     None
                 }
                 Some(domain) => {

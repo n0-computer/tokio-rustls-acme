@@ -36,7 +36,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    simple_logger::init_with_level(log::Level::Info).unwrap();
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     let tcp_listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, args.port))
@@ -60,7 +60,7 @@ async fn main() {
         let tls = match tls {
             Ok(tls) => tls,
             Err(err) => {
-                log::error!("accept error: {err}");
+                tracing::error!("accept error: {err}");
                 continue;
             }
         };
@@ -69,7 +69,7 @@ async fn main() {
                 .serve_connection_with_upgrades(TokioIo::new(tls), service)
                 .await
             {
-                log::warn!("connection error: {err}");
+                tracing::warn!("connection error: {err}");
             }
         });
     }
