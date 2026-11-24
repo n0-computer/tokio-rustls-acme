@@ -30,7 +30,8 @@ x509-parser = "0.18"
 async-trait = "0.1.53"
 rustls = { version = "0.23.46", default-features = false }
 time = "0.3.47"
-tokio = { version = "1.20.1", default-features = false, features = ["fs", "time"] }
+tokio = { version = "1.20.1", default-features = false, features = ["fs", "rt", "time"] }
+tempfile = { version = "3.10", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
 ] }
@@ -88,6 +89,9 @@ x509-parser = { version = "0.18", features = ["verify"] }
 # applies dev-dep features to test/example/bench builds only, so this does
 # not enable rustls's `ring` feature in downstream library builds.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [package.metadata.docs.rs]
 all-features = true
