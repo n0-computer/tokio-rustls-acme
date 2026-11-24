@@ -310,9 +310,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let [not_before, not_after] = validity;
         // The deployed certificate may still be valid, so keep it and the cache.
         if !cached && not_after <= OffsetDateTime::now_utc() {
-            log::warn!(
-                "the CA issued a certificate that expired at {not_after}, keeping the deployed one"
-            );
+            warn!(%not_after, "the CA issued an expired certificate, keeping the deployed one");
             return Err(EventError::NewCertParse(CertParseError::Expired));
         }
         self.resolver.set_cert(Arc::new(cert));
@@ -407,7 +405,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let Some(delay) = stall_delay(stalled_rounds) else {
                     return Err(OrderError::ProcessingTimeout(order));
                 };
-                log::info!("order status did not advance, now {:?}", order.status);
+                info!(status = ?order.status, "order status did not advance");
                 after(delay).await;
                 stalled_rounds += 1;
             }

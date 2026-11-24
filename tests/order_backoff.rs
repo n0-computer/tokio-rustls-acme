@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use n0_future::StreamExt;
 use support::{MockAcme, MockCa, OrderScript, Validity};
 use tokio::task::JoinHandle;
 use tokio_rustls_acme::{AccountCache, AcmeConfig, AcmeState, CertCache};
