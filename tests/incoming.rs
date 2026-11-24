@@ -1,3 +1,5 @@
+//! Tests the `Incoming` stream.
+
 #![cfg(feature = "tls-webpki-roots")]
 
 use std::{io, sync::mpsc, time::Duration};

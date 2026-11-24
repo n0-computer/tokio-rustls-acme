@@ -1,3 +1,5 @@
+//! Tests how the state machine loads, stores and replaces account keys.
+
 mod support;
 
 use std::{

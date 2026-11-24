@@ -1,7 +1,9 @@
 //! In-process HTTP(S) and scripted ACME servers on `127.0.0.1` for tests.
 
-// Each test binary uses a different subset of these helpers.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test binary uses a different subset of these helpers"
+)]
 
 use std::{
     collections::{HashMap, HashSet},
@@ -38,20 +40,20 @@ use x509_parser::{
 };
 
 /// ALPN protocol of the tls-alpn-01 challenge, RFC 8737 section 6.2.
-pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+pub(crate) const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
 /// How often `wait_for_hits` checks the request count.
 const HIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// OID of the `acmeIdentifier` extension, RFC 8737 section 6.1.
-pub const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
+pub(crate) const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
 
 /// Returns the provider all tests use for TLS, whatever the crate features select.
-pub fn provider() -> Arc<CryptoProvider> {
+pub(crate) fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
+pub(crate) fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
     Arc::new(
         ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(DEFAULT_VERSIONS)
@@ -62,7 +64,7 @@ pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
 }
 
 /// Builds a client config for tests that never reach an ACME server.
-pub fn client_config_without_roots() -> Arc<ClientConfig> {
+pub(crate) fn client_config_without_roots() -> Arc<ClientConfig> {
     client_config(RootCertStore::empty())
 }
 
@@ -71,7 +73,7 @@ pub fn client_config_without_roots() -> Arc<ClientConfig> {
 /// It reads the public key with x509-parser because webpki rejects the
 /// critical `acmeIdentifier` extension.
 #[derive(Debug)]
-pub struct AcceptAnyCert(pub Arc<CryptoProvider>);
+pub(crate) struct AcceptAnyCert(pub(crate) Arc<CryptoProvider>);
 
 impl AcceptAnyCert {
     fn verify_signature(
@@ -138,12 +140,12 @@ impl ServerCertVerifier for AcceptAnyCert {
 }
 
 /// A TLS identity for `127.0.0.1` and a client config that trusts it.
-pub struct LocalTls {
+pub(crate) struct LocalTls {
     pub acceptor: TlsAcceptor,
     pub client_config: Arc<ClientConfig>,
 }
 
-pub fn local_tls() -> LocalTls {
+pub(crate) fn local_tls() -> LocalTls {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate key");
     let cert = CertificateParams::new(vec!["127.0.0.1".to_string()])
         .expect("valid params")
@@ -165,13 +167,13 @@ pub fn local_tls() -> LocalTls {
 }
 
 /// A byte stream of an accepted connection, with or without TLS.
-pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
 type ConnFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 #[derive(Debug, Clone)]
-pub struct Request {
+pub(crate) struct Request {
     pub method: String,
     pub path: String,
     pub content_type: Option<String>,
@@ -179,14 +181,14 @@ pub struct Request {
 }
 
 #[derive(Debug, Clone)]
-pub struct Response {
+pub(crate) struct Response {
     pub status: u16,
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
 }
 
 impl Response {
-    pub fn new(status: u16) -> Self {
+    pub(crate) fn new(status: u16) -> Self {
         Self {
             status,
             headers: Vec::new(),
@@ -194,25 +196,25 @@ impl Response {
         }
     }
 
-    pub fn json(status: u16, body: &Value) -> Self {
+    pub(crate) fn json(status: u16, body: &Value) -> Self {
         Self::new(status)
             .header("content-type", "application/json")
             .body(body.to_string())
     }
 
-    pub fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+    pub(crate) fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
         self.headers.push((name, value.into()));
         self
     }
 
-    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+    pub(crate) fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
         self
     }
 }
 
 /// A server on `127.0.0.1` that stops when dropped.
-pub struct Server {
+pub(crate) struct Server {
     pub addr: SocketAddr,
     task: JoinHandle<()>,
 }
@@ -224,14 +226,14 @@ impl Drop for Server {
 }
 
 impl Server {
-    pub async fn bind() -> (TcpListener, SocketAddr) {
+    pub(crate) async fn bind() -> (TcpListener, SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         (listener, addr)
     }
 
     /// Serves one request per connection with `handler`.
-    pub fn start(
+    pub(crate) fn start(
         listener: TcpListener,
         tls: Option<TlsAcceptor>,
         handler: impl Fn(Request) -> Response + Send + Sync + 'static,
@@ -249,7 +251,7 @@ impl Server {
         })
     }
 
-    pub fn start_raw(
+    pub(crate) fn start_raw(
         listener: TcpListener,
         tls: Option<TlsAcceptor>,
         serve: impl Fn(Box<dyn Io>) -> ConnFuture + Send + Sync + 'static,
@@ -285,7 +287,7 @@ impl Server {
 }
 
 /// Reads one HTTP/1.1 request, with its body if it has a `content-length`.
-pub async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Request> {
+pub(crate) async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Request> {
     let mut buf = Vec::new();
     let head_end = loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -353,7 +355,7 @@ async fn write_response(
 }
 
 /// Decodes a flattened JWS into its protected header and payload.
-pub fn decode_jws(body: &[u8]) -> Option<(Value, Vec<u8>)> {
+pub(crate) fn decode_jws(body: &[u8]) -> Option<(Value, Vec<u8>)> {
     let jws: Value = serde_json::from_slice(body).ok()?;
     let protected = URL_SAFE_NO_PAD
         .decode(jws.get("protected")?.as_str()?)
@@ -363,7 +365,7 @@ pub fn decode_jws(body: &[u8]) -> Option<(Value, Vec<u8>)> {
 }
 
 /// Returns the uncompressed public point of the P-256 key in `jwk`.
-pub fn jwk_public_point(jwk: &Value) -> [u8; 65] {
+pub(crate) fn jwk_public_point(jwk: &Value) -> [u8; 65] {
     let coordinate = |name: &str| {
         let value = jwk[name].as_str().expect("JWK coordinate");
         URL_SAFE_NO_PAD.decode(value).expect("base64url coordinate")
@@ -384,7 +386,7 @@ fn unauthorized() -> Response {
 
 /// How the mock ACME server reports the order status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderScript {
+pub(crate) enum OrderScript {
     /// Follows RFC 8555: pending, ready, then valid after finalization.
     Normal,
     /// Reports `pending` forever, even when all authorizations are valid.
@@ -394,7 +396,7 @@ pub enum OrderScript {
 }
 
 /// The mutable part of [`MockAcme`], open to the tests.
-pub struct MockAcmeState {
+pub(crate) struct MockAcmeState {
     pub authz_status: &'static str,
     pub order_script: OrderScript,
     /// Validity of the certificates that the server issues.
@@ -422,12 +424,12 @@ pub struct MockAcmeState {
 }
 
 impl MockAcmeState {
-    pub fn hits(&self, route: &str) -> usize {
+    pub(crate) fn hits(&self, route: &str) -> usize {
         self.hits.get(route).copied().unwrap_or(0)
     }
 
     /// Returns the arrival times of the requests to `route`, oldest first.
-    pub fn arrivals(&self, route: &str) -> &[Instant] {
+    pub(crate) fn arrivals(&self, route: &str) -> &[Instant] {
         self.arrivals.get(route).map_or(&[], Vec::as_slice)
     }
 }
@@ -436,7 +438,7 @@ impl MockAcmeState {
 ///
 /// It serves one account and one order at a time. It does not verify JWS
 /// signatures.
-pub struct MockAcme {
+pub(crate) struct MockAcme {
     pub directory_url: String,
     /// Client config that trusts the API endpoint of this server.
     pub client_config: Arc<ClientConfig>,
@@ -447,7 +449,7 @@ pub struct MockAcme {
 }
 
 impl MockAcme {
-    pub async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let tls = local_tls();
         let (listener, addr) = Server::bind().await;
         let base = format!("https://{addr}");
@@ -487,11 +489,11 @@ impl MockAcme {
         }
     }
 
-    pub fn state(&self) -> std::sync::MutexGuard<'_, MockAcmeState> {
+    pub(crate) fn state(&self) -> std::sync::MutexGuard<'_, MockAcmeState> {
         self.state.lock().expect("poisoned")
     }
 
-    pub async fn wait_for_hits(&self, route: &str, count: usize, limit: Duration) {
+    pub(crate) async fn wait_for_hits(&self, route: &str, count: usize, limit: Duration) {
         let reached = tokio::time::timeout(limit, async {
             while self.state().hits(route) < count {
                 tokio::time::sleep(HIT_POLL_INTERVAL).await;
@@ -678,7 +680,7 @@ fn order_json(base: &str, state: &MockAcmeState) -> Value {
 
 /// The validity period of a certificate that [`MockCa`] issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Validity {
+pub(crate) enum Validity {
     /// Valid from one day ago for 90 days.
     Fresh,
     /// Valid for one more day out of 90, so past the renewal time of the client.
@@ -687,7 +689,7 @@ pub enum Validity {
     Expired,
 }
 
-pub struct MockCa {
+pub(crate) struct MockCa {
     issuer: Issuer<'static, KeyPair>,
     cert_pem: String,
     pub cert_der: CertificateDer<'static>,
@@ -707,7 +709,7 @@ impl PublicKeyData for CsrPublicKey {
 }
 
 impl MockCa {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut params = CertificateParams::default();
         let mut name = DistinguishedName::new();
         name.push(DnType::CommonName, "Mock ACME CA");
@@ -722,7 +724,7 @@ impl MockCa {
         }
     }
 
-    pub fn issue_for_csr(&self, csr_der: &[u8], domain: &str, validity: Validity) -> String {
+    pub(crate) fn issue_for_csr(&self, csr_der: &[u8], domain: &str, validity: Validity) -> String {
         let (_, csr) = X509CertificationRequest::from_der(csr_der).expect("parse CSR");
         let public_key = csr
             .certification_request_info
@@ -734,7 +736,7 @@ impl MockCa {
     }
 
     /// Issues a new key and chain for `domain` as cache PEM.
-    pub fn issue_with_key(&self, domain: &str, validity: Validity) -> Vec<u8> {
+    pub(crate) fn issue_with_key(&self, domain: &str, validity: Validity) -> Vec<u8> {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate key");
         let chain = self.issue(&key, domain, validity);
         format!("{}\n{chain}", key.serialize_pem()).into_bytes()

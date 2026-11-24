@@ -1,6 +1,7 @@
 use crate::AcmeAcceptor;
 use crate::acceptor::{DEFAULT_HANDSHAKE_TIMEOUT, Handshake};
 use rustls::ServerConfig;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -10,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// An [`axum_server`] acceptor that answers `tls-alpn-01` requests and times out handshakes.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AxumAcceptor {
     acme_acceptor: AcmeAcceptor,
     config: Arc<ServerConfig>,
@@ -58,6 +59,14 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static>
 pub struct AxumAccept<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> {
     handshake: Handshake<I>,
     service: Option<S>,
+}
+
+impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> fmt::Debug
+    for AxumAccept<I, S>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AxumAccept").finish_non_exhaustive()
+    }
 }
 
 impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> Unpin

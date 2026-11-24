@@ -1,3 +1,5 @@
+//! A "Hello Tls!" server that drives `AcmeState` and answers tls-alpn-01 with `AcmeAcceptor`.
+
 use clap::Parser;
 use rustls::{DEFAULT_VERSIONS, ServerConfig};
 use std::io;

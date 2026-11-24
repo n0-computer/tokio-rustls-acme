@@ -16,11 +16,13 @@ const DIR_MODE: u32 = 0o700;
 /// The files hold private keys. Files are written owner-only (`0600`) on Unix
 /// and replaced atomically. The directory must not be writable by other users.
 /// A crash during a write can leave a temporary file behind.
+#[derive(Debug)]
 pub struct DirCache<P: AsRef<Path> + Send + Sync> {
     inner: P,
 }
 
 impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
+    /// Creates a cache that stores its files in the directory `dir`.
     pub fn new(dir: P) -> Self {
         Self { inner: dir }
     }

@@ -10,7 +10,7 @@ use rustls::DEFAULT_VERSIONS;
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, ServerConfig};
 use std::convert::Infallible;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -24,6 +24,16 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
+}
+
+impl<EC: Debug, EA: Debug> fmt::Debug for AcmeConfig<EC, EA> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcmeConfig")
+            .field("directory_url", &self.directory_url)
+            .field("domains", &self.domains)
+            .field("contact", &self.contact)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -151,15 +161,19 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         .into();
         self
     }
-    pub fn domains(mut self, contact: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
-        self.domains = contact.into_iter().map(|s| s.as_ref().into()).collect();
+    /// Sets the domains to request a certificate for, replacing the current ones.
+    pub fn domains(mut self, domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        self.domains = domains.into_iter().map(|s| s.as_ref().into()).collect();
         self
     }
-    pub fn domains_push(mut self, contact: impl AsRef<str>) -> Self {
-        self.domains.push(contact.as_ref().into());
+    /// Adds a domain to request a certificate for.
+    pub fn domains_push(mut self, domain: impl AsRef<str>) -> Self {
+        self.domains.push(domain.as_ref().into());
         self
     }
 
+    /// Binds the ACME account to an account at the CA with the key ID `kid` and HMAC `key`
+    /// (RFC 8555 section 7.3.4). Some CAs require this.
     pub fn external_account_binding(mut self, kid: impl AsRef<str>, key: impl AsRef<[u8]>) -> Self {
         self.eab = Some(ExternalAccountKey::new(kid.as_ref().into(), key.as_ref()));
         self
@@ -181,6 +195,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
+    /// Stores certificates and account keys in `cache`.
     pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> {
         AcmeConfig {
             client_config: self.client_config,

@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -67,7 +67,10 @@ struct OrderFailure {
 ///
 /// Owns the [`ResolvesServerCertAcme`] populated as new certificates are
 /// issued. Construct one from [`AcmeConfig::state`].
-#[allow(clippy::type_complexity)]
+#[allow(
+    clippy::type_complexity,
+    reason = "the boxed futures are each used once, aliases would only move them"
+)]
 pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
     resolver: Arc<ResolvesServerCertAcme>,
@@ -186,6 +189,16 @@ pub enum CertParseError {
 
 fn rcgen_err(err: rcgen::Error) -> OrderError {
     OrderError::Rcgen(err.into())
+}
+
+impl<EC: Debug, EA: Debug> fmt::Debug for AcmeState<EC, EA> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcmeState")
+            .field("config", &self.config)
+            .field("renew_at", &self.renew_at)
+            .field("backoff_cnt", &self.backoff_cnt)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
@@ -310,7 +323,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Ok((cert, validity))
     }
 
-    #[allow(clippy::result_large_err)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "runs once per certificate, so the error size does not matter"
+    )]
     fn process_cert(&mut self, pem: Vec<u8>, cached: bool) -> Event<EC, EA> {
         let provider = self.crypto_provider();
         let (cert, validity) = match (Self::parse_cert(&provider, &pem), cached) {
@@ -347,8 +363,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Event::Ok(EventOk::DeployedNewCert)
     }
     /// Runs one order.
-    // Returns once per order, so the error size does not matter.
-    #[allow(clippy::result_large_err)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "returns once per order, so the error size does not matter"
+    )]
     async fn order(
         config: Arc<AcmeConfig<EC, EA>>,
         resolver: Arc<ResolvesServerCertAcme>,

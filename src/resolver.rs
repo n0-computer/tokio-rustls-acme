@@ -29,10 +29,14 @@ impl ResolvesServerCertAcme {
         })
     }
     pub(crate) fn set_cert(&self, cert: Arc<CertifiedKey>) {
-        self.inner.lock().unwrap().cert = Some(cert);
+        self.inner.lock().expect("poisoned").cert = Some(cert);
     }
     pub(crate) fn set_auth_key(&self, domain: String, cert: Arc<CertifiedKey>) {
-        self.inner.lock().unwrap().auth_keys.insert(domain, cert);
+        self.inner
+            .lock()
+            .expect("poisoned")
+            .auth_keys
+            .insert(domain, cert);
     }
 }
 
@@ -52,11 +56,16 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
                 Some(domain) => {
                     let domain = domain.to_owned();
                     let domain: String = AsRef::<str>::as_ref(&domain).into();
-                    self.inner.lock().unwrap().auth_keys.get(&domain).cloned()
+                    self.inner
+                        .lock()
+                        .expect("poisoned")
+                        .auth_keys
+                        .get(&domain)
+                        .cloned()
                 }
             }
         } else {
-            self.inner.lock().unwrap().cert.clone()
+            self.inner.lock().expect("poisoned").cert.clone()
         }
     }
 }

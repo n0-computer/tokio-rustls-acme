@@ -162,6 +162,7 @@
 //! [rustls]: https://github.com/ctz/rustls
 //! [aws-lc-rs]: https://github.com/aws/aws-lc-rs
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod acceptor;

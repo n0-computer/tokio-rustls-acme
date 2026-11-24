@@ -194,8 +194,10 @@ impl Site {
     /// # Panics
     ///
     /// Panics on other errors and after [`ORDER_TIMEOUT`].
-    // The crate returns `OrderError` by value in its events too.
-    #[allow(clippy::result_large_err)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the crate returns `OrderError` by value in its events too"
+    )]
     async fn deploy(&mut self) -> Result<(), OrderError> {
         tokio::time::timeout(ORDER_TIMEOUT, async {
             loop {

@@ -139,4 +139,11 @@ name = "low_level"
 required-features = ["tls-webpki-roots"]
 
 [lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
 unnameable_types = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+allow_attributes_without_reason = "warn"
+unused_async = "warn"
