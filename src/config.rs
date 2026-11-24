@@ -4,7 +4,7 @@ use crate::acme::{
 use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
-use futures::Stream;
+use n0_future::Stream;
 #[cfg(feature = "tls-webpki-roots")]
 use rustls::DEFAULT_VERSIONS;
 use rustls::crypto::CryptoProvider;
@@ -187,10 +187,16 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self.client_config = client_config;
         self
     }
+    /// Sets the URL of the ACME directory.
+    ///
+    /// RFC 8555 requires HTTPS. Plain HTTP works, but leaves the ACME traffic unprotected.
+    ///
+    /// Signed requests follow no redirects.
     pub fn directory(mut self, directory_url: impl AsRef<str>) -> Self {
         self.directory_url = directory_url.as_ref().into();
         self
     }
+    /// Uses the Let's Encrypt production directory if `production` is true, else staging.
     pub fn directory_lets_encrypt(mut self, production: bool) -> Self {
         self.directory_url = match production {
             true => LETS_ENCRYPT_PRODUCTION_DIRECTORY,
@@ -245,6 +251,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             cert_chain: self.cert_chain,
         }
     }
+    /// Stores certificates in `cert_cache` and account keys in `account_cache`.
     pub fn cache_compose<CC: 'static + CertCache, CA: 'static + AccountCache>(
         self,
         cert_cache: CC,
@@ -252,9 +259,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     ) -> AcmeConfig<CC::EC, CA::EA> {
         self.cache(CompositeCache::new(cert_cache, account_cache))
     }
+    /// Sets the cache and boxes its errors, so the config type does not depend on it.
     pub fn cache_with_boxed_err<C: 'static + Cache>(self, cache: C) -> AcmeConfig<Box<dyn Debug>> {
         self.cache(BoxedErrCache::new(cache))
     }
+    /// Sets the cache if `cache` is `Some`, and disables caching otherwise.
     pub fn cache_option<C: 'static + Cache>(self, cache: Option<C>) -> AcmeConfig<C::EC, C::EA> {
         match cache {
             Some(cache) => self.cache(cache),

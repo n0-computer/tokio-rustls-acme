@@ -6,24 +6,18 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
-use futures::future::try_join_all;
-use futures::{FutureExt, Stream, ready};
-use rcgen::{CertificateParams, DistinguishedName, Error as RcgenError, PKCS_ECDSA_P256_SHA256};
+use n0_future::{FutureExt, Stream, ready, try_join_all};
+use rcgen::{CertificateParams, DistinguishedName, PKCS_ECDSA_P256_SHA256};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, SignatureScheme};
 use thiserror::Error;
+use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
+use tracing::{debug, info, warn};
 use x509_parser::parse_x509_certificate;
-
-struct ParsedCert {
-    certified_key: CertifiedKey,
-    validity: [DateTime<Utc>; 2],
-    signature_schemes: Vec<SignatureScheme>,
-}
 
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
@@ -35,7 +29,7 @@ use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 type Timer = std::pin::Pin<Box<Sleep>>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-pub fn after(d: std::time::Duration) -> Timer {
+pub(crate) fn after(d: std::time::Duration) -> Timer {
     Box::pin(tokio::time::sleep(d))
 }
 
@@ -57,60 +51,104 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     wait: Option<Timer>,
 }
 
+/// Item of the [`AcmeState`] stream, reporting the outcome of one step.
 pub type Event<EC, EA> = Result<EventOk, EventError<EC, EA>>;
 
+/// A successful step of [`AcmeState`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EventOk {
+    /// A certificate from the cache is now served.
     DeployedCachedCert,
+    /// A newly issued certificate is now served.
     DeployedNewCert,
+    /// The newly issued certificate was stored in the cache.
     CertCacheStore,
+    /// A newly generated account key was stored in the cache.
     AccountCacheStore,
 }
 
+/// A failed step of [`AcmeState`].
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum EventError<EC: Debug, EA: Debug> {
+    /// Loading the certificate from the cache failed.
     #[error("cert cache load: {0}")]
     CertCacheLoad(EC),
     #[error("account cache load: {0}")]
     AccountCacheLoad(EA),
+    /// Storing the newly issued certificate in the cache failed.
     #[error("cert cache store: {0}")]
     CertCacheStore(EC),
+    /// Storing the newly generated account key in the cache failed.
     #[error("account cache store: {0}")]
     AccountCacheStore(EA),
+    /// The certificate from the cache could not be parsed.
     #[error("cached cert parse: {0}")]
     CachedCertParse(CertParseError),
+    /// Ordering a certificate failed, and the next order follows after a backoff.
     #[error("order: {0}")]
     Order(OrderError),
+    /// The newly issued certificate could not be parsed.
     #[error("new cert parse: {0}")]
     NewCertParse(CertParseError),
 }
 
+/// An error that stopped a certificate order.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum OrderError {
+    /// The ACME client failed.
     #[error("acme error: {0}")]
     Acme(#[from] AcmeError),
+    /// Generating the certificate key or the CSR failed.
+    ///
+    /// Usually downcasts to `rcgen::Error`. The concrete type is not covered by semver.
     #[error("certificate generation error: {0}")]
-    Rcgen(#[from] RcgenError),
+    Rcgen(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The server marked the order invalid.
     #[error("bad order object: {0:?}")]
     BadOrder(Order),
+    /// An authorization reached a status other than pending or valid.
     #[error("bad auth object: {0:?}")]
     BadAuth(Auth),
+    /// The authorization for the given domain was still pending after the last check.
     #[error("authorization for {0} failed too many times")]
     TooManyAttemptsAuth(String),
+    /// The order was still processing after the last check.
     #[error("order status stayed on processing too long")]
     ProcessingTimeout(Order),
 }
 
+/// An error from parsing a PEM bundle of private key and certificate chain.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum CertParseError {
+    /// The end-entity certificate is not valid X.509.
+    ///
+    /// Usually downcasts to `x509_parser::nom::Err<x509_parser::error::X509Error>`. The concrete type is not covered by semver.
     #[error("X509 parsing error: {0}")]
-    X509(#[from] x509_parser::nom::Err<x509_parser::error::X509Error>),
+    X509(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The data is not valid PEM.
+    ///
+    /// Usually downcasts to `pem::PemError`. The concrete type is not covered by semver.
     #[error("expected 2 or more pem, got: {0}")]
-    Pem(#[from] pem::PemError),
+    Pem(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The bundle holds fewer than two PEM blocks, so the key or the certificate is missing.
     #[error("expected 2 or more pem, got: {0}")]
     TooFewPem(usize),
-    #[error("unsupported private key type")]
+    /// The crypto provider cannot load the private key, or it does not match the certificate.
+    #[error("private key is unsupported or does not match the certificate")]
     InvalidPrivateKey,
+}
+
+/// A parsed certificate chain with its key.
+struct ParsedCert {
+    certified_key: CertifiedKey,
+    /// `notBefore` and `notAfter` of the leaf.
+    validity: [OffsetDateTime; 2],
+    /// The signature schemes of all certificates in the chain.
+    signature_schemes: Vec<SignatureScheme>,
 }
 
 struct OrderResult {
@@ -172,6 +210,10 @@ fn sig_oid_to_scheme(oid: &x509_parser::asn1_rs::Oid) -> Option<SignatureScheme>
     }
 }
 
+fn rcgen_err(err: rcgen::Error) -> OrderError {
+    OrderError::Rcgen(err.into())
+}
+
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     /// Wraps `tcp_incoming` so each connection is dispatched to ACME
     /// validation or to application TLS, returning an [`Incoming`] stream.
@@ -219,6 +261,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         self.config.crypto_provider().clone()
     }
 
+    /// Returns an [`AxumAcceptor`] that uses `rustls_config` for application TLS.
+    ///
+    /// [`AxumAcceptor`]: crate::axum::AxumAcceptor
     #[cfg(feature = "axum")]
     pub fn axum_acceptor(
         &self,
@@ -260,7 +305,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         {
                             Ok(alternate) => alternate,
                             Err(err) => {
-                                log::warn!("failed to load cached alternate cert: {err:?}");
+                                warn!(?err, "failed to load cached alternate cert");
                                 None
                             }
                         },
@@ -287,45 +332,40 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         crypto_provider: &CryptoProvider,
         pem: &[u8],
     ) -> Result<ParsedCert, CertParseError> {
-        let mut pems = pem::parse_many(pem)?;
+        let mut pems = pem::parse_many(pem).map_err(|err| CertParseError::Pem(err.into()))?;
         if pems.len() < 2 {
             return Err(CertParseError::TooFewPem(pems.len()));
         }
         let pk_bytes = pems.remove(0).into_contents();
         let pk_der: PrivatePkcs8KeyDer<'static> = pk_bytes.into();
-        let pk_der: PrivateKeyDer<'static> = pk_der.into();
-        let pk = match crypto_provider.key_provider.load_private_key(pk_der) {
-            Ok(pk) => pk,
-            Err(_) => return Err(CertParseError::InvalidPrivateKey),
-        };
         let cert_chain: Vec<RustlsCertificate> =
             pems.into_iter().map(|p| p.into_contents().into()).collect();
 
         let mut validity = None;
-        let mut required_schemes = Vec::new();
-
+        let mut signature_schemes = Vec::new();
         for der in cert_chain.iter() {
-            let (_, cert) = parse_x509_certificate(der.as_ref()).map_err(CertParseError::X509)?;
+            let (_, cert) = parse_x509_certificate(der.as_ref())
+                .map_err(|err| CertParseError::X509(err.into()))?;
             if validity.is_none() {
                 let v = cert.validity();
-                validity = Some(
-                    [v.not_before, v.not_after]
-                        .map(|t| Utc.timestamp_opt(t.timestamp(), 0).earliest().unwrap()),
-                );
+                validity = Some([v.not_before, v.not_after].map(|t| t.to_datetime()));
             }
             if let Some(scheme) = sig_oid_to_scheme(&cert.signature_algorithm.algorithm)
-                && !required_schemes.contains(&scheme)
+                && !signature_schemes.contains(&scheme)
             {
-                required_schemes.push(scheme);
+                signature_schemes.push(scheme);
             }
         }
-
-        let validity = validity.expect("length checked above");
-        let cert = CertifiedKey::new(cert_chain, pk);
+        let validity = validity.expect("the chain has at least one certificate");
+        let certified_key = CertifiedKey::from_der(cert_chain, pk_der.into(), crypto_provider)
+            .map_err(|err| {
+                warn!(%err, "rejecting certificate and private key");
+                CertParseError::InvalidPrivateKey
+            })?;
         Ok(ParsedCert {
-            certified_key: cert,
+            certified_key,
             validity,
-            signature_schemes: required_schemes,
+            signature_schemes,
         })
     }
 
@@ -355,17 +395,18 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 .resolver
                 .set_alt_cert(Some((Arc::new(alt.certified_key), alt.signature_schemes))),
             Err(err) => {
-                log::warn!("failed to parse alternate cert chain: {err}");
+                warn!(%err, "failed to parse alternate cert chain");
                 false
             }
         });
         if alternate.is_none() {
             self.resolver.set_alt_cert(None);
         }
-        let validity = parsed.validity;
-        let wait_duration = (validity[1] - (validity[1] - validity[0]) / 3 - Utc::now())
-            .max(chrono::Duration::zero())
-            .to_std()
+        let [not_before, not_after] = parsed.validity;
+        let renew_at = not_after - (not_after - not_before) / 3_i32;
+        // Negative durations (renewal already due) fail the conversion and become zero.
+        let wait_duration = (renew_at - OffsetDateTime::now_utc())
+            .try_into()
             .unwrap_or_default();
         self.wait = Some(after(wait_duration));
         if cached {
@@ -408,9 +449,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         )
         .await?;
 
-        let mut params = CertificateParams::new(config.domains.clone())?;
+        let mut params = CertificateParams::new(config.domains.clone()).map_err(rcgen_err)?;
         params.distinguished_name = DistinguishedName::new();
-        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(rcgen_err)?;
 
         let (order_url, mut order) = account
             .new_order(&config.client_config, config.domains.clone())
@@ -423,12 +464,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         .iter()
                         .map(|url| Self::authorize(&config, &resolver, &account, url));
                     try_join_all(auth_futures).await?;
-                    log::info!("completed all authorizations");
+                    info!("completed all authorizations");
                     order = account.order(&config.client_config, &order_url).await?;
                 }
                 OrderStatus::Processing => {
                     for i in 0u64..10 {
-                        log::info!("order processing");
+                        info!("order processing");
                         after(Duration::from_secs(1u64 << i)).await;
                         order = account.order(&config.client_config, &order_url).await?;
                         if order.status != OrderStatus::Processing {
@@ -440,14 +481,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                     }
                 }
                 OrderStatus::Ready => {
-                    log::info!("sending csr");
-                    let csr = params.serialize_request(&key_pair)?;
+                    info!("sending csr");
+                    let csr = params.serialize_request(&key_pair).map_err(rcgen_err)?;
                     order = account
                         .finalize(&config.client_config, order.finalize, csr.der().to_vec())
                         .await?
                 }
                 OrderStatus::Valid { certificate } => {
-                    log::info!("download certificate");
+                    info!("download certificate");
                     let cert_response = account
                         .certificate_with_alternate_urls(&config.client_config, &certificate)
                         .await?;
@@ -517,23 +558,24 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         target_issuer: &str,
     ) -> Option<String> {
         for url in alternate_urls {
-            log::debug!("fetching alternate chain from {url}");
+            debug!(%url, "fetching alternate chain");
             let alt_pem = match account.certificate(client_config, url).await {
                 Ok(pem) => pem,
                 Err(err) => {
-                    log::warn!("failed to fetch alternate chain from {url}: {err}");
+                    warn!(%url, %err, "failed to fetch alternate chain");
                     continue;
                 }
             };
             if let Some(issuer) = chain_root_issuer(&alt_pem) {
-                log::debug!("alternate chain root issuer: '{issuer}'");
+                debug!(%issuer, "alternate chain root issuer");
                 if issuer == target_issuer {
                     return Some(alt_pem);
                 }
             }
         }
-        log::warn!(
-            "no alternate chain found matching issuer '{target_issuer}', using default chain"
+        warn!(
+            issuer = %target_issuer,
+            "no alternate chain matches the issuer, using the default chain"
         );
         None
     }
@@ -547,7 +589,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let (domain, challenge_url) = match auth.status {
             AuthStatus::Pending => {
                 let Identifier::Dns(domain) = auth.identifier;
-                log::info!("trigger challenge for {}", domain);
+                info!(%domain, "trigger challenge");
                 let (challenge, auth_key) = account.tls_alpn_01(
                     config.crypto_provider(),
                     &auth.challenges,
@@ -567,7 +609,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             let auth = account.auth(&config.client_config, url).await?;
             match auth.status {
                 AuthStatus::Pending => {
-                    log::info!("authorization for {} still pending", domain);
+                    info!(%domain, "authorization still pending");
                     account
                         .challenge(&config.client_config, &challenge_url)
                         .await?
@@ -582,20 +624,20 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         loop {
             // queued early action
             if let Some(early_action) = &mut self.early_action {
-                let result = ready!(early_action.poll_unpin(cx));
+                let result = ready!(early_action.poll(cx));
                 self.early_action.take();
                 return Poll::Ready(result);
             }
 
             // sleep
             if let Some(timer) = &mut self.wait {
-                ready!(timer.poll_unpin(cx));
+                ready!(timer.poll(cx));
                 self.wait.take();
             }
 
             // load from cert cache
             if let Some(load_cert) = &mut self.load_cert {
-                let result = ready!(load_cert.poll_unpin(cx));
+                let result = ready!(load_cert.poll(cx));
                 self.load_cert.take();
                 match result {
                     Ok(Some(cached)) => {
@@ -613,7 +655,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
             // load from account cache
             if let Some(load_account) = &mut self.load_account {
-                let result = ready!(load_account.poll_unpin(cx));
+                let result = ready!(load_account.poll(cx));
                 self.load_account.take();
                 match result {
                     Ok(Some(key_pair)) => self.account_key = Some(key_pair),
@@ -624,7 +666,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
             // execute order
             if let Some(order) = &mut self.order {
-                let result = ready!(order.poll_unpin(cx));
+                let result = ready!(order.poll(cx));
                 self.order.take();
                 match result {
                     Ok(order_result) => {

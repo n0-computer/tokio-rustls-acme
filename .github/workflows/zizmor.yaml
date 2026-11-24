@@ -16,7 +16,7 @@ permissions:
 jobs:
   zizmor:
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -31,7 +31,7 @@ jobs:
     # Fails if a pinned SHA drifts from its version comment, or is younger
     # than the cooldown in .pinact.yaml.
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -48,7 +48,8 @@ jobs:
           curl -fsSL -O "$base/pinact_${PINACT_VERSION}_checksums.txt"
           grep ' pinact_linux_amd64.tar.gz$' "pinact_${PINACT_VERSION}_checksums.txt" | sha256sum -c -
           tar xzf pinact_linux_amd64.tar.gz pinact
-          install -m755 pinact /usr/local/bin/pinact
+          install -m755 pinact "$RUNNER_TEMP/pinact"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - run: pinact run --check --verify-comment --verify-min-age
         env:
           GITHUB_TOKEN: ${{ github.token }}

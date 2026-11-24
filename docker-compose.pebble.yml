@@ -1,14 +1,46 @@
+# Pebble with real challenge validation, for tests/pebble.rs.
+#
+# Host networking lets Pebble's VA reach the tls-alpn-01 listeners that the
+# tests bind on loopback addresses. This requires Docker on Linux.
 services:
   pebble:
-    image: ghcr.io/letsencrypt/pebble:latest
-    command: ["-config", "/test/config/pebble-config.json"]
-    ports:
-      - "14000:14000"
-      - "15000:15000"
+    # Tag 2.10.3.
+    image: ghcr.io/letsencrypt/pebble@sha256:0c81f05db371f436c97fb894bd6d2ab8fc9c8e2ce40f8bef8a8e15941bcd75ef
+    command:
+      - -config
+      - /test/config/pebble-config.json
+      - -dnsserver
+      - 127.0.0.1:8053
+    network_mode: host
     volumes:
       - ./test/pebble-config.json:/test/config/pebble-config.json:ro
     environment:
       PEBBLE_VA_NOSLEEP: "1"
-      PEBBLE_VA_ALWAYS_VALID: "1"
       PEBBLE_ALTERNATE_ROOTS: "1"
       PEBBLE_WFE_NONCEREJECT: "0"
+      # Validate almost every order. Pebble still reuses about 1 in 100 authorizations.
+      PEBBLE_AUTHZREUSE: "0"
+
+  # DNS server for Pebble's VA, fed by the tests through port 8055. The
+  # challenge listeners are off to keep port 5001 free for the tests.
+  challtestsrv:
+    # Tag 2.10.3.
+    image: ghcr.io/letsencrypt/pebble-challtestsrv@sha256:0152c8cb506e2ecba2900ed47d23932e27e3e6575a7d2c8ef93c7719ee3dea4c
+    command:
+      - -dnsserver
+      - 127.0.0.1:8053
+      - -management
+      - 127.0.0.1:8055
+      - -defaultIPv4
+      - ""
+      - -defaultIPv6
+      - ""
+      - -http01
+      - ""
+      - -https01
+      - ""
+      - -tlsalpn01
+      - ""
+      - -doh
+      - ""
+    network_mode: host

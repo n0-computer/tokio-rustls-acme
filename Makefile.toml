@@ -3,23 +3,31 @@
 PEBBLE_FEATURES = { value = "tls-webpki-roots,tls-ring", condition = { env_not_set = ["PEBBLE_FEATURES"] } }
 
 [tasks.pebble-up]
-description = "Start Pebble ACME test server"
+description = "Start Pebble ACME test server and its DNS server"
 script = '''
 docker compose -f docker-compose.pebble.yml up -d
-echo "Waiting for Pebble to be ready..."
-for i in $(seq 1 30); do
-    if curl -sk https://localhost:14000/dir > /dev/null 2>&1; then
-        echo "Pebble is ready"
-        exit 0
+echo "Waiting for Pebble and challtestsrv to be ready..."
+# challtestsrv answers 404 on /, which is enough to show that it runs.
+for url in https://localhost:14000/dir http://127.0.0.1:8055/; do
+    ready=
+    for i in $(seq 1 30); do
+        if curl -sk -o /dev/null "$url"; then
+            ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [ -z "$ready" ]; then
+        echo "No response from $url"
+        docker compose -f docker-compose.pebble.yml logs
+        exit 1
     fi
-    sleep 1
 done
-echo "Pebble failed to start"
-exit 1
+echo "Pebble and challtestsrv are ready"
 '''
 
 [tasks.pebble-down]
-description = "Stop Pebble ACME test server"
+description = "Stop Pebble ACME test server and its DNS server"
 script = '''
 docker compose -f docker-compose.pebble.yml down
 rm -f pebble.minica.pem

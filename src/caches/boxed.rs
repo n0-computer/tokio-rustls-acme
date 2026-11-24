@@ -2,14 +2,17 @@ use crate::{AccountCache, CertCache};
 use async_trait::async_trait;
 use std::fmt::Debug;
 
+/// A cache wrapper that boxes the errors of the inner cache as `Box<dyn Debug>`.
 pub struct BoxedErrCache<T: Send + Sync> {
     inner: T,
 }
 
 impl<T: Send + Sync> BoxedErrCache<T> {
+    /// Wraps `inner` so that its errors are boxed.
     pub fn new(inner: T) -> Self {
         Self { inner }
     }
+    /// Returns the wrapped cache.
     pub fn into_inner(self) -> T {
         self.inner
     }

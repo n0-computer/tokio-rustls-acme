@@ -5,6 +5,7 @@ use rustls::sign::CertifiedKey;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tracing::{debug, warn};
 
 /// Cert resolver that serves the issued certificate to application traffic
 /// and per-domain validation certificates to `tls-alpn-01` clients.
@@ -64,7 +65,7 @@ impl ResolvesServerCertAcme {
                 .and_then(|c| c.key.end_entity_cert().ok());
             let matches = primary_leaf.is_some() && primary_leaf == key.end_entity_cert().ok();
             if !matches {
-                log::warn!("alternate chain doesn't match the current certificate, not serving it");
+                warn!("alternate chain doesn't match the current certificate, not serving it");
             }
             matches
         });
@@ -89,7 +90,7 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
         if is_acme_challenge {
             match client_hello.server_name() {
                 None => {
-                    log::debug!("client did not supply SNI");
+                    debug!("client did not supply SNI");
                     None
                 }
                 Some(domain) => {

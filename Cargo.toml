@@ -1,6 +1,6 @@
 [package]
 name = "tokio-rustls-acme"
-version = "0.9.1"
+version = "0.10.0"
 authors = [
     "dignifiedquire <me@dignifiedquire.com>",
     "Florian Uekermann <florian@uekermann.me>",
@@ -14,23 +14,22 @@ keywords = ["acme", "rustls", "tls", "letsencrypt"]
 categories = ["asynchronous", "cryptography", "network-programming"]
 
 [dependencies]
-futures = "0.3.21"
+futures-core = "0.3"
+n0-future = "0.3.2"
 rcgen = { version = "0.14", default-features = false, features = ["pem"] }
 serde_json = "1.0.81"
 serde = { version = "1.0.137", features = ["derive"] }
-ring = { version = "0.17.0", features = ["std"], optional = true }
+ring = { version = "0.17.12", features = ["std"], optional = true }
 aws-lc-rs = { version = "1.18", optional = true }
 base64 = "0.23"
-log = "0.4.17"
-webpki-roots = { version = "1", optional = true }
+tracing = "0.1.44"
+webpki-roots = { version = "1.0.10", optional = true }
 pem = "4.0"
 thiserror = "2.0"
 x509-parser = "0.18"
-chrono = { version = "0.4.24", default-features = false, features = ["clock"] }
 async-trait = "0.1.53"
-rustls = { version = "0.23", default-features = false }
-time = "0.3.36"                                                                 # force the transitive dependency to a more recent minimal version. The build fails with 0.3.20
-
+rustls = { version = "0.23.46", default-features = false }
+time = "0.3.47"
 tokio = { version = "1.20.1", default-features = false, features = ["fs", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
@@ -38,6 +37,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider",
 ] }
+# transitive dependency, updated to fix deny warning, remove after reqwest updates
+url = "2.5.9"
 
 # Axum
 axum-server = { version = "0.8", features = ["tokio-rustls"], optional = true }
@@ -54,16 +55,34 @@ version = "1.0.78"
 # works.
 version = "0.4.4"
 
+[dependencies.rustls-webpki]
+# This is a transitive dependency of rustls, which verifies the ACME
+# server certificate. rustls 0.23.46 admits 0.103.14, but versions
+# before 0.103.16 accept distrusted emSign intermediates
+# (RUSTSEC-2026-0382).
+version = "0.103.16"
+default-features = false
+
+[dependencies.h2]
+# Transitive through axum-server. Versions before 0.4.16 queue empty
+# DATA frames without limit (RUSTSEC-2026-0258).
+version = "0.4.16"
+default-features = false
+optional = true
+
 [dev-dependencies]
-simple_logger = "5.0"
+tracing-subscriber = "0.3.23"
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
-tokio = { version = "1.19.2", features = ["full"] }
+# `test-util` gives tests a paused clock.
+tokio = { version = "1.19.2", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1.9", features = ["net"] }
 tokio-util = { version = "0.7.3", features = ["compat"] }
-warp = "0.3"
+warp = "0.4"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 tempfile = "3"
-x509-parser = "0.18"
+# `verify` checks the challenge certificate self-signature in tests.
+x509-parser = { version = "0.18", features = ["verify"] }
 # Pulled in only for the integration tests so they can construct a
 # `CryptoProvider` regardless of which crate features are enabled. Cargo
 # applies dev-dep features to test/example/bench builds only, so this does
@@ -78,21 +97,16 @@ rustdoc-args = ["--cfg", "doc_auto_cfg"]
 allowed_external_types = [
     "axum_server::*",
     "futures_core::*",
-    "nom::*",
-    "pem::*",
-    "rcgen::*",
     "rustls::*",
     "serde_core::*",
-    "serde_json::*",
     "tokio::*",
     "tokio_rustls",
     "tokio_rustls::*",
-    "x509_parser::*",
 ]
 
 [features]
 default = ["tls-webpki-roots", "tls-ring"]
-axum = ["dep:axum-server"]
+axum = ["dep:axum-server", "dep:h2"]
 tls-webpki-roots = ["dep:webpki-roots"]
 # At least one of `tls-ring` or `tls-aws-lc-rs` must be enabled. The
 # selected backend signs ACME requests, generates keys, and provides the
@@ -119,3 +133,6 @@ required-features = ["tls-webpki-roots"]
 [[example]]
 name = "low_level"
 required-features = ["tls-webpki-roots"]
+
+[lints.rust]
+unnameable_types = "warn"
