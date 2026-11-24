@@ -111,15 +111,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `absent`: crypto backend that must not be in the dependency tree.
+          # `tests`: run the tests and Pebble tests. The test job covers all features.
           - name: "ring only"
             features: "tls-webpki-roots,tls-ring"
             absent: "aws-lc-rs"
+            tests: true
           - name: "aws-lc-rs only"
             features: "tls-webpki-roots,tls-aws-lc-rs"
             absent: "ring"
+            tests: true
           - name: "all features"
             features: "axum,tls-webpki-roots,tls-ring,tls-aws-lc-rs"
-            absent: ""
+            tests: false
     name: feature-combos (${{ matrix.name }})
     env:
       RUSTC_WRAPPER: "sccache"
@@ -137,7 +141,7 @@ jobs:
           tool: cargo-make@${{ env.CARGO_MAKE_VERSION }},nextest@${{ env.NEXTEST_VERSION }}
       - run: cargo make check-lib
       - name: other backend absent from dependency tree
-        if: matrix.absent != ''
+        if: matrix.absent
         env:
           ABSENT: ${{ matrix.absent }}
         run: |
@@ -146,10 +150,10 @@ jobs:
             echo "$ABSENT is in the dependency tree for features $TEST_FEATURES"
             exit 1
           fi
-      - if: matrix.absent != ''
+      - if: matrix.tests
         run: cargo make test
       - run: cargo make test-doc
-      - if: matrix.absent != ''
+      - if: matrix.tests
         run: cargo make test-pebble
 
   minimal-crates:
