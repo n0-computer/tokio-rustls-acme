@@ -32,8 +32,9 @@ pub const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
 /// ALPN protocol name that marks a `tls-alpn-01` validation handshake (RFC 8737).
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
+/// An account at an ACME server, with the key that signs its requests.
 #[derive(Debug)]
-pub struct Account {
+pub(crate) struct Account {
     pub(crate) key_pair: EcdsaKeyPair,
     /// Directory of the ACME server that holds this account.
     pub directory: Directory,
@@ -49,19 +50,6 @@ impl Account {
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(ALG, &rng).unwrap();
         pkcs8.as_ref().to_vec()
-    }
-    pub async fn create<'a, S, I>(
-        client_config: &Arc<ClientConfig>,
-        directory: Directory,
-        contact: I,
-        eab: &Option<ExternalAccountKey>,
-    ) -> Result<Self, AcmeError>
-    where
-        S: AsRef<str> + 'a,
-        I: IntoIterator<Item = &'a S>,
-    {
-        let key_pair = Self::generate_key_pair();
-        Self::create_with_keypair(client_config, directory, contact, &key_pair, eab).await
     }
     /// Registers the account for `key_pair` at the server, or looks up the existing one.
     pub async fn create_with_keypair<'a, S, I>(
@@ -245,7 +233,7 @@ impl Account {
 /// Endpoint URLs from the directory object of an ACME server (RFC 8555 section 7.1.1).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Directory {
+pub(crate) struct Directory {
     /// URL that hands out fresh replay nonces.
     pub new_nonce: String,
     /// URL to create an account or look up an existing one.
@@ -267,7 +255,7 @@ impl Directory {
         serde_json::from_slice(&body).map_err(json_err)
     }
     /// Fetches a fresh replay nonce from the `newNonce` URL.
-    pub async fn nonce(&self, client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
+    async fn nonce(&self, client_config: &Arc<ClientConfig>) -> Result<String, AcmeError> {
         let url = self.new_nonce.as_str();
         let response = &https(client_config, url, Method::Head, None, self.https_only()).await?;
         get_header(response, "replay-nonce")
@@ -281,8 +269,8 @@ impl Directory {
     }
 }
 
-/// See RFC 8555 section 7.3.4 for more information.
-pub struct ExternalAccountKey {
+/// A key that binds a new account to an external CA account (RFC 8555 section 7.3.4).
+pub(crate) struct ExternalAccountKey {
     /// Key identifier that the CA assigned to the external account.
     pub kid: String,
     pub(crate) key: hmac::Key,
@@ -471,6 +459,9 @@ fn get_header(response: &Response, header: &'static str) -> Result<String, AcmeE
         Some(value) => Ok(value),
     }
 }
+
+#[cfg(test)]
+mod http_tests;
 
 #[cfg(test)]
 mod tests {

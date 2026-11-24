@@ -119,9 +119,8 @@
 //!
 //! ## The acme module
 //!
-//! The underlying implementation of an async acme client may be useful to others and is exposed as
-//! a module. It is incomplete (contributions welcome) and not covered by any stability
-//! promises.
+//! The [acme] module holds the ACME server objects and errors that [OrderError] carries, and the
+//! Let's Encrypt directory URLs. The ACME client itself is internal.
 //!
 //! ## Special thanks
 //!
@@ -142,7 +141,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod acceptor;
-/// Low-level ACME client (RFC 8555), not covered by stability promises.
+/// ACME server objects and errors (RFC 8555), and the Let's Encrypt directory URLs.
 pub mod acme;
 /// Acceptor for serving through `axum_server`.
 #[cfg(feature = "axum")]

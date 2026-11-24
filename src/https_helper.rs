@@ -7,10 +7,10 @@ use thiserror::Error;
 pub(crate) use reqwest::Response;
 
 /// Time limit to open the TCP connection and finish the TLS handshake.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time limit for one request, from the connect until the end of the body.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum size of a response body in bytes, far above any ACME object.
 const MAX_BODY_SIZE: usize = 1024 * 1024;
