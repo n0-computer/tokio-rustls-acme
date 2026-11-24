@@ -1,3 +1,5 @@
+//! A "Hello Tls!" server that gets its certificate from an ACME CA through `AcmeConfig::incoming`.
+
 use clap::Parser;
 use std::io;
 use std::net::Ipv6Addr;

@@ -13,7 +13,7 @@ use tracing::info;
 /// # type EA = EC;
 /// let no_cache = NoCache::<EC, EA>::new();
 /// ```
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct NoCache<EC: Debug = Infallible, EA: Debug = Infallible> {
     _cert_error: PhantomData<AtomicPtr<Box<EC>>>,
     _account_error: PhantomData<AtomicPtr<Box<EA>>>,

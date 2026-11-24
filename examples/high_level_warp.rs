@@ -1,3 +1,5 @@
+//! A warp server that gets its certificate from an ACME CA through `AcmeConfig::incoming`.
+
 use clap::Parser;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;

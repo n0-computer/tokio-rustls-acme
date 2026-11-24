@@ -3,6 +3,7 @@ use crate::acme::ACME_TLS_ALPN_NAME;
 use rustls::crypto::CryptoProvider;
 use rustls::server::Acceptor;
 use rustls::{DEFAULT_VERSIONS, ServerConfig};
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -33,7 +34,7 @@ pub(crate) fn server_config(
 
 /// Accepts incoming TLS connections, handling `tls-alpn-01` validation
 /// inline and forwarding application traffic to the caller.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AcmeAcceptor {
     config: Arc<ServerConfig>,
 }
@@ -70,6 +71,12 @@ pub struct AcmeAccept<IO: AsyncRead + AsyncWrite + Unpin> {
     acceptor: LazyConfigAcceptor<IO>,
     config: Arc<ServerConfig>,
     validation_accept: Option<Accept<IO>>,
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin> fmt::Debug for AcmeAccept<IO> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcmeAccept").finish_non_exhaustive()
+    }
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> AcmeAccept<IO> {
@@ -123,8 +130,10 @@ pub(crate) struct Handshake<IO: AsyncRead + AsyncWrite + Unpin> {
     deadline: Pin<Box<Sleep>>,
 }
 
-// Every handshake starts in the larger variant, so boxing it only adds an allocation.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "every handshake starts in the larger variant, so boxing it only adds an allocation"
+)]
 enum HandshakeStage<IO: AsyncRead + AsyncWrite + Unpin> {
     /// Reads the ClientHello and answers `tls-alpn-01` validation requests.
     Acme(AcmeAccept<IO>),

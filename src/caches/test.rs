@@ -29,6 +29,12 @@ pub struct TestCache<EC: Debug = std::io::Error, EA: Debug = std::io::Error> {
     _account_error: PhantomData<AtomicPtr<Box<EA>>>,
 }
 
+impl<EC: Debug, EA: Debug> std::fmt::Debug for TestCache<EC, EA> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestCache").finish_non_exhaustive()
+    }
+}
+
 impl<EC: Debug, EA: Debug> Default for TestCache<EC, EA> {
     fn default() -> Self {
         let mut params = CertificateParams::default();

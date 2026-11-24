@@ -47,7 +47,7 @@ static ALG: &EcdsaSigningAlgorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
 
 impl Account {
     /// Generates a new P-256 ECDSA account key in PKCS#8 DER form.
-    pub fn generate_key_pair() -> Vec<u8> {
+    pub(crate) fn generate_key_pair() -> Vec<u8> {
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(ALG, &rng).unwrap();
         pkcs8.as_ref().to_vec()
@@ -57,7 +57,7 @@ impl Account {
         crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, key_pair).map(drop)
     }
     /// Registers the account for `key_pair` at the server, or looks up the existing one.
-    pub async fn create_with_keypair<'a, S, I>(
+    pub(crate) async fn create_with_keypair<'a, S, I>(
         client_config: &Arc<ClientConfig>,
         directory: Directory,
         contact: I,
@@ -137,7 +137,7 @@ impl Account {
         debug!(?body, "response");
         Ok((location, body))
     }
-    pub async fn new_order(
+    pub(crate) async fn new_order(
         &self,
         client_config: &Arc<ClientConfig>,
         domains: Vec<String>,
@@ -155,7 +155,7 @@ impl Account {
         Ok((url, order))
     }
     /// Fetches the authorization object at `url`.
-    pub async fn auth(
+    pub(crate) async fn auth(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -165,7 +165,7 @@ impl Account {
         serde_json::from_str(&response.1).map_err(json_err)
     }
     /// Tells the server that the challenge at `url` is ready for validation.
-    pub async fn challenge(
+    pub(crate) async fn challenge(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -174,7 +174,7 @@ impl Account {
         Ok(())
     }
     /// Fetches the current state of the order at `url`.
-    pub async fn order(
+    pub(crate) async fn order(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -183,7 +183,7 @@ impl Account {
         serde_json::from_str(&response.1).map_err(json_err)
     }
     /// Sends the DER-encoded `csr` to the finalize `url` and returns the updated order.
-    pub async fn finalize(
+    pub(crate) async fn finalize(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -194,7 +194,7 @@ impl Account {
         serde_json::from_str(&response.1).map_err(json_err)
     }
     /// Downloads the PEM certificate chain at `url`.
-    pub async fn certificate(
+    pub(crate) async fn certificate(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -202,7 +202,7 @@ impl Account {
         Ok(self.request(client_config, &url, "").await?.1)
     }
     /// Picks the `tls-alpn-01` challenge and builds its validation certificate for `domain`.
-    pub fn tls_alpn_01<'a>(
+    pub(crate) fn tls_alpn_01<'a>(
         &self,
         crypto_provider: &CryptoProvider,
         challenges: &'a [Challenge],
@@ -249,7 +249,7 @@ pub(crate) struct Directory {
 
 impl Directory {
     /// Fetches and parses the directory object at `url`.
-    pub async fn discover(
+    pub(crate) async fn discover(
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<Self, AcmeError> {
@@ -283,7 +283,7 @@ pub(crate) struct ExternalAccountKey {
 
 impl ExternalAccountKey {
     /// Creates a binding key from the CA-issued `kid` and the raw HMAC-SHA256 `key` bytes.
-    pub fn new(kid: String, key: &[u8]) -> Self {
+    pub(crate) fn new(kid: String, key: &[u8]) -> Self {
         Self {
             kid,
             key: hmac::Key::new(hmac::HMAC_SHA256, key),
@@ -291,6 +291,7 @@ impl ExternalAccountKey {
     }
 }
 
+/// The type of a challenge (RFC 8555 section 8).
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 pub enum ChallengeType {
     /// The `http-01` challenge (RFC 8555 section 8.3), not supported by this crate.
@@ -299,8 +300,10 @@ pub enum ChallengeType {
     /// The `dns-01` challenge (RFC 8555 section 8.4), not supported by this crate.
     #[serde(rename = "dns-01")]
     Dns01,
+    /// The `tls-alpn-01` challenge (RFC 8737), which this crate answers.
     #[serde(rename = "tls-alpn-01")]
     TlsAlpn01,
+    /// A challenge type this crate does not know.
     #[serde(other)]
     Unknown,
 }
@@ -385,6 +388,7 @@ pub enum AuthStatus {
     Deactivated,
 }
 
+/// An ACME identifier (RFC 8555 section 9.7.7).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 #[non_exhaustive]
@@ -406,6 +410,7 @@ pub struct Challenge {
     /// Random token from the server, part of the key authorization.
     #[serde(default)]
     pub token: String,
+    /// The error of a failed validation.
     pub error: Option<Problem>,
 }
 

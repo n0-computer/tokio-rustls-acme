@@ -3,7 +3,7 @@ use crate::acceptor::{AcmeAcceptor, DEFAULT_HANDSHAKE_TIMEOUT, Handshake, server
 use futures_core::FusedStream;
 use n0_future::{FuturesUnordered, Stream};
 use rustls::ServerConfig;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,6 +46,22 @@ pub struct Incoming<
     tcp_incoming: Option<ITCP>,
     handshake_timeout: Duration,
     handshakes: FuturesUnordered<Handshake<TCP>>,
+}
+
+impl<
+    TCP: AsyncRead + AsyncWrite + Unpin,
+    ETCP,
+    ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
+    EC: Debug + 'static,
+    EA: Debug + 'static,
+> fmt::Debug for Incoming<TCP, ETCP, ITCP, EC, EA>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Incoming")
+            .field("state", &self.state)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<
