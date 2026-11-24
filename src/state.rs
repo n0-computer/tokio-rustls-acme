@@ -16,7 +16,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
@@ -56,6 +56,13 @@ fn stall_delay(round: u32) -> Option<Duration> {
     (round < MAX_STALLED_ROUNDS).then(|| BACKOFF_BASE_DELAY * (1 << round))
 }
 
+/// A failed order.
+struct OrderFailure {
+    error: OrderError,
+    /// Whether the CA rejected the account key at `newAccount`.
+    account_rejected: bool,
+}
+
 /// Drives ACME orders and renewals, surfacing lifecycle events as a [`Stream`].
 ///
 /// Owns the [`ResolvesServerCertAcme`] populated as new certificates are
@@ -69,7 +76,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     early_action: Option<BoxFuture<Event<EC, EA>>>,
     load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
-    order: Option<BoxFuture<Result<Vec<u8>, OrderError>>>,
+    order: Option<BoxFuture<Result<Vec<u8>, OrderFailure>>>,
     backoff_cnt: usize,
     wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
@@ -99,6 +106,12 @@ pub enum EventError<EC: Debug, EA: Debug> {
     /// Loading the certificate from the cache failed.
     #[error("cert cache load: {0}")]
     CertCacheLoad(EC),
+    /// The account cache could not be read, so this run orders with a new key that is not stored.
+    ///
+    /// Return `Ok(None)` from [`AccountCache::load_account`] when no key is stored.
+    /// Otherwise every start uses a new account.
+    ///
+    /// [`AccountCache::load_account`]: crate::AccountCache::load_account
     #[error("account cache load: {0}")]
     AccountCacheLoad(EA),
     /// Storing the newly issued certificate in the cache failed.
@@ -110,7 +123,9 @@ pub enum EventError<EC: Debug, EA: Debug> {
     /// The certificate from the cache could not be parsed.
     #[error("cached cert parse: {0}")]
     CachedCertParse(CertParseError),
-    /// Ordering a certificate failed, and the next order follows after a backoff.
+    /// An order failed, and the next one starts after a backoff.
+    ///
+    /// If the CA rejects the account, later orders use a new account key kept in memory only.
     #[error("order: {0}")]
     Order(OrderError),
     /// The newly issued certificate could not be parsed.
@@ -331,21 +346,44 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }));
         Event::Ok(EventOk::DeployedNewCert)
     }
+    /// Runs one order.
+    // Returns once per order, so the error size does not matter.
+    #[allow(clippy::result_large_err)]
     async fn order(
         config: Arc<AcmeConfig<EC, EA>>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
+    ) -> Result<Vec<u8>, OrderFailure> {
+        let account = async {
+            let directory =
+                Directory::discover(&config.client_config, &config.directory_url).await?;
+            Account::create_with_keypair(
+                &config.client_config,
+                directory,
+                &config.contact,
+                &key_pair,
+                &config.eab,
+            )
+            .await
+        }
+        .await
+        .map_err(|err| OrderFailure {
+            account_rejected: err.rejects_account(),
+            error: err.into(),
+        })?;
+        // CAs also use `unauthorized` for order problems, so only account errors count.
+        Self::order_with_account(&config, &resolver, &account)
+            .await
+            .map_err(|error| OrderFailure {
+                error,
+                account_rejected: false,
+            })
+    }
+    async fn order_with_account(
+        config: &AcmeConfig<EC, EA>,
+        resolver: &ResolvesServerCertAcme,
+        account: &Account,
     ) -> Result<Vec<u8>, OrderError> {
-        let directory = Directory::discover(&config.client_config, &config.directory_url).await?;
-        let account = Account::create_with_keypair(
-            &config.client_config,
-            directory,
-            &config.contact,
-            &key_pair,
-            &config.eab,
-        )
-        .await?;
-
         let mut params = CertificateParams::new(config.domains.clone()).map_err(rcgen_err)?;
         params.distinguished_name = DistinguishedName::new();
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(rcgen_err)?;
@@ -361,7 +399,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                     let auth_futures = order
                         .authorizations
                         .iter()
-                        .map(|url| Self::authorize(&config, &resolver, &account, url));
+                        .map(|url| Self::authorize(config, resolver, account, url));
                     try_join_all(auth_futures).await?;
                     info!("completed all authorizations");
                     order = account.order(&config.client_config, &order_url).await?;
@@ -500,10 +538,23 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             if let Some(load_account) = &mut self.load_account {
                 let result = ready!(load_account.poll(cx));
                 self.load_account.take();
+                // Never overwrite a stored key, it may be the only access to an account.
                 match result {
-                    Ok(Some(key_pair)) => self.account_key = Some(key_pair),
+                    Ok(Some(key_pair)) => match Account::check_key_pair(&key_pair) {
+                        Ok(()) => self.account_key = Some(key_pair),
+                        Err(err) => {
+                            error!(
+                                %err,
+                                "cannot use the cached account key, fix or delete it. Ordering with a new key that is not stored"
+                            );
+                            self.account_key = Some(Account::generate_key_pair());
+                        }
+                    },
                     Ok(None) => {}
-                    Err(err) => return Poll::Ready(Err(EventError::AccountCacheLoad(err))),
+                    Err(err) => {
+                        self.account_key = Some(Account::generate_key_pair());
+                        return Poll::Ready(Err(EventError::AccountCacheLoad(err)));
+                    }
                 }
             }
 
@@ -524,10 +575,19 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         }
                         return Poll::Ready(event);
                     }
-                    Err(err) => {
-                        // TODO: replace key on some errors or high backoff_cnt?
+                    Err(OrderFailure {
+                        error,
+                        account_rejected,
+                    }) => {
+                        // Keeps the stored key, so a wrong CA answer cannot lose a valid account.
+                        if account_rejected {
+                            error!(
+                                "the CA rejected the ACME account, ordering with a new account key that is not stored"
+                            );
+                            self.account_key = Some(Account::generate_key_pair());
+                        }
                         self.back_off();
-                        return Poll::Ready(Err(EventError::Order(err)));
+                        return Poll::Ready(Err(EventError::Order(error)));
                     }
                 }
             }

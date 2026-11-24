@@ -52,6 +52,10 @@ impl Account {
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(ALG, &rng).unwrap();
         pkcs8.as_ref().to_vec()
     }
+    /// Returns an error if `key_pair` is not a PKCS#8 key that an account can use.
+    pub(crate) fn check_key_pair(key_pair: &[u8]) -> Result<(), CryptoError> {
+        crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, key_pair).map(drop)
+    }
     /// Registers the account for `key_pair` at the server, or looks up the existing one.
     pub async fn create_with_keypair<'a, S, I>(
         client_config: &Arc<ClientConfig>,
@@ -451,6 +455,27 @@ pub enum AcmeError {
     NoTlsAlpn01Challenge,
 }
 
+impl AcmeError {
+    /// Returns whether a `newAccount` error shows a deactivated or unknown account.
+    ///
+    /// See RFC 8555 section 7.3.6.
+    pub(crate) fn rejects_account(&self) -> bool {
+        let AcmeError::HttpRequest(HttpsRequestError::Non2xxStatus { body, .. }) = self else {
+            return false;
+        };
+        let typ = serde_json::from_str::<Problem>(body)
+            .ok()
+            .and_then(|p| p.typ);
+        matches!(
+            typ.as_deref(),
+            Some(
+                "urn:ietf:params:acme:error:unauthorized"
+                    | "urn:ietf:params:acme:error:accountDoesNotExist"
+            )
+        )
+    }
+}
+
 fn json_err(err: serde_json::Error) -> AcmeError {
     AcmeError::Json(err.into())
 }
@@ -521,6 +546,28 @@ mod tests {
 
         let result = account.tls_alpn_01(&provider, &challenges, "example.com".into());
         assert!(matches!(result, Err(AcmeError::Crypto(_))));
+    }
+
+    #[test]
+    fn rejects_account_on_account_problems_only() {
+        let non_2xx = |body: &str| {
+            AcmeError::HttpRequest(HttpsRequestError::Non2xxStatus {
+                status_code: 403,
+                body: body.to_string(),
+            })
+        };
+        let problem = |typ: &str| format!(r#"{{"type":"urn:ietf:params:acme:error:{typ}"}}"#);
+        let cases = [
+            (problem("unauthorized"), true),
+            (problem("accountDoesNotExist"), true),
+            (problem("rateLimited"), false),
+            ("{}".to_string(), false),
+            ("unauthorized".to_string(), false),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(non_2xx(&body).rejects_account(), expected, "{body}");
+        }
+        assert!(!AcmeError::MissingHeader("location").rejects_account());
     }
 
     #[test]

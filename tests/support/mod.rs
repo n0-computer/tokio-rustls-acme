@@ -362,6 +362,26 @@ pub fn decode_jws(body: &[u8]) -> Option<(Value, Vec<u8>)> {
     Some((serde_json::from_slice(&protected).ok()?, payload))
 }
 
+/// Returns the uncompressed public point of the P-256 key in `jwk`.
+pub fn jwk_public_point(jwk: &Value) -> [u8; 65] {
+    let coordinate = |name: &str| {
+        let value = jwk[name].as_str().expect("JWK coordinate");
+        URL_SAFE_NO_PAD.decode(value).expect("base64url coordinate")
+    };
+    [vec![0x04], coordinate("x"), coordinate("y")]
+        .concat()
+        .try_into()
+        .expect("P-256 point")
+}
+
+fn unauthorized() -> Response {
+    Response::json(
+        403,
+        &json!({"type": "urn:ietf:params:acme:error:unauthorized"}),
+    )
+    .header("content-type", "application/problem+json")
+}
+
 /// How the mock ACME server reports the order status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderScript {
@@ -385,6 +405,10 @@ pub struct MockAcmeState {
     pub domain: String,
     /// JWK of the most recent `newAccount` request.
     pub account_jwk: Option<Value>,
+    /// Public point of an account key whose `newAccount` requests fail with `unauthorized`.
+    pub deactivated_key: Option<[u8; 65]>,
+    /// Answers the next finalization with `unauthorized`, then resets.
+    pub reject_finalize: bool,
     /// Number of requests per `"METHOD /path"`.
     pub hits: HashMap<String, usize>,
     /// Arrival times of the requests per `"METHOD /path"`, on the real clock.
@@ -439,6 +463,8 @@ impl MockAcme {
             token: "bW9jay1hY21lLXRva2Vu".to_string(),
             domain: String::new(),
             account_jwk: None,
+            deactivated_key: None,
+            reject_finalize: false,
             hits: HashMap::new(),
             arrivals: HashMap::new(),
             jws_violations: Vec::new(),
@@ -534,6 +560,12 @@ fn handle_acme(
             state.issued_nonces.insert(nonce.clone());
             Response::new(200).header("replay-nonce", nonce)
         }
+        "POST /acct"
+            if state.deactivated_key.is_some()
+                && state.account_jwk.as_ref().map(jwk_public_point) == state.deactivated_key =>
+        {
+            unauthorized()
+        }
         "POST /acct" => Response::json(201, &json!({"status": "valid"}))
             .header("location", format!("{base}/acct/1")),
         "POST /order" => {
@@ -561,6 +593,10 @@ fn handle_acme(
             }),
         ),
         "POST /chall/1" => Response::json(200, &json!({})),
+        "POST /finalize/1" if state.reject_finalize => {
+            state.reject_finalize = false;
+            unauthorized()
+        }
         "POST /finalize/1" if state.order_script == OrderScript::RevertsOnFinalize => {
             let mut order = order_json(base, &state);
             order["status"] = json!("pending");
