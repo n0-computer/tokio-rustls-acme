@@ -37,7 +37,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    simple_logger::init_with_level(log::Level::Info).unwrap();
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     let tcp_listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, args.port))
@@ -56,7 +56,7 @@ async fn main() {
             Ok(tls) => tls,
             Err(err) if is_connection_error(&err) => continue,
             Err(err) => {
-                log::error!("TCP accept failed: {err:?}");
+                tracing::error!("TCP accept failed: {err:?}");
                 // Accept fails again at once while no file descriptor is free.
                 tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
                 continue;

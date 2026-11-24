@@ -8,7 +8,7 @@ mod support;
 use std::{convert::TryFrom, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use futures::StreamExt;
+use n0_future::StreamExt;
 use rustls::{
     ClientConfig, DEFAULT_VERSIONS, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, ServerName},

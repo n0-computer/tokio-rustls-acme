@@ -1,8 +1,8 @@
 use clap::Parser;
-use futures::StreamExt;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
+use n0_future::StreamExt;
 use std::io;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
@@ -41,7 +41,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    simple_logger::init_with_level(log::Level::Info).unwrap();
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     let tcp_listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, args.port))
@@ -49,18 +49,19 @@ async fn main() {
         .unwrap();
     // Log and drop accept errors here, and pause after those that would repeat at once.
     let tcp_incoming = TcpListenerStream::new(tcp_listener)
-        .filter_map(|tcp| async move {
+        .then(|tcp| async move {
             match tcp {
                 Ok(tcp) => Some(Ok::<_, io::Error>(tcp)),
                 Err(err) if is_connection_error(&err) => None,
                 Err(err) => {
-                    log::error!("TCP accept failed: {err:?}");
+                    tracing::error!("TCP accept failed: {err:?}");
                     // Accept fails again at once while no file descriptor is free.
                     tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
                     None
                 }
             }
         })
+        .filter_map(|tcp| tcp)
         .boxed();
 
     let tls_incoming = AcmeConfig::new(args.domains)
@@ -79,7 +80,7 @@ async fn main() {
         let tls = match tls {
             Ok(tls) => tls,
             Err(err) => {
-                log::error!("accept error: {err}");
+                tracing::error!("accept error: {err}");
                 continue;
             }
         };
@@ -88,7 +89,7 @@ async fn main() {
                 .serve_connection_with_upgrades(TokioIo::new(tls), service)
                 .await
             {
-                log::warn!("connection error: {err}");
+                tracing::warn!("connection error: {err}");
             }
         });
     }

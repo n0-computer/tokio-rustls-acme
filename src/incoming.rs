@@ -1,7 +1,7 @@
 use crate::AcmeState;
 use crate::acceptor::{AcmeAcceptor, DEFAULT_HANDSHAKE_TIMEOUT, Handshake, server_config};
-use futures::Stream;
-use futures::stream::{FusedStream, FuturesUnordered};
+use futures_core::FusedStream;
+use n0_future::{FuturesUnordered, Stream};
 use rustls::ServerConfig;
 use std::fmt::Debug;
 use std::io;
@@ -11,20 +11,21 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::server::TlsStream;
+use tracing::{debug, error, info, warn};
 
 /// Logs a failed handshake.
 ///
 /// Peers can cause the common failures, so those log at debug.
 fn log_handshake_error(err: &io::Error) {
     match err.kind() {
-        io::ErrorKind::TimedOut => log::debug!("TLS handshake timed out"),
+        io::ErrorKind::TimedOut => debug!("TLS handshake timed out"),
         io::ErrorKind::UnexpectedEof
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::BrokenPipe => log::debug!("peer disconnected during TLS handshake: {err}"),
+        | io::ErrorKind::BrokenPipe => debug!("peer disconnected during TLS handshake: {err}"),
         // rustls reports invalid or unacceptable TLS messages as InvalidData.
-        io::ErrorKind::InvalidData => log::debug!("TLS handshake rejected: {err}"),
-        _ => log::warn!("TLS handshake failed: {err:?}"),
+        io::ErrorKind::InvalidData => debug!("TLS handshake rejected: {err}"),
+        _ => warn!("TLS handshake failed: {err:?}"),
     }
 }
 
@@ -120,8 +121,8 @@ impl<
             match Pin::new(&mut self.state).poll_next(cx) {
                 Poll::Ready(Some(event)) => {
                     match event {
-                        Ok(ok) => log::info!("event: {ok:?}"),
-                        Err(err) => log::error!("event: {err:?}"),
+                        Ok(ok) => info!(event = ?ok, "event"),
+                        Err(err) => error!(?err, "event"),
                     }
                     continue;
                 }
@@ -131,7 +132,7 @@ impl<
             match Pin::new(&mut self.handshakes).poll_next(cx) {
                 Poll::Ready(Some(Ok(Some(tls)))) => return Poll::Ready(Some(Ok(tls))),
                 Poll::Ready(Some(Ok(None))) => {
-                    log::debug!("received TLS-ALPN-01 validation request");
+                    debug!("received TLS-ALPN-01 validation request");
                     continue;
                 }
                 Poll::Ready(Some(Err(err))) => {

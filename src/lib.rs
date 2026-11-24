@@ -54,7 +54,7 @@
 //! use std::io;
 //! use std::time::Duration;
 //! use tokio::io::AsyncWriteExt;
-//! use futures::StreamExt;
+//! use n0_future::StreamExt;
 //! use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 //! use tokio_stream::wrappers::TcpListenerStream;
 //!
@@ -63,7 +63,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     simple_logger::init_with_level(log::Level::Info).unwrap();
+//!     tracing_subscriber::fmt::init();
 //!
 //!     let tcp_listener = tokio::net::TcpListener::bind("[::]:443").await.unwrap();
 //!     let tcp_incoming = TcpListenerStream::new(tcp_listener);
@@ -78,7 +78,7 @@
 //!             Ok(tls) => tls,
 //!             Err(err) if is_connection_error(&err) => continue,
 //!             Err(err) => {
-//!                 log::error!("TCP accept failed: {err:?}");
+//!                 tracing::error!("TCP accept failed: {err:?}");
 //!                 // Accept fails again at once while no file descriptor is free.
 //!                 tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
 //!                 continue;

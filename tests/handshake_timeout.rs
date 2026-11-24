@@ -4,7 +4,7 @@ mod support;
 
 use std::{convert::Infallible, convert::TryFrom, io, sync::Arc, time::Duration};
 
-use futures::{StreamExt, stream::BoxStream};
+use n0_future::{StreamExt, boxed::BoxStream};
 use rustls::{
     ClientConfig, DEFAULT_VERSIONS, RootCertStore,
     pki_types::{CertificateDer, ServerName},
@@ -75,18 +75,13 @@ struct TimeoutCase {
 
 type Cache = TestCache<io::Error, io::Error>;
 
-type TestIncoming = Incoming<
-    DuplexStream,
-    io::Error,
-    BoxStream<'static, io::Result<DuplexStream>>,
-    io::Error,
-    io::Error,
->;
+type TestIncoming =
+    Incoming<DuplexStream, io::Error, BoxStream<io::Result<DuplexStream>>, io::Error, io::Error>;
 
 fn incoming(cache: Cache, connections: impl IntoIterator<Item = DuplexStream>) -> TestIncoming {
     let connections: Vec<_> = connections.into_iter().map(io::Result::Ok).collect();
-    let tcp = futures::stream::iter(connections)
-        .chain(futures::stream::pending())
+    let tcp = n0_future::stream::iter(connections)
+        .chain(n0_future::stream::pending())
         .boxed();
     AcmeConfig::new_with_client_tls_config([DOMAIN], support::client_config_without_roots())
         .cache(cache)

@@ -9,6 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_rustls_acme::caches::DirCache;
 use tokio_rustls_acme::{AcmeAcceptor, AcmeConfig};
 use tokio_stream::StreamExt;
+use tracing::{debug, error, info};
 
 /// Limit for one TLS handshake, the default of axum-server.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,7 +42,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    simple_logger::init_with_level(log::Level::Info).unwrap();
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     let mut state = AcmeConfig::new(args.domains)
@@ -59,8 +60,8 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             match state.next().await.unwrap() {
-                Ok(ok) => log::info!("event: {ok:?}"),
-                Err(err) => log::error!("error: {err:?}"),
+                Ok(ok) => info!(event = ?ok, "event"),
+                Err(err) => error!(?err, "error"),
             }
         }
     });
@@ -77,7 +78,7 @@ async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u
             Ok((tcp, _)) => tcp,
             Err(err) if is_connection_error(&err) => continue,
             Err(err) => {
-                log::error!("TCP accept failed: {err:?}");
+                error!("TCP accept failed: {err:?}");
                 // Accept fails again at once while no file descriptor is free.
                 tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
                 continue;
@@ -104,12 +105,12 @@ async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u
                         tls.shutdown().await
                     };
                     if let Err(err) = response.await {
-                        log::debug!("failed to send response: {err:?}");
+                        debug!("failed to send response: {err:?}");
                     }
                 }
-                Ok(Ok(None)) => log::info!("received TLS-ALPN-01 validation request"),
-                Ok(Err(err)) => log::debug!("TLS handshake failed: {err:?}"),
-                Err(_) => log::debug!("TLS handshake timed out"),
+                Ok(Ok(None)) => info!("received TLS-ALPN-01 validation request"),
+                Ok(Err(err)) => debug!("TLS handshake failed: {err:?}"),
+                Err(_) => debug!("TLS handshake timed out"),
             }
         });
     }
