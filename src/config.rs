@@ -19,7 +19,7 @@ const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
 /// Controls which certificate chain to serve to clients.
 ///
 /// ACME servers like Let's Encrypt may offer multiple certificate chains with different root
-/// certificates (RFC 8555 §7.4.2). This enum allows selecting which chain(s) to use.
+/// certificates (RFC 8555 section 7.4.2). This enum allows selecting which chain(s) to use.
 ///
 /// A chain is identified by the issuer common name of its topmost certificate, i.e. the root it
 /// chains to, like certbot's `--preferred-chain`. These names are chosen by the CA and change
@@ -33,7 +33,14 @@ const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
 /// can't verify every signature in the default chain but can verify the alternate. This helps
 /// clients that leave out algorithms they can't verify, e.g. rustls clients built without RSA
 /// support. A client that advertises a scheme it can't actually verify, or that doesn't trust
-/// the alternate's root, gains nothing.
+/// the alternate's root, gains nothing. The choice uses the `signature_algorithms` extension
+/// only, so a TLS 1.3 client that lists a scheme only in `signature_algorithms_cert` counts as
+/// not supporting it.
+///
+/// # Changing the preference
+///
+/// The preference applies to new orders. A certificate loaded from the cache keeps the chain it
+/// was issued with until its renewal.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub enum CertChainPreference {

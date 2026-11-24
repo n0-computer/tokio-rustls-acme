@@ -203,8 +203,9 @@ impl Account {
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<CertificateWithAlternateUrls, AcmeError> {
+        let url = url.as_ref();
         let response = self.request(client_config, url, "").await?;
-        let alternate_urls = parse_link_alternate(&response.headers);
+        let alternate_urls = parse_link_alternate(url, &response.headers);
         Ok(CertificateWithAlternateUrls {
             pem: response.body,
             alternate_urls,
@@ -474,8 +475,11 @@ pub(crate) struct CertificateWithAlternateUrls {
     pub alternate_urls: Vec<String>,
 }
 
-/// Parse `Link` headers for `rel="alternate"` URLs (RFC 8555 Section 7.4.2).
-fn parse_link_alternate(headers: &HeaderMap) -> Vec<String> {
+/// Returns the `rel="alternate"` URLs of the `Link` headers (RFC 8555 section 7.4.2).
+///
+/// Relative URLs are resolved against `base`, the URL of the response (RFC 8288 section 3.2).
+fn parse_link_alternate(base: &str, headers: &HeaderMap) -> Vec<String> {
+    let base = url::Url::parse(base).ok();
     headers
         .get_all(reqwest::header::LINK)
         .iter()
@@ -490,12 +494,16 @@ fn parse_link_alternate(headers: &HeaderMap) -> Vec<String> {
                             .split_ascii_whitespace()
                             .any(|rel| rel.eq_ignore_ascii_case("alternate"))
                 })
-                .then(|| target.to_string())
+                .then_some(target)
+        })
+        .filter_map(|target| match &base {
+            Some(base) => base.join(target).ok().map(String::from),
+            None => url::Url::parse(target).ok().map(String::from),
         })
         .collect()
 }
 
-/// Splits `s` on `sep`, except inside `<…>` and `"…"` (RFC 8288 link values).
+/// Splits `s` on `sep`, except inside `<...>` and `"..."` (RFC 8288 link values).
 fn split_unquoted(sep: char) -> impl Fn(&str) -> Vec<&str> {
     move |s| {
         let mut parts = Vec::new();
@@ -569,7 +577,7 @@ mod tests {
         for value in values {
             headers.append(LINK, HeaderValue::from_str(value).unwrap());
         }
-        parse_link_alternate(&headers)
+        parse_link_alternate("https://ca.example/acme/cert/1", &headers)
     }
 
     #[test]
@@ -597,6 +605,17 @@ mod tests {
                 r#"<https://ca.example/b> ; title="x;y" ; rel = "index alternate""#,
             ]),
             ["https://ca.example/a,1", "https://ca.example/b"],
+        );
+    }
+
+    #[test]
+    fn link_alternate_resolves_relative_urls() {
+        assert_eq!(
+            alternates(&[r#"<1/2>;rel="alternate""#, r#"</other/3>;rel="alternate""#]),
+            [
+                "https://ca.example/acme/cert/1/2",
+                "https://ca.example/other/3"
+            ],
         );
     }
 

@@ -17,8 +17,8 @@ pub struct ResolvesServerCertAcme {
 #[derive(Debug)]
 struct CertWithSchemes {
     key: Arc<CertifiedKey>,
-    /// Signature schemes required to verify this certificate chain.
-    required_schemes: Vec<SignatureScheme>,
+    /// Signature schemes required to verify this certificate chain, or `None` if unknown.
+    required_schemes: Option<Vec<SignatureScheme>>,
 }
 
 #[derive(Debug)]
@@ -40,7 +40,11 @@ impl ResolvesServerCertAcme {
             }),
         })
     }
-    pub(crate) fn set_cert(&self, cert: Arc<CertifiedKey>, required_schemes: Vec<SignatureScheme>) {
+    pub(crate) fn set_cert(
+        &self,
+        cert: Arc<CertifiedKey>,
+        required_schemes: Option<Vec<SignatureScheme>>,
+    ) {
         self.inner.lock().unwrap().cert = Some(CertWithSchemes {
             key: cert,
             required_schemes,
@@ -55,7 +59,7 @@ impl ResolvesServerCertAcme {
     /// alternate is installed.
     pub(crate) fn set_alt_cert(
         &self,
-        cert: Option<(Arc<CertifiedKey>, Vec<SignatureScheme>)>,
+        cert: Option<(Arc<CertifiedKey>, Option<Vec<SignatureScheme>>)>,
     ) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let alt = cert.filter(|(key, _)| {
@@ -106,14 +110,16 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
             // In DualChain mode: if the client can't verify the primary chain
             // but can verify the alternate, serve the alternate. Verifying a
             // chain takes every signature scheme in it, so a client that
-            // supports only some of the primary's schemes can't use it.
-            if let (Some(primary), Some(alt)) = (&inner.cert, &inner.alt_cert) {
-                let supports = |c: &CertWithSchemes| {
-                    c.required_schemes
-                        .iter()
-                        .all(|s| client_schemes.contains(s))
+            // supports only some of the primary's schemes can't use it. If
+            // either chain has an unknown scheme, keep the primary.
+            if let (Some(primary), Some(alt)) = (&inner.cert, &inner.alt_cert)
+                && let (Some(primary_schemes), Some(alt_schemes)) =
+                    (&primary.required_schemes, &alt.required_schemes)
+            {
+                let supports = |schemes: &[SignatureScheme]| {
+                    schemes.iter().all(|s| client_schemes.contains(s))
                 };
-                if !supports(primary) && supports(alt) {
+                if !supports(primary_schemes) && supports(alt_schemes) {
                     return Some(alt.key.clone());
                 }
             }
@@ -245,11 +251,11 @@ mod tests {
 
         let resolver = ResolvesServerCertAcme::new();
         // Primary requires ED448 (not supported by ring clients).
-        resolver.set_cert(primary_key, vec![SignatureScheme::ED448]);
+        resolver.set_cert(primary_key, Some(vec![SignatureScheme::ED448]));
         // Alt requires ECDSA P-256 (supported by ring clients).
         resolver.set_alt_cert(Some((
             alt_key,
-            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
+            Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
         )));
 
         let root_store = make_root_store(cache.ca_pem());
@@ -271,10 +277,13 @@ mod tests {
 
         let resolver = ResolvesServerCertAcme::new();
         // Primary requires ECDSA P-256 (supported by ring clients).
-        resolver.set_cert(primary_key, vec![SignatureScheme::ECDSA_NISTP256_SHA256]);
+        resolver.set_cert(
+            primary_key,
+            Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
+        );
         resolver.set_alt_cert(Some((
             alt_key,
-            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
+            Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
         )));
 
         let root_store = make_root_store(cache.ca_pem());
@@ -300,14 +309,14 @@ mod tests {
         let resolver = ResolvesServerCertAcme::new();
         resolver.set_cert(
             primary_key,
-            vec![
+            Some(vec![
                 SignatureScheme::ECDSA_NISTP384_SHA384,
                 SignatureScheme::RSA_PKCS1_SHA256,
-            ],
+            ]),
         );
         resolver.set_alt_cert(Some((
             alt_key,
-            vec![SignatureScheme::ECDSA_NISTP384_SHA384],
+            Some(vec![SignatureScheme::ECDSA_NISTP384_SHA384]),
         )));
 
         // A ring client that doesn't advertise any RSA scheme.
@@ -340,6 +349,26 @@ mod tests {
         );
     }
 
+    /// A primary chain with an unknown signature scheme is served, since it
+    /// is unknown whether the client can verify it.
+    #[tokio::test]
+    async fn dual_chain_unknown_primary_schemes_serve_primary() {
+        let cache = TestCache::<Infallible, Infallible>::new();
+        let (primary_key, primary_chain) = make_cert(&cache).await;
+        let (alt_key, _) = alternate_of(&primary_key);
+
+        let resolver = ResolvesServerCertAcme::new();
+        resolver.set_cert(primary_key, None);
+        resolver.set_alt_cert(Some((
+            alt_key,
+            Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
+        )));
+
+        let root_store = make_root_store(cache.ca_pem());
+        let peer_certs = do_handshake(resolver, root_store).await;
+        assert_eq!(peer_certs, primary_chain);
+    }
+
     /// Without DualChain (no alt cert set), the primary is always served.
     #[tokio::test]
     async fn single_chain_serves_primary() {
@@ -347,7 +376,10 @@ mod tests {
         let (primary_key, primary_chain) = make_cert(&cache).await;
 
         let resolver = ResolvesServerCertAcme::new();
-        resolver.set_cert(primary_key, vec![SignatureScheme::ECDSA_NISTP256_SHA256]);
+        resolver.set_cert(
+            primary_key,
+            Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
+        );
 
         let root_store = make_root_store(cache.ca_pem());
         let peer_certs = do_handshake(resolver, root_store).await;
@@ -364,10 +396,10 @@ mod tests {
         let (other_key, _) = make_cert(&cache).await;
 
         let resolver = ResolvesServerCertAcme::new();
-        resolver.set_cert(primary_key, vec![SignatureScheme::ED448]);
+        resolver.set_cert(primary_key, Some(vec![SignatureScheme::ED448]));
         let installed = resolver.set_alt_cert(Some((
             other_key,
-            vec![SignatureScheme::ECDSA_NISTP256_SHA256],
+            Some(vec![SignatureScheme::ECDSA_NISTP256_SHA256]),
         )));
         assert!(!installed);
 

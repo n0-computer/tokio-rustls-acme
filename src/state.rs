@@ -147,8 +147,9 @@ struct ParsedCert {
     certified_key: CertifiedKey,
     /// `notBefore` and `notAfter` of the leaf.
     validity: [OffsetDateTime; 2],
-    /// The signature schemes of all certificates in the chain.
-    signature_schemes: Vec<SignatureScheme>,
+    /// The signature schemes of all certificates in the chain, or `None` if one of them has a
+    /// signature algorithm without a known scheme.
+    signature_schemes: Option<Vec<SignatureScheme>>,
 }
 
 struct OrderResult {
@@ -164,7 +165,7 @@ struct CachedCert {
 
 /// Extract the issuer common name of the last certificate in a PEM chain.
 /// For a typical chain [leaf, intermediate], this returns the CN of whoever
-/// signed the intermediate — i.e. the root CA, which may not be included
+/// signed the intermediate, i.e. the root CA, which may not be included
 /// in the chain itself.
 fn chain_root_issuer(cert_pem: &str) -> Option<String> {
     let pems = pem::parse_many(cert_pem).ok()?;
@@ -342,7 +343,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             pems.into_iter().map(|p| p.into_contents().into()).collect();
 
         let mut validity = None;
-        let mut signature_schemes = Vec::new();
+        let mut signature_schemes = Some(Vec::new());
         for der in cert_chain.iter() {
             let (_, cert) = parse_x509_certificate(der.as_ref())
                 .map_err(|err| CertParseError::X509(err.into()))?;
@@ -350,10 +351,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let v = cert.validity();
                 validity = Some([v.not_before, v.not_after].map(|t| t.to_datetime()));
             }
-            if let Some(scheme) = sig_oid_to_scheme(&cert.signature_algorithm.algorithm)
-                && !signature_schemes.contains(&scheme)
-            {
-                signature_schemes.push(scheme);
+            match (
+                sig_oid_to_scheme(&cert.signature_algorithm.algorithm),
+                &mut signature_schemes,
+            ) {
+                (Some(scheme), Some(schemes)) if !schemes.contains(&scheme) => schemes.push(scheme),
+                (Some(_), _) => {}
+                (None, _) => signature_schemes = None,
             }
         }
         let validity = validity.expect("the chain has at least one certificate");
@@ -525,15 +529,23 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
                         // Serve two chains: the default as primary, and an alternate
                         // matching `issuer` for clients whose signature schemes differ.
+                        // If the default chain already matches, there is nothing to add.
                         CertChainPreference::DualChain(issuer) => {
-                            let alternate = Self::fetch_chain_by_issuer(
-                                &account,
-                                &config.client_config,
-                                &cert_response.alternate_urls,
-                                issuer,
-                            )
-                            .await
-                            .map(|pem| make_pem(&pem));
+                            let default_matches =
+                                chain_root_issuer(&cert_response.pem).as_deref() == Some(issuer);
+                            let alternate = if default_matches {
+                                debug!(%issuer, "the default chain matches, serving no alternate");
+                                None
+                            } else {
+                                Self::fetch_chain_by_issuer(
+                                    &account,
+                                    &config.client_config,
+                                    &cert_response.alternate_urls,
+                                    issuer,
+                                )
+                                .await
+                                .map(|pem| make_pem(&pem))
+                            };
                             (make_pem(&cert_response.pem), alternate)
                         }
                     };

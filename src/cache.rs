@@ -29,7 +29,7 @@ pub trait CertCache: Send + Sync {
     /// Loads the alternate certificate chain stored by [`CertCache::store_alt_cert`].
     ///
     /// Used with [`CertChainPreference::DualChain`](crate::CertChainPreference::DualChain),
-    /// which serves an alternate chain next to the default one (RFC 8555 §7.4.2).
+    /// which serves an alternate chain next to the default one (RFC 8555 section 7.4.2).
     /// The default implementation stores nothing, so the alternate is
     /// fetched again with the next order.
     async fn load_alt_cert(
