@@ -174,8 +174,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     ///
     /// Profiles are defined by the CA and listed in its directory under `meta.profiles` (see
     /// [draft-ietf-acme-profiles](https://datatracker.ietf.org/doc/draft-ietf-acme-profiles/)).
-    /// If unset, no profile is sent and the CA picks its default. Ordering with a profile the
-    /// CA does not offer fails.
+    /// If unset, no profile is sent and the CA picks its default. A CA that supports profiles
+    /// rejects an order for a profile it does not offer. A CA without profile support ignores the
+    /// field and issues its default certificate.
+    ///
+    /// The profile applies to new orders. A certificate loaded from the cache is served until its
+    /// renewal, even if it was issued under another profile.
     ///
     /// Let's Encrypt issues certificates for IP addresses only under the `shortlived` profile
     /// (about 6 days of validity), so set it when any identifier is an IP address:

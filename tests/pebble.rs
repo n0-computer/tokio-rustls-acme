@@ -661,7 +661,7 @@ async fn test_validated_mixed_ip_and_domain_certificate() {
 
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let domain = "mixed.example.com";
-    let domain_addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 10));
+    let domain_addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 20));
     set_dns_record(domain, domain_addr).await;
 
     let _guard = LOOPBACK_LOCK.lock().await;

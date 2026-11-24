@@ -40,7 +40,7 @@ impl ResolvesServerCertAcme {
         let server_name = identifier.tls_alpn_01_server_name();
         self.inner
             .lock()
-            .expect("poisoned")
+            .unwrap()
             .auth_keys
             .insert(server_name, cert);
     }
@@ -59,11 +59,13 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
                     debug!("client did not supply SNI");
                     None
                 }
-                Some(domain) => {
-                    let domain = domain.to_owned();
-                    let domain: String = AsRef::<str>::as_ref(&domain).into();
-                    self.inner.lock().unwrap().auth_keys.get(&domain).cloned()
-                }
+                Some(server_name) => self
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .auth_keys
+                    .get(challenge_server_name(server_name))
+                    .cloned(),
             }
         } else {
             self.inner.lock().unwrap().cert.clone()
@@ -76,14 +78,22 @@ impl Identifier {
     ///
     /// For DNS identifiers this is the name itself (RFC 8737 section 3). SNI cannot carry IP
     /// addresses, so for IP identifiers it is the reverse-DNS name (RFC 8738 section 6), e.g.
-    /// `1.2.0.192.in-addr.arpa` for `192.0.2.1`. rustls lowercases the received SNI and strips a
-    /// trailing dot, so we produce that form.
+    /// `1.2.0.192.in-addr.arpa` for `192.0.2.1`. rustls lowercases the received SNI and
+    /// [`challenge_server_name`] strips a trailing dot, so we produce that form.
     fn tls_alpn_01_server_name(&self) -> String {
         match self {
             Identifier::Dns(name) => name.to_ascii_lowercase(),
             Identifier::Ip(ip) => reverse_dns_name(*ip),
         }
     }
+}
+
+/// Returns the received SNI `server_name` in the form [`Identifier::tls_alpn_01_server_name`]
+/// produces.
+///
+/// rustls lowercases the SNI it receives but keeps a trailing dot, which a CA may send.
+fn challenge_server_name(server_name: &str) -> &str {
+    server_name.strip_suffix('.').unwrap_or(server_name)
 }
 
 /// Returns the reverse-DNS name of `ip` (RFC 1035 section 3.5, RFC 3596 section 2.5).
@@ -132,6 +142,16 @@ mod tests {
             reverse_dns_name("::1".parse().unwrap()),
             format!("1.{}ip6.arpa", "0.".repeat(31))
         );
+    }
+
+    #[test]
+    fn challenge_server_name_strips_one_trailing_dot() {
+        // The rustls client strips the dot before sending, so a handshake cannot test this.
+        assert_eq!(
+            challenge_server_name("1.2.0.192.in-addr.arpa."),
+            "1.2.0.192.in-addr.arpa"
+        );
+        assert_eq!(challenge_server_name("example.org"), "example.org");
     }
 
     #[test]
@@ -242,8 +262,6 @@ mod tests {
     async fn resolves_ip_identifier_by_reverse_sni() {
         for (ip, sni) in [
             ("192.0.2.1", "1.2.0.192.in-addr.arpa".to_string()),
-            // Pebble passes the reverse name with a trailing dot, which must not matter.
-            ("192.0.2.1", "1.2.0.192.in-addr.arpa.".to_string()),
             (
                 "2001:db8::1",
                 format!("1.{}8.b.d.0.1.0.0.2.ip6.arpa", "0.".repeat(23)),

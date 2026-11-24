@@ -383,6 +383,10 @@ pub enum AuthStatus {
 /// Converting from a string picks [`Identifier::Ip`] if the string parses as an IP address and
 /// [`Identifier::Dns`] otherwise. IP addresses serialize in their canonical text form (RFC 5952
 /// for IPv6), as RFC 8738 section 3 requires.
+///
+/// The parsing follows [`IpAddr`]'s `FromStr`. An IPv4-mapped IPv6 address like
+/// `::ffff:192.0.2.1` stays an IPv6 identifier, which a CA may reject. Strings that do not parse,
+/// like `fe80::1%eth0` with a zone or `010.0.0.1` with a leading zero, become DNS identifiers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 #[non_exhaustive]
