@@ -44,12 +44,6 @@ url = "2.5.9"
 # Axum
 axum-server = { version = "0.9", features = ["tokio-rustls"], optional = true }
 
-[dependencies.proc-macro2]
-# This is a transitive dependency, we specify it to make sure we have
-# a recent-enough version so that -Z minimal-versions crate resolution
-# works.
-version = "1.0.78"
-
 [dependencies.num-bigint]
 # This is a transitive dependency, we specify it to make sure we have
 # a recent-enough version so that -Z minimal-versions crate resolution
