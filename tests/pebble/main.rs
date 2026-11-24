@@ -4,7 +4,7 @@
 //! can run in parallel, also with other runs of them.
 //!
 //! Install the Pebble binaries with `cargo make pebble-install`, then run the tests with
-//! `cargo test --test pebble -- --ignored`, or both with `cargo make test`.
+//! `cargo test --test pebble -- --ignored`, or both with `cargo make test-pebble`.
 
 mod server;
 

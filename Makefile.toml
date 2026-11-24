@@ -1,8 +1,80 @@
+[config]
+skip_core_tasks = true
+default_to_workspace = false
+
 [env]
-# Crate features for the pebble tests. CI runs them once per crypto backend.
-PEBBLE_FEATURES = { value = "tls-webpki-roots,tls-ring", condition = { env_not_set = ["PEBBLE_FEATURES"] } }
+# Fails the build on warnings without RUSTFLAGS, which would invalidate the build cache.
+CARGO_BUILD_WARNINGS = "deny"
+# Crate features for the test tasks. CI sets them per job.
+TEST_FEATURES = { value = "axum,tls-webpki-roots,tls-ring,tls-aws-lc-rs", condition = { env_not_set = ["TEST_FEATURES"] } }
 # Pebble release for the pebble tests. After changing it, run `cargo make pebble-update-checksums`.
 PEBBLE_VERSION = "v2.10.3"
+
+[tasks.default]
+alias = "dev-flow"
+
+[tasks.dev-flow]
+description = "Fast local subset of the CI checks"
+dependencies = ["format-check", "clippy", "test", "test-doc"]
+
+[tasks.format-check]
+command = "cargo"
+args = ["fmt", "--all", "--check"]
+
+[tasks.clippy]
+command = "cargo"
+args = ["clippy", "--locked", "--all-targets", "--all-features"]
+
+[tasks.check-lib]
+description = "Check the library alone for TEST_FEATURES, so that dev-dependencies add no features"
+command = "cargo"
+args = ["check", "--locked", "--no-default-features", "--features", "${TEST_FEATURES}", "--lib"]
+
+[tasks.test]
+description = "Run the tests except the doctests and the Pebble tests"
+command = "cargo"
+args = [
+    "nextest",
+    "run",
+    "--locked",
+    "--no-default-features",
+    "--features",
+    "${TEST_FEATURES}",
+    "--lib",
+    "--bins",
+    "--tests",
+]
+
+[tasks.test-doc]
+description = "Run the doctests"
+command = "cargo"
+args = ["test", "--locked", "--no-default-features", "--features", "${TEST_FEATURES}", "--doc"]
+
+[tasks.test-pebble]
+description = "Run the Pebble integration tests, which are ignored by default"
+dependencies = ["pebble-install"]
+command = "cargo"
+args = [
+    "nextest",
+    "run",
+    "--locked",
+    "--no-default-features",
+    "--features",
+    "${TEST_FEATURES}",
+    "--test",
+    "pebble",
+    "--run-ignored",
+    "only",
+]
+
+[tasks.test-feature-combos]
+description = "Run the tests for each crypto backend alone, as CI does"
+script = '''
+set -eu
+for features in tls-webpki-roots,tls-ring tls-webpki-roots,tls-aws-lc-rs; do
+    TEST_FEATURES=$features cargo make test
+done
+'''
 
 [tasks.pebble-install]
 description = "Download the Pebble and challtestsrv binaries to target/pebble"
@@ -59,28 +131,6 @@ done
 cat test/pebble.sha256
 '''
 
-[tasks.pebble-test-run]
-description = "Run Pebble integration tests"
-dependencies = ["pebble-install"]
-command = "cargo"
-args = [
-    "test",
-    "--locked",
-    "--no-default-features",
-    "--features",
-    "${PEBBLE_FEATURES}",
-    "--test",
-    "pebble",
-    "--",
-    "--ignored",
-    "--nocapture",
-]
-
-[tasks.test]
-clear = true
-description = "Run Pebble integration tests e2e (install Pebble, test)"
-run_task = "pebble-test-run"
-
 [tasks.check-external-types]
 description = "Run cargo check-external-types on workspace crates"
 workspace = true
@@ -90,44 +140,3 @@ toolchain = "${TOOLCHAIN:nightly-2026-03-20}"
 command = "cargo"
 install_crate = false
 args = ["check-external-types", "--all-features"]
-
-[tasks.test-ring]
-description = "Run tests with only the ring crypto provider feature enabled"
-command = "cargo"
-args = [
-    "test",
-    "--locked",
-    "--no-default-features",
-    "--features",
-    "tls-webpki-roots,tls-ring",
-]
-
-[tasks.test-aws-lc-rs]
-description = "Run tests with only the aws-lc-rs crypto provider feature enabled"
-command = "cargo"
-args = [
-    "test",
-    "--locked",
-    "--no-default-features",
-    "--features",
-    "tls-webpki-roots,tls-aws-lc-rs",
-]
-
-[tasks.test-both-providers]
-description = "Run tests with both ring and aws-lc-rs crypto provider features enabled"
-command = "cargo"
-args = [
-    "test",
-    "--locked",
-    "--no-default-features",
-    "--features",
-    "tls-webpki-roots,tls-ring,tls-aws-lc-rs",
-]
-
-[tasks.test-feature-combos]
-description = "Run the full crypto provider feature matrix the CI uses"
-dependencies = [
-    "test-ring",
-    "test-aws-lc-rs",
-    "test-both-providers",
-]

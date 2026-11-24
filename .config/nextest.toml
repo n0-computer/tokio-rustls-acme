@@ -1,0 +1,9 @@
+[profile.default]
+slow-timeout = { period = "10s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+filter = "binary(pebble)"
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[profile.ci]
+fail-fast = false

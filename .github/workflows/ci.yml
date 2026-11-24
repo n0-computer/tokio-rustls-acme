@@ -9,11 +9,20 @@ on:
 env:
   MSRV: "1.63"
   RUST_BACKTRACE: 1
-  RUSTFLAGS: -Dwarnings
+  # Denies warnings like RUSTFLAGS=-Dwarnings, without changing the build cache key.
+  CARGO_BUILD_WARNINGS: deny
+  NEXTEST_PROFILE: ci
+  NEXTEST_VERSION: "0.9.80"
+  CARGO_MAKE_VERSION: "0.37.24"
 
 # Default to read-only; jobs that need more grant it explicitly.
 permissions:
   contents: read
+
+# A new push to a pull request supersedes the runs for the previous one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
@@ -27,12 +36,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
+          components: rustfmt, clippy
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-      - name: cargo clippy
-        run: cargo clippy --locked --workspace --all-targets --all-features
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-make@${{ env.CARGO_MAKE_VERSION }}
+      - run: cargo make format-check
+      - run: cargo make clippy
 
+  # All features on each OS. The feature-combos jobs test each crypto backend alone on Linux.
   test:
     runs-on: ${{ matrix.target.os }}
     strategy:
@@ -48,9 +60,6 @@ jobs:
           - os: [self-hosted, windows, x64]
             toolchain: "x86_64-pc-windows-msvc"
             name: "Windows MSVC"
-          - os: [self-hosted, windows, x64]
-            toolchain: "x86_64-pc-windows-gnu"
-            name: "Windows GNU"
         channel:
           - "stable"
     env:
@@ -74,11 +83,28 @@ jobs:
           rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $env:RUST_TARGET
           rustup default $env:RUST_TOOLCHAIN
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-      - name: cargo test
-        run: cargo test --locked --workspace --all-features --bins --tests --examples
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        if: runner.os != 'Windows'
+        with:
+          tool: cargo-make@${{ env.CARGO_MAKE_VERSION }},nextest@${{ env.NEXTEST_VERSION }}
+      # taiki-e/install-action needs bash too. The runners are shared, so install into RUNNER_TEMP.
+      - name: Install cargo-make and nextest (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $bin = Join-Path $env:RUNNER_TEMP "bin"
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          $nextest = Join-Path $env:RUNNER_TEMP "nextest.zip"
+          Invoke-WebRequest -OutFile $nextest "https://get.nexte.st/$env:NEXTEST_VERSION/windows"
+          Expand-Archive -Path $nextest -DestinationPath $bin -Force
+          $make = Join-Path $env:RUNNER_TEMP "cargo-make.zip"
+          Invoke-WebRequest -OutFile $make "https://github.com/sagiegurari/cargo-make/releases/download/$env:CARGO_MAKE_VERSION/cargo-make-v$env:CARGO_MAKE_VERSION-x86_64-pc-windows-msvc.zip"
+          Expand-Archive -Path $make -DestinationPath $bin -Force
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+      - run: cargo make test
 
-  # Verifies the crate compiles and tests pass under each crypto provider
-  # feature combo, and that a single-backend build doesn't pull in the other.
+  # Checks that each feature set builds without the features that dev-dependencies add and
+  # without the other crypto backend, and runs the tests, doctests and Pebble tests for each
+  # backend alone.
   feature-combos:
     runs-on: [self-hosted, linux, X64]
     strategy:
@@ -91,11 +117,13 @@ jobs:
           - name: "aws-lc-rs only"
             features: "tls-webpki-roots,tls-aws-lc-rs"
             absent: "ring"
-          - name: "ring and aws-lc-rs"
-            features: "tls-webpki-roots,tls-ring,tls-aws-lc-rs"
+          - name: "all features"
+            features: "axum,tls-webpki-roots,tls-ring,tls-aws-lc-rs"
             absent: ""
+    name: feature-combos (${{ matrix.name }})
     env:
       RUSTC_WRAPPER: "sccache"
+      TEST_FEATURES: ${{ matrix.features }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -104,39 +132,25 @@ jobs:
         with:
           toolchain: stable
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-      # Checked on its own: with `--tests` in the same invocation, the rustls
-      # dev-dependency's `ring` feature would be visible to the lib too.
-      - name: cargo check (lib only)
-        run: cargo check --locked --no-default-features --features ${{ matrix.features }} --lib
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-make@${{ env.CARGO_MAKE_VERSION }},nextest@${{ env.NEXTEST_VERSION }}
+      - run: cargo make check-lib
       - name: other backend absent from dependency tree
         if: matrix.absent != ''
         env:
-          FEATURES: ${{ matrix.features }}
           ABSENT: ${{ matrix.absent }}
         run: |
-          tree=$(cargo tree --locked -e normal,build --no-default-features --features "$FEATURES" --prefix none --format '{p}')
+          tree=$(cargo tree --locked -e normal,build --no-default-features --features "$TEST_FEATURES" --prefix none --format '{p}')
           if awk '{print $1}' <<<"$tree" | grep -qx "$ABSENT"; then
-            echo "$ABSENT is in the dependency tree for features $FEATURES"
+            echo "$ABSENT is in the dependency tree for features $TEST_FEATURES"
             exit 1
           fi
-      - name: cargo test
-        run: cargo test --locked --no-default-features --features ${{ matrix.features }}
-
-  # Checks correct runtime deps and features are requested by not including dev-dependencies.
-  check-deps:
-    runs-on: [self-hosted, linux, X64]
-    env:
-      RUSTC_WRAPPER: "sccache"
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: stable
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-      - name: cargo check
-        run: cargo check --locked --workspace --all-features --lib --bins
+      - if: matrix.absent != ''
+        run: cargo make test
+      - run: cargo make test-doc
+      - if: matrix.absent != ''
+        run: cargo make test-pebble
 
   minimal-crates:
     runs-on: [self-hosted, linux, X64]
@@ -176,10 +190,11 @@ jobs:
     env:
       RUSTC_WRAPPER: "sccache"
       # The tool drives an internal rustdoc invocation that only emits JSON
-      # for the analyzer, so the workflow-wide `-Dwarnings` would just turn
-      # unrelated rustdoc lints (e.g. `private-intra-doc-links`) into hard
-      # failures here. Clear it for this job.
+      # for the analyzer, so denying warnings would just turn unrelated
+      # rustdoc lints (e.g. `private-intra-doc-links`) into hard failures
+      # here. Allow them for this job.
       RUSTDOCFLAGS: ""
+      CARGO_BUILD_WARNINGS: allow
       # Pin to the nightly that the pinned `cargo-check-external-types`
       # release was last tested against. Update both together.
       CARGO_CHECK_EXTERNAL_TYPES_VERSION: "0.5.0"
