@@ -4,7 +4,7 @@ use crate::acme::{
 use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
 use crate::{AcmeState, Incoming};
-use futures::Stream;
+use n0_future::Stream;
 #[cfg(feature = "tls-webpki-roots")]
 use rustls::DEFAULT_VERSIONS;
 use rustls::crypto::CryptoProvider;

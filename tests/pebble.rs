@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use futures::StreamExt;
+use n0_future::StreamExt;
 use rustls::{
     ClientConfig, DEFAULT_VERSIONS, RootCertStore, ServerConfig,
     client::{WebPkiServerVerifier, danger::ServerCertVerifier},
@@ -380,7 +380,7 @@ where
 #[tokio::test]
 #[ignore]
 async fn test_default_chain() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let domain = "default-chain.example.com";
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
@@ -402,7 +402,7 @@ async fn test_default_chain() {
 #[tokio::test]
 #[ignore]
 async fn test_dir_cache_stores_and_reloads() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let domain = "dir-cache.example.com";
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
@@ -442,7 +442,7 @@ async fn test_dir_cache_stores_and_reloads() {
 #[tokio::test]
 #[ignore]
 async fn test_corrupted_cache_reissues_with_cached_account() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let domain = "corrupted-cache.example.com";
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5));
@@ -487,7 +487,7 @@ async fn test_corrupted_cache_reissues_with_cached_account() {
 #[tokio::test]
 #[ignore]
 async fn test_automatic_renewal() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let domain = "renewal.example.com";
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 6));
@@ -504,7 +504,7 @@ async fn test_automatic_renewal() {
 #[tokio::test]
 #[ignore]
 async fn test_multi_domain_san() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let hosts = [
         ("multi-1.example.com", Ipv4Addr::new(127, 0, 0, 7)),

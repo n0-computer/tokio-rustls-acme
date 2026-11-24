@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicPtr;
+use tracing::info;
 
 /// No-op cache, which does nothing.
 /// ```rust
@@ -42,7 +43,7 @@ impl<EC: Debug, EA: Debug> CertCache for NoCache<EC, EA> {
         _domains: &[String],
         _directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
-        log::info!("no cert cache configured, could not load certificate");
+        info!("no cert cache configured, could not load certificate");
         Ok(None)
     }
     async fn store_cert(
@@ -51,7 +52,7 @@ impl<EC: Debug, EA: Debug> CertCache for NoCache<EC, EA> {
         _directory_url: &str,
         _cert: &[u8],
     ) -> Result<(), Self::EC> {
-        log::info!("no cert cache configured, could not store certificate");
+        info!("no cert cache configured, could not store certificate");
         Ok(())
     }
 }
@@ -64,7 +65,7 @@ impl<EC: Debug, EA: Debug> AccountCache for NoCache<EC, EA> {
         _contact: &[String],
         _directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EA> {
-        log::info!("no account cache configured, could not load account");
+        info!("no account cache configured, could not load account");
         Ok(None)
     }
     async fn store_account(
@@ -73,7 +74,7 @@ impl<EC: Debug, EA: Debug> AccountCache for NoCache<EC, EA> {
         _directory_url: &str,
         _account: &[u8],
     ) -> Result<(), Self::EA> {
-        log::info!("no account cache configured, could not store account");
+        info!("no account cache configured, could not store account");
         Ok(())
     }
 }

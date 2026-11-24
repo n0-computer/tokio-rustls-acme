@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::future::try_join_all;
-use futures::{FutureExt, Stream, ready};
+use n0_future::{FutureExt, Stream, ready, try_join_all};
 use rcgen::{CertificateParams, DistinguishedName, PKCS_ECDSA_P256_SHA256};
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
@@ -17,6 +16,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
+use tracing::{info, warn};
 use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
@@ -289,7 +289,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         };
         let cert =
             CertifiedKey::from_der(cert_chain, pk_der.into(), crypto_provider).map_err(|err| {
-                log::warn!("rejecting certificate and private key: {err}");
+                warn!(%err, "rejecting certificate and private key");
                 CertParseError::InvalidPrivateKey
             })?;
         Ok((cert, validity))
@@ -365,12 +365,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         .iter()
                         .map(|url| Self::authorize(&config, &resolver, &account, url));
                     try_join_all(auth_futures).await?;
-                    log::info!("completed all authorizations");
+                    info!("completed all authorizations");
                     order = account.order(&config.client_config, &order_url).await?;
                 }
                 OrderStatus::Processing => {
                     for i in 0u64..10 {
-                        log::info!("order processing");
+                        info!("order processing");
                         after(Duration::from_secs(1u64 << i)).await;
                         order = account.order(&config.client_config, &order_url).await?;
                         if order.status != OrderStatus::Processing {
@@ -382,14 +382,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                     }
                 }
                 OrderStatus::Ready => {
-                    log::info!("sending csr");
+                    info!("sending csr");
                     let csr = params.serialize_request(&key_pair).map_err(rcgen_err)?;
                     order = account
                         .finalize(&config.client_config, order.finalize, csr.der().to_vec())
                         .await?
                 }
                 OrderStatus::Valid { certificate } => {
-                    log::info!("download certificate");
+                    info!("download certificate");
                     let pem = [
                         &key_pair.serialize_pem(),
                         "\n",
@@ -423,7 +423,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let (domain, challenge_url) = match auth.status {
             AuthStatus::Pending => {
                 let Identifier::Dns(domain) = auth.identifier;
-                log::info!("trigger challenge for {}", domain);
+                info!(%domain, "trigger challenge");
                 let (challenge, auth_key) = account.tls_alpn_01(
                     config.crypto_provider(),
                     &auth.challenges,
@@ -443,7 +443,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             let auth = account.auth(&config.client_config, url).await?;
             match auth.status {
                 AuthStatus::Pending => {
-                    log::info!("authorization for {} still pending", domain);
+                    info!(%domain, "authorization still pending");
                     account
                         .challenge(&config.client_config, &challenge_url)
                         .await?
@@ -463,14 +463,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         loop {
             // queued early action
             if let Some(early_action) = &mut self.early_action {
-                let result = ready!(early_action.poll_unpin(cx));
+                let result = ready!(early_action.poll(cx));
                 self.early_action.take();
                 return Poll::Ready(result);
             }
 
             // sleep
             if let Some(timer) = &mut self.wait {
-                ready!(timer.poll_unpin(cx));
+                ready!(timer.poll(cx));
                 self.wait.take();
             }
 
@@ -487,7 +487,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
             // load from cert cache
             if let Some(load_cert) = &mut self.load_cert {
-                let result = ready!(load_cert.poll_unpin(cx));
+                let result = ready!(load_cert.poll(cx));
                 self.load_cert.take();
                 match result {
                     Ok(Some(pem)) => {
@@ -500,7 +500,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
             // load from account cache
             if let Some(load_account) = &mut self.load_account {
-                let result = ready!(load_account.poll_unpin(cx));
+                let result = ready!(load_account.poll(cx));
                 self.load_account.take();
                 match result {
                     Ok(Some(key_pair)) => self.account_key = Some(key_pair),
@@ -511,7 +511,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
             // execute order
             if let Some(order) = &mut self.order {
-                let result = ready!(order.poll_unpin(cx));
+                let result = ready!(order.poll(cx));
                 self.order.take();
                 match result {
                     Ok(pem) => {

@@ -2,7 +2,7 @@
 
 use std::{io, sync::mpsc, time::Duration};
 
-use futures::StreamExt;
+use n0_future::StreamExt;
 use tokio::io::DuplexStream;
 use tokio_rustls_acme::{AcmeConfig, caches::TestCache};
 
@@ -19,7 +19,7 @@ fn ends_when_tcp_stream_ends() {
             .build()
             .unwrap();
         let next = rt.block_on(async {
-            let tcp = futures::stream::empty::<io::Result<DuplexStream>>();
+            let tcp = n0_future::stream::empty::<io::Result<DuplexStream>>();
             let mut incoming = AcmeConfig::new(["example.com"])
                 .cache(TestCache::<io::Error, io::Error>::new())
                 .state()
