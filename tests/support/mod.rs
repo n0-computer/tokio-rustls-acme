@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -369,13 +369,16 @@ pub enum OrderScript {
     Normal,
     /// Reports `pending` forever, even when all authorizations are valid.
     AlwaysPending,
+    /// Reports `ready`, but answers each finalization with `pending`.
+    RevertsOnFinalize,
 }
 
 /// The mutable part of [`MockAcme`], open to the tests.
 pub struct MockAcmeState {
     pub authz_status: &'static str,
     pub order_script: OrderScript,
-    pub issue_expired: bool,
+    /// Validity of the certificates that the server issues.
+    pub issue_validity: Validity,
     /// Token of the tls-alpn-01 challenge.
     pub token: String,
     /// Domain of the most recent order.
@@ -384,6 +387,8 @@ pub struct MockAcmeState {
     pub account_jwk: Option<Value>,
     /// Number of requests per `"METHOD /path"`.
     pub hits: HashMap<String, usize>,
+    /// Arrival times of the requests per `"METHOD /path"`, on the real clock.
+    pub arrivals: HashMap<String, Vec<Instant>>,
     /// JWS requests that break the RFC 8555 section 6 rules.
     pub jws_violations: Vec<String>,
     issued: Option<String>,
@@ -395,6 +400,11 @@ pub struct MockAcmeState {
 impl MockAcmeState {
     pub fn hits(&self, route: &str) -> usize {
         self.hits.get(route).copied().unwrap_or(0)
+    }
+
+    /// Returns the arrival times of the requests to `route`, oldest first.
+    pub fn arrivals(&self, route: &str) -> &[Instant] {
+        self.arrivals.get(route).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -425,11 +435,12 @@ impl MockAcme {
         let state = Arc::new(Mutex::new(MockAcmeState {
             authz_status: "valid",
             order_script: OrderScript::Normal,
-            issue_expired: false,
+            issue_validity: Validity::Fresh,
             token: "bW9jay1hY21lLXRva2Vu".to_string(),
             domain: String::new(),
             account_jwk: None,
             hits: HashMap::new(),
+            arrivals: HashMap::new(),
             jws_violations: Vec::new(),
             issued: None,
             nonce_counter: 0,
@@ -477,6 +488,11 @@ fn handle_acme(
     let mut state = state.lock().expect("poisoned");
     let route = format!("{} {}", request.method, request.path);
     *state.hits.entry(route.clone()).or_default() += 1;
+    state
+        .arrivals
+        .entry(route.clone())
+        .or_default()
+        .push(Instant::now());
 
     let mut payload = Vec::new();
     if request.method == "POST" {
@@ -545,12 +561,17 @@ fn handle_acme(
             }),
         ),
         "POST /chall/1" => Response::json(200, &json!({})),
+        "POST /finalize/1" if state.order_script == OrderScript::RevertsOnFinalize => {
+            let mut order = order_json(base, &state);
+            order["status"] = json!("pending");
+            Response::json(200, &order)
+        }
         "POST /finalize/1" => {
             let csr: Value = serde_json::from_slice(&payload).unwrap_or_default();
             let csr = URL_SAFE_NO_PAD
                 .decode(csr["csr"].as_str().unwrap_or_default())
                 .unwrap_or_default();
-            state.issued = Some(ca.issue_for_csr(&csr, &state.domain, state.issue_expired));
+            state.issued = Some(ca.issue_for_csr(&csr, &state.domain, state.issue_validity));
             Response::json(200, &order_json(base, &state))
         }
         "POST /cert/1" => {
@@ -607,6 +628,7 @@ fn order_json(base: &str, state: &MockAcmeState) -> Value {
     });
     let status = match state.order_script {
         OrderScript::AlwaysPending => "pending",
+        OrderScript::RevertsOnFinalize => "ready",
         OrderScript::Normal if state.issued.is_some() => {
             order["certificate"] = json!(format!("{base}/cert/1"));
             "valid"
@@ -616,6 +638,17 @@ fn order_json(base: &str, state: &MockAcmeState) -> Value {
     };
     order["status"] = json!(status);
     order
+}
+
+/// The validity period of a certificate that [`MockCa`] issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Validity {
+    /// Valid from one day ago for 90 days.
+    Fresh,
+    /// Valid for one more day out of 90, so past the renewal time of the client.
+    Due,
+    /// Expired one day ago.
+    Expired,
 }
 
 pub struct MockCa {
@@ -653,7 +686,7 @@ impl MockCa {
         }
     }
 
-    pub fn issue_for_csr(&self, csr_der: &[u8], domain: &str, expired: bool) -> String {
+    pub fn issue_for_csr(&self, csr_der: &[u8], domain: &str, validity: Validity) -> String {
         let (_, csr) = X509CertificationRequest::from_der(csr_der).expect("parse CSR");
         let public_key = csr
             .certification_request_info
@@ -661,17 +694,25 @@ impl MockCa {
             .subject_public_key
             .data
             .to_vec();
-        self.issue(&CsrPublicKey(public_key), domain, expired)
+        self.issue(&CsrPublicKey(public_key), domain, validity)
     }
 
-    fn issue(&self, public_key: &impl PublicKeyData, domain: &str, expired: bool) -> String {
+    /// Issues a new key and chain for `domain` as cache PEM.
+    pub fn issue_with_key(&self, domain: &str, validity: Validity) -> Vec<u8> {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let chain = self.issue(&key, domain, validity);
+        format!("{}\n{chain}", key.serialize_pem()).into_bytes()
+    }
+
+    fn issue(&self, public_key: &impl PublicKeyData, domain: &str, validity: Validity) -> String {
         let mut params = CertificateParams::new(vec![domain.to_string()]).expect("valid domain");
         params.distinguished_name = DistinguishedName::new();
         let now = OffsetDateTime::now_utc();
         let day = time::Duration::days(1);
-        (params.not_before, params.not_after) = match expired {
-            true => (now - 2 * day, now - day),
-            false => (now - day, now + 90 * day),
+        (params.not_before, params.not_after) = match validity {
+            Validity::Fresh => (now - day, now + 90 * day),
+            Validity::Due => (now - 89 * day, now + day),
+            Validity::Expired => (now - 2 * day, now - day),
         };
         let leaf = params
             .signed_by(public_key, &self.issuer)
