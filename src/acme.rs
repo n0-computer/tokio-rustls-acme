@@ -49,7 +49,7 @@ impl Account {
     /// Generates a new P-256 ECDSA account key in PKCS#8 DER form.
     pub(crate) fn generate_key_pair() -> Vec<u8> {
         let rng = SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(ALG, &rng).unwrap();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(ALG, &rng).expect("system RNG failed");
         pkcs8.as_ref().to_vec()
     }
     /// Returns an error if `key_pair` is not a PKCS#8 key that an account can use.

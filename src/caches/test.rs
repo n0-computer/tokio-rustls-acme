@@ -49,8 +49,11 @@ impl<EC: Debug, EA: Debug> Default for TestCache<EC, EA> {
         params.not_before = date_time_ymd(2000, 1, 1);
         params.not_after = date_time_ymd(3000, 1, 1);
 
-        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        let ca_cert = params.self_signed(&key_pair).unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+            .expect("CA key generation failed");
+        let ca_cert = params
+            .self_signed(&key_pair)
+            .expect("CA self-signing failed");
         let ca_pem = ca_cert.pem();
         let ca_issuer = rcgen::Issuer::new(params, key_pair);
 
@@ -83,8 +86,9 @@ impl<EC: Debug, EA: Debug> CertCache for TestCache<EC, EA> {
         domains: &[String],
         _directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
-        let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut params = CertificateParams::new(domains).unwrap();
+        let key_pair =
+            rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("key generation failed");
+        let mut params = CertificateParams::new(domains).expect("domains must be valid DNS names");
         let mut distinguished_name = DistinguishedName::new();
         distinguished_name.push(DnType::CommonName, "Test Cert");
         params.distinguished_name = distinguished_name;
