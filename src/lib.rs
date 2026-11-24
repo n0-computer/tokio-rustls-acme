@@ -52,13 +52,13 @@
 //!
 //! ```rust,no_run
 //! use tokio::io::AsyncWriteExt;
-//! use futures::StreamExt;
+//! use n0_future::StreamExt;
 //! use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 //! use tokio_stream::wrappers::TcpListenerStream;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     simple_logger::init_with_level(log::Level::Info).unwrap();
+//!     tracing_subscriber::fmt::init();
 //!
 //!     let tcp_listener = tokio::net::TcpListener::bind("[::]:443").await.unwrap();
 //!     let tcp_incoming = TcpListenerStream::new(tcp_listener);

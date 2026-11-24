@@ -24,6 +24,7 @@ use rustls::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
+use tracing::debug;
 
 /// Directory URL of the Let's Encrypt staging environment.
 pub const LETS_ENCRYPT_STAGING_DIRECTORY: &str =
@@ -131,7 +132,7 @@ impl Account {
         .await?;
         let location = get_header(&response, "Location").ok();
         let body = https_helper::text(response).await?;
-        log::debug!("response: {body:?}");
+        debug!(?body, "response");
         Ok((location, body))
     }
     /// Creates a new order for `domains`, which may contain DNS names and IP addresses.

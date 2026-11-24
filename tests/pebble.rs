@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use futures::StreamExt;
+use n0_future::StreamExt;
 use rustls::{
     ClientConfig, DEFAULT_VERSIONS, RootCertStore, ServerConfig,
     client::{WebPkiServerVerifier, danger::ServerCertVerifier},
@@ -386,7 +386,7 @@ where
 #[tokio::test]
 #[ignore]
 async fn test_default_chain() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let domain = "default-chain.example.com";
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
@@ -408,7 +408,7 @@ async fn test_default_chain() {
 #[tokio::test]
 #[ignore]
 async fn test_dir_cache_stores_and_reloads() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let domain = "dir-cache.example.com";
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
@@ -448,7 +448,7 @@ async fn test_dir_cache_stores_and_reloads() {
 #[tokio::test]
 #[ignore]
 async fn test_corrupted_cache_reissues_with_cached_account() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let domain = "corrupted-cache.example.com";
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5));
@@ -493,7 +493,7 @@ async fn test_corrupted_cache_reissues_with_cached_account() {
 #[tokio::test]
 #[ignore]
 async fn test_automatic_renewal() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let domain = "renewal.example.com";
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 6));
@@ -510,7 +510,7 @@ async fn test_automatic_renewal() {
 #[tokio::test]
 #[ignore]
 async fn test_multi_domain_san() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let hosts = [
         ("multi-1.example.com", Ipv4Addr::new(127, 0, 0, 7)),
@@ -616,7 +616,7 @@ async fn acquire_ip_cert(
 #[tokio::test]
 #[ignore]
 async fn test_validated_ipv4_certificate() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let chain = acquire_ip_cert(&[ip], None).await.expect("order failed");
@@ -629,7 +629,7 @@ async fn test_validated_ipv4_certificate() {
 #[tokio::test]
 #[ignore]
 async fn test_validated_ipv6_certificate() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
     let chain = acquire_ip_cert(&[ip], None).await.expect("order failed");
@@ -640,7 +640,7 @@ async fn test_validated_ipv6_certificate() {
 #[tokio::test]
 #[ignore]
 async fn test_validated_dual_stack_certificate() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let ips = [
         IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -657,7 +657,7 @@ async fn test_validated_dual_stack_certificate() {
 #[tokio::test]
 #[ignore]
 async fn test_validated_mixed_ip_and_domain_certificate() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let domain = "mixed.example.com";
@@ -701,7 +701,7 @@ fn lifetime_secs(cert: &CertificateDer<'_>) -> i64 {
 #[tokio::test]
 #[ignore]
 async fn test_profile_selects_lifetime() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     for (profile, validity_period) in [("shortlived", 10), ("default", 20)] {
@@ -722,7 +722,7 @@ async fn test_profile_selects_lifetime() {
 #[tokio::test]
 #[ignore]
 async fn test_unknown_profile_is_rejected() {
-    let _ = simple_logger::init_with_level(log::Level::Info);
+    let _ = tracing_subscriber::fmt::try_init();
 
     let config = pebble_config(&["127.0.0.1"]).profile("no-such-profile");
     let mut site = Site::bind(config, &[]).await;

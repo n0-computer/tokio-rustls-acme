@@ -7,6 +7,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_rustls_acme::caches::DirCache;
 use tokio_rustls_acme::{AcmeAcceptor, AcmeConfig};
 use tokio_stream::StreamExt;
+use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -33,7 +34,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    simple_logger::init_with_level(log::Level::Info).unwrap();
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     let mut state = AcmeConfig::new(args.domains)
@@ -51,8 +52,8 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             match state.next().await.unwrap() {
-                Ok(ok) => log::info!("event: {ok:?}"),
-                Err(err) => log::error!("error: {err:?}"),
+                Ok(ok) => info!(event = ?ok, "event"),
+                Err(err) => error!(?err, "error"),
             }
         }
     });
@@ -71,7 +72,7 @@ async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u
 
         tokio::spawn(async move {
             match accept_future.await.unwrap() {
-                None => log::info!("received TLS-ALPN-01 validation request"),
+                None => info!("received TLS-ALPN-01 validation request"),
                 Some(start_handshake) => {
                     let mut tls = start_handshake.into_stream(rustls_config).await.unwrap();
                     tls.write_all(HELLO).await.unwrap();
