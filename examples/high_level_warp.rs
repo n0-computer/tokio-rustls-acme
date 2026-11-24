@@ -2,14 +2,19 @@ use clap::Parser;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
+use n0_future::StreamExt;
+use std::io;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::pin::pin;
+use std::time::Duration;
 use tokio_rustls_acme::AcmeConfig;
 use tokio_rustls_acme::caches::DirCache;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use warp::Filter;
+
+/// Pause after an accept error, as in axum's `serve`.
+const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -42,7 +47,22 @@ async fn main() {
     let tcp_listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, args.port))
         .await
         .unwrap();
-    let tcp_incoming = TcpListenerStream::new(tcp_listener);
+    // Log and drop accept errors here, and pause after those that would repeat at once.
+    let tcp_incoming = TcpListenerStream::new(tcp_listener)
+        .then(|tcp| async move {
+            match tcp {
+                Ok(tcp) => Some(Ok::<_, io::Error>(tcp)),
+                Err(err) if is_connection_error(&err) => None,
+                Err(err) => {
+                    tracing::error!("TCP accept failed: {err:?}");
+                    // Accept fails again at once while no file descriptor is free.
+                    tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
+                    None
+                }
+            }
+        })
+        .filter_map(|tcp| tcp)
+        .boxed();
 
     let tls_incoming = AcmeConfig::new(args.domains)
         .contact(args.email.iter().map(|e| format!("mailto:{e}")))
@@ -75,4 +95,14 @@ async fn main() {
     }
 
     unreachable!()
+}
+
+/// Returns whether `err` concerns only one connection, so accepting can go on at once.
+fn is_connection_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
 }

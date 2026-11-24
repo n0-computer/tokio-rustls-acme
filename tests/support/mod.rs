@@ -19,9 +19,11 @@ use rcgen::{
     PKCS_ECDSA_P256_SHA256, PublicKeyData, SignatureAlgorithm,
 };
 use rustls::{
-    ClientConfig, DEFAULT_VERSIONS, RootCertStore, ServerConfig,
+    ClientConfig, DEFAULT_VERSIONS, DigitallySignedStruct, RootCertStore, ServerConfig,
+    SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::CryptoProvider,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -31,7 +33,18 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::TlsAcceptor;
-use x509_parser::{certification_request::X509CertificationRequest, prelude::FromDer};
+use x509_parser::{
+    certificate::X509Certificate, certification_request::X509CertificationRequest, prelude::FromDer,
+};
+
+/// ALPN protocol of the tls-alpn-01 challenge, RFC 8737 section 6.2.
+pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+
+/// How often `wait_for_hits` checks the request count.
+const HIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// OID of the `acmeIdentifier` extension, RFC 8737 section 6.1.
+pub const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
 
 /// Returns the provider all tests use for TLS, whatever the crate features select.
 pub fn provider() -> Arc<CryptoProvider> {
@@ -51,6 +64,77 @@ pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
 /// Builds a client config for tests that never reach an ACME server.
 pub fn client_config_without_roots() -> Arc<ClientConfig> {
     client_config(RootCertStore::empty())
+}
+
+/// Accepts any certificate, but still checks the handshake signature.
+///
+/// It reads the public key with x509-parser because webpki rejects the
+/// critical `acmeIdentifier` extension.
+#[derive(Debug)]
+pub struct AcceptAnyCert(pub Arc<CryptoProvider>);
+
+impl AcceptAnyCert {
+    fn verify_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let (_, cert) = X509Certificate::from_der(cert)
+            .map_err(|err| rustls::Error::General(format!("unparsable certificate: {err}")))?;
+        let public_key = &cert.public_key().subject_public_key.data;
+        let valid = self
+            .0
+            .signature_verification_algorithms
+            .mapping
+            .iter()
+            .filter(|(scheme, _)| *scheme == dss.scheme)
+            .flat_map(|(_, algorithms)| algorithms.iter())
+            .any(|algorithm| {
+                algorithm
+                    .verify_signature(public_key, message, dss.signature())
+                    .is_ok()
+            });
+        match valid {
+            true => Ok(HandshakeSignatureValid::assertion()),
+            false => Err(rustls::Error::General("bad handshake signature".into())),
+        }
+    }
+}
+
+impl ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.verify_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.verify_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 /// A TLS identity for `127.0.0.1` and a client config that trusts it.
@@ -373,7 +457,7 @@ impl MockAcme {
     pub async fn wait_for_hits(&self, route: &str, count: usize, limit: Duration) {
         let reached = tokio::time::timeout(limit, async {
             while self.state().hits(route) < count {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(HIT_POLL_INTERVAL).await;
             }
         })
         .await;
