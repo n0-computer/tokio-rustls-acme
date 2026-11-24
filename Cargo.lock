@@ -201,17 +201,17 @@ dependencies = [
 
 [[package]]
 name = "axum-server"
-version = "0.8.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc"
+checksum = "3766086d344b8f8d2a9cf6fb211b581de5b160e052d7bc75a92e58cc41909054"
 dependencies = [
  "bytes",
  "either",
- "fs-err",
  "http",
  "http-body",
  "hyper",
  "hyper-util",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -543,16 +543,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "fs-err"
-version = "3.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5c95b673b8f6f7235229ae11c5642d81b04c2e64c1e2fb417bc0cf73ca45f29"
-dependencies = [
- "autocfg",
- "tokio",
 ]
 
 [[package]]
