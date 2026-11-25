@@ -119,14 +119,14 @@ impl ResolvesServerCertAcme {
         }
         matches
     }
-    /// Returns whether an alternate chain is set, which DualChain serves to some clients.
+    /// Returns whether DualChain serves an alternate chain to some clients.
     pub fn serves_alternate_chain(&self) -> bool {
         let inner = self.inner.lock().expect("poisoned");
         let now = OffsetDateTime::now_utc();
         inner
             .alt_cert
             .as_ref()
-            .is_some_and(|alternate| !alternate.is_expired(now))
+            .is_some_and(|alternate| alternate.is_selectable() && !alternate.is_expired(now))
     }
     /// Returns the alternate chain for a client that offers `offered`, if it needs it.
     pub(crate) fn alternate_for(&self, offered: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
@@ -206,6 +206,12 @@ mod tests {
         let (resolver, primary) = resolver();
         assert!(!resolver.set_alternate(alternate(&primary, &[Cert::Intermediate])));
         assert!(!resolver.serves_alternate_chain());
+        let unselectable = AlternateChain {
+            alternate_schemes: RequiredSchemes::Unknown,
+            ..alternate(&primary, CROSS_SIGNED_ROOT.alternate)
+        };
+        assert!(resolver.set_alternate(unselectable));
+        assert!(!resolver.serves_alternate_chain(), "no client can get it");
         assert!(resolver.set_alternate(alternate(&primary, CROSS_SIGNED_ROOT.alternate)));
         assert!(resolver.serves_alternate_chain());
         let unserved = ResolvesServerCertAcme::new();

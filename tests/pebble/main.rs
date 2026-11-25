@@ -511,7 +511,10 @@ async fn test_preferred_chain_falls_back_to_default() {
     );
 }
 
-/// DualChain serves and stores the alternate chain, and loads it on the next run.
+/// DualChain stores the alternate chain in `DirCache`, next to the certificate.
+///
+/// Pebble's chains need the same schemes, so no client gets the alternate. Serving it, also
+/// after a restart, is tested in `state` and `tests/dual_chain.rs`.
 #[tokio::test]
 #[ignore]
 async fn test_dual_chain_cache() {
@@ -536,7 +539,6 @@ async fn test_dual_chain_cache() {
     );
     // The alternate follows the certificate.
     site.run_idle().await;
-    assert!(site.state.resolver().serves_alternate_chain());
     site.close().await;
 
     let alt_file = std::fs::read_dir(&cache_path)
@@ -567,10 +569,6 @@ async fn test_dual_chain_cache() {
         "second run should deploy the cached cert, got {events:?}"
     );
     site.run_idle().await;
-    assert!(
-        site.state.resolver().serves_alternate_chain(),
-        "the reload should install the cached alternate chain"
-    );
     let chain = fetch_chain_for(&pebble, domain).await;
     assert_eq!(chain.last(), Some(&pebble.intermediate(0).await));
 }
