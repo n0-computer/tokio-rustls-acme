@@ -10,10 +10,10 @@ pub use crate::https_helper::HttpsRequestError;
 use crate::https_helper::{self, Method, Response, https};
 pub use crate::jose::JoseError;
 use crate::jose::{key_authorization_sha256, sign, sign_eab};
+use crate::link;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rcgen::{CustomExtension, PKCS_ECDSA_P256_SHA256};
-use reqwest::header::{HeaderMap, LINK};
 use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig,
@@ -24,7 +24,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tracing::debug;
-use url::Url;
 
 /// Directory URL of the Let's Encrypt staging environment.
 pub const LETS_ENCRYPT_STAGING_DIRECTORY: &str =
@@ -34,8 +33,6 @@ pub const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
     "https://acme-v02.api.letsencrypt.org/directory";
 /// ALPN protocol name that marks a `tls-alpn-01` validation handshake (RFC 8737).
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
-/// Maximum number of alternate chains to download per certificate.
-const MAX_ALTERNATE_CHAINS: usize = 8;
 
 /// An account at an ACME server, with the key that signs its requests.
 #[derive(Debug)]
@@ -114,37 +111,34 @@ impl Account {
             directory,
         })
     }
+    /// Sends `payload` to `url` in a request signed by this account.
+    async fn post(
+        &self,
+        client_config: &Arc<ClientConfig>,
+        url: &str,
+        payload: &str,
+    ) -> Result<Response, AcmeError> {
+        let body = sign(
+            &self.key_pair,
+            Some(&self.kid),
+            self.directory.nonce(client_config).await?,
+            url,
+            payload,
+        )?;
+        let https_only = self.directory.https_only();
+        Ok(https(client_config, url, Method::Post, Some(body), https_only).await?)
+    }
     async fn request(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
         payload: &str,
     ) -> Result<ApiResponse, AcmeError> {
-        let body = sign(
-            &self.key_pair,
-            Some(&self.kid),
-            self.directory.nonce(client_config).await?,
-            url.as_ref(),
-            payload,
-        )?;
-        let https_only = self.directory.https_only();
-        let response = https(
-            client_config,
-            url.as_ref(),
-            Method::Post,
-            Some(body),
-            https_only,
-        )
-        .await?;
+        let response = self.post(client_config, url.as_ref(), payload).await?;
         let location = get_header(&response, "Location").ok();
-        let headers = response.headers().clone();
         let body = https_helper::text(response).await?;
         debug!(?body, "response");
-        Ok(ApiResponse {
-            body,
-            location,
-            headers,
-        })
+        Ok(ApiResponse { body, location })
     }
     pub(crate) async fn new_order(
         &self,
@@ -211,10 +205,11 @@ impl Account {
         url: impl AsRef<str>,
     ) -> Result<CertificateWithAlternateUrls, AcmeError> {
         let url = url.as_ref();
-        let response = self.request(client_config, url, "").await?;
-        let alternate_urls = parse_link_alternate(url, &response.headers);
+        let response = self.post(client_config, url, "").await?;
+        let alternate_urls = link::alternate_urls(url, response.headers());
+        let pem = https_helper::text(response).await?;
         Ok(CertificateWithAlternateUrls {
-            pem: response.body,
+            pem,
             alternate_urls,
         })
     }
@@ -489,96 +484,14 @@ pub enum AcmeError {
 struct ApiResponse {
     body: String,
     location: Option<String>,
-    headers: HeaderMap,
 }
 
 /// The response from downloading a certificate, including any alternate chain URLs.
 pub(crate) struct CertificateWithAlternateUrls {
     /// The PEM-encoded certificate chain.
     pub(crate) pem: String,
-    /// URLs of alternate certificate chains (from `Link: <url>;rel="alternate"` headers).
+    /// The URLs of the alternate chains, see [`link::alternate_urls`].
     pub(crate) alternate_urls: Vec<String>,
-}
-
-/// Returns the `rel="alternate"` URLs of the `Link` headers (RFC 8555 section 7.4.2).
-///
-/// Relative URLs are resolved against `base`, the URL of the response (RFC 8288 section 3.2).
-/// Only `https` URLs are kept, without duplicates and at most [`MAX_ALTERNATE_CHAINS`], since
-/// each is fetched with a signed request.
-fn parse_link_alternate(base: &str, headers: &HeaderMap) -> Vec<String> {
-    let base = Url::parse(base).ok();
-    let mut urls: Vec<String> = Vec::new();
-    let targets = headers
-        .get_all(LINK)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| split_unquoted(value, ','))
-        .filter_map(|link| {
-            let (target, mut params) = parse_link_value(link)?;
-            params
-                .any(|(name, value)| {
-                    name.eq_ignore_ascii_case("rel")
-                        && value
-                            .split_ascii_whitespace()
-                            .any(|rel| rel.eq_ignore_ascii_case("alternate"))
-                })
-                .then_some(target)
-        })
-        .filter_map(|target| match &base {
-            Some(base) => base.join(target).ok(),
-            None => Url::parse(target).ok(),
-        })
-        .filter(|url| url.scheme() == "https");
-    for url in targets {
-        let url = String::from(url);
-        if urls.len() == MAX_ALTERNATE_CHAINS {
-            break;
-        }
-        if !urls.contains(&url) {
-            urls.push(url);
-        }
-    }
-    urls
-}
-
-/// Splits `s` on `sep`, except inside `<...>` and `"..."` (RFC 8288 link values).
-///
-/// Escaped quotes inside quoted strings are not handled, which CAs don't send.
-fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let (mut start, mut in_uri, mut in_quotes) = (0, false, false);
-    for (i, c) in s.char_indices() {
-        match c {
-            '<' if !in_quotes => in_uri = true,
-            '>' if !in_quotes => in_uri = false,
-            '"' if !in_uri => in_quotes = !in_quotes,
-            c if c == sep && !in_uri && !in_quotes => {
-                parts.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&s[start..]);
-    parts
-}
-
-/// Parses one link value, `<target>; name=value; name="value"`, into its target and parameters.
-///
-/// Parameter names stay as written, and values are unquoted.
-fn parse_link_value(link: &str) -> Option<(&str, impl Iterator<Item = (&str, &str)>)> {
-    let link = link.trim().strip_prefix('<')?;
-    let (target, params) = link.split_once('>')?;
-    let params = split_unquoted(params, ';').into_iter().filter_map(|param| {
-        let (name, value) = param.split_once('=')?;
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .unwrap_or(value);
-        Some((name.trim(), value))
-    });
-    Some((target, params))
 }
 
 impl AcmeError {
@@ -630,84 +543,6 @@ mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::{HeaderValue, LINK};
-
-    fn alternates(values: &[&str]) -> Vec<String> {
-        let mut headers = HeaderMap::new();
-        for value in values {
-            headers.append(LINK, HeaderValue::from_str(value).unwrap());
-        }
-        parse_link_alternate("https://ca.example/acme/cert/1", &headers)
-    }
-
-    #[test]
-    fn link_alternate_boulder_format() {
-        assert_eq!(
-            alternates(&[
-                r#"<https://ca.example/acme/issuer>;rel="up""#,
-                r#"<https://ca.example/acme/cert/1/1>;rel="alternate""#,
-                r#"<https://ca.example/acme/cert/1/2>;rel="alternate""#,
-            ]),
-            [
-                "https://ca.example/acme/cert/1/1",
-                "https://ca.example/acme/cert/1/2"
-            ],
-        );
-    }
-
-    #[test]
-    fn link_alternate_rfc8288_variants() {
-        assert_eq!(
-            alternates(&[
-                // Several links in one header, unquoted and spaced params,
-                // case-insensitive names, multi-valued rel, a comma in a URL.
-                r#"<https://ca.example/up>; rel="up", <https://ca.example/a,1>; REL=alternate"#,
-                r#"<https://ca.example/b> ; title="x;y" ; rel = "index alternate""#,
-            ]),
-            ["https://ca.example/a,1", "https://ca.example/b"],
-        );
-    }
-
-    #[test]
-    fn link_alternate_resolves_relative_urls() {
-        assert_eq!(
-            alternates(&[r#"<1/2>;rel="alternate""#, r#"</other/3>;rel="alternate""#]),
-            [
-                "https://ca.example/acme/cert/1/2",
-                "https://ca.example/other/3"
-            ],
-        );
-    }
-
-    #[test]
-    fn link_alternate_keeps_https_urls_once_up_to_the_cap() {
-        let mut values = vec![
-            r#"<http://ca.example/plain>;rel="alternate""#.to_string(),
-            r#"<https://ca.example/a>;rel="alternate""#.to_string(),
-            r#"<https://ca.example/a>;rel="alternate""#.to_string(),
-        ];
-        values.extend((0..20).map(|i| format!(r#"<https://ca.example/n/{i}>;rel="alternate""#)));
-        let values: Vec<&str> = values.iter().map(String::as_str).collect();
-        let urls = alternates(&values);
-        assert_eq!(urls.len(), MAX_ALTERNATE_CHAINS);
-        assert_eq!(
-            urls[..2],
-            ["https://ca.example/a", "https://ca.example/n/0"]
-        );
-    }
-
-    #[test]
-    fn link_alternate_ignores_other_and_malformed() {
-        assert!(
-            alternates(&[
-                r#"<https://ca.example/up>;rel="up""#,
-                r#"https://no-brackets.example;rel="alternate""#,
-                r#"<https://ca.example/c>;rel="alternates""#,
-            ])
-            .is_empty()
-        );
-    }
-
     use rustls::crypto::KeyProvider;
     use rustls::sign::SigningKey;
 

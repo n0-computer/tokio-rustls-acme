@@ -182,6 +182,7 @@ mod fixture;
 mod https_helper;
 mod incoming;
 mod jose;
+mod link;
 mod resolver;
 mod state;
 
