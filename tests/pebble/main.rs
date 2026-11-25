@@ -126,8 +126,7 @@ async fn serve(listener: TcpListener, acceptor: AcmeAcceptor, server_config: Arc
     }
 }
 
-/// Connects to the tls-alpn-01 port of `pebble` on `addr`, and returns the verified chain served
-/// for `name`.
+/// Connects to the tls-alpn-01 port of `pebble` on `addr`, and returns the chain for `name`.
 async fn fetch_chain(
     pebble: &Pebble,
     addr: IpAddr,
