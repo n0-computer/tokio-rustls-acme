@@ -233,7 +233,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::server::{ClientHello, ResolvesServerCert};
     use rustls::sign::CertifiedKey;
-    use rustls::{ClientConfig, RootCertStore, SupportedCipherSuite};
+    use rustls::{ClientConfig, RootCertStore, SignatureScheme, SupportedCipherSuite};
     use tokio_rustls::TlsConnector;
 
     /// Buffer size of the in-memory connection between client and server.
@@ -270,14 +270,39 @@ mod tests {
         (AcmeAcceptor::new(resolver, provider), Arc::new(config))
     }
 
+    /// How a test client handles RSA signatures.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Rsa {
+        /// It verifies and offers them.
+        Supported,
+        /// It verifies them, but offers only RSA-PSS, like TLS 1.3-only Go and Java clients.
+        PssOffered,
+        /// It neither verifies nor offers them.
+        Unsupported,
+    }
+
     /// Returns a client that trusts `root` and offers only `suite`.
-    ///
-    /// Without `verifies_rsa`, the client can't verify RSA signatures and doesn't offer them.
-    fn client(root: Cert, verifies_rsa: bool, suite: SupportedCipherSuite) -> ClientConfig {
+    fn client(root: Cert, rsa: Rsa, suite: SupportedCipherSuite) -> ClientConfig {
         let mut provider = ring::default_provider();
         provider.cipher_suites = vec![suite];
-        if !verifies_rsa {
-            let algorithms = &mut provider.signature_verification_algorithms;
+        let algorithms = &mut provider.signature_verification_algorithms;
+        if rsa == Rsa::PssOffered {
+            let mapping: Vec<_> = algorithms
+                .mapping
+                .iter()
+                .filter(|(scheme, _)| {
+                    !matches!(
+                        scheme,
+                        SignatureScheme::RSA_PKCS1_SHA256
+                            | SignatureScheme::RSA_PKCS1_SHA384
+                            | SignatureScheme::RSA_PKCS1_SHA512
+                    )
+                })
+                .copied()
+                .collect();
+            algorithms.mapping = Vec::leak(mapping);
+        }
+        if rsa == Rsa::Unsupported {
             let all: Vec<_> = algorithms
                 .all
                 .iter()
@@ -332,13 +357,17 @@ mod tests {
     async fn dual_chain_serves_each_client_a_chain_it_verifies() {
         for hierarchy in HIERARCHIES {
             let (acceptor, config) = dual_chain(hierarchy);
+            let clients = [
+                (Cert::RsaRoot, Rsa::Supported, hierarchy.primary),
+                (Cert::RsaRoot, Rsa::PssOffered, hierarchy.primary),
+                (Cert::EcRoot, Rsa::Unsupported, hierarchy.alternate),
+            ];
             for suite in SUITES {
-                let rsa_client = client(Cert::RsaRoot, true, suite);
-                let chain = handshake(&acceptor, config.clone(), rsa_client).await;
-                assert_eq!(chain, fixture::certs(hierarchy.primary), "{suite:?}");
-                let ecdsa_client = client(Cert::EcRoot, false, suite);
-                let chain = handshake(&acceptor, config.clone(), ecdsa_client).await;
-                assert_eq!(chain, fixture::certs(hierarchy.alternate), "{suite:?}");
+                for (root, rsa, served) in clients {
+                    let chain =
+                        handshake(&acceptor, config.clone(), client(root, rsa, suite)).await;
+                    assert_eq!(chain, fixture::certs(served), "{rsa:?} with {suite:?}");
+                }
             }
         }
     }
@@ -353,7 +382,7 @@ mod tests {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(Wrapped(acceptor.resolver.clone())));
         // This client verifies the primary up to the intermediate, which the ECDSA root signed.
-        let ecdsa_client = client(Cert::EcRoot, false, TLS13_AES_128_GCM_SHA256);
+        let ecdsa_client = client(Cert::EcRoot, Rsa::Unsupported, TLS13_AES_128_GCM_SHA256);
         let chain = handshake(&acceptor, Arc::new(wrapped), ecdsa_client).await;
         assert_eq!(chain, fixture::certs(CROSS_SIGNED_ROOT.primary));
     }

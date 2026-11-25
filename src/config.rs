@@ -26,6 +26,7 @@ const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
 ///
 /// [`DualChain`](CertChainPreference::DualChain) picks the chain per connection from the
 /// `signature_algorithms` of the ClientHello: clients that can verify only the alternate get it.
+/// A client that verifies RSA certificates but offers no RSA scheme gets the alternate too.
 /// This happens in [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream), which
 /// [`Incoming`](crate::Incoming) and the Axum acceptor use. A preference applies to new orders.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

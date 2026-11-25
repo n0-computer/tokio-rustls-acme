@@ -35,11 +35,27 @@ pub(crate) enum RequiredSchemes {
 
 impl RequiredSchemes {
     /// Returns whether a client offering `offered` can verify the chain, or `None` if unknown.
+    ///
+    /// A TLS 1.3 client may list RSA PKCS#1 only in `signature_algorithms_cert`, which rustls
+    /// doesn't expose, so RSA-PSS with the same hash counts for it.
     pub(crate) fn supported_by(&self, offered: &[SignatureScheme]) -> Option<bool> {
         match self {
-            Self::Known(schemes) => Some(schemes.iter().all(|s| offered.contains(s))),
+            Self::Known(schemes) => Some(schemes.iter().all(|scheme| {
+                offered.contains(scheme)
+                    || pss_with_same_hash(*scheme).is_some_and(|pss| offered.contains(&pss))
+            })),
             Self::Unknown => None,
         }
+    }
+}
+
+/// Returns the RSA-PSS scheme with the hash of the RSA PKCS#1 scheme `scheme`.
+fn pss_with_same_hash(scheme: SignatureScheme) -> Option<SignatureScheme> {
+    match scheme {
+        SignatureScheme::RSA_PKCS1_SHA256 => Some(SignatureScheme::RSA_PSS_SHA256),
+        SignatureScheme::RSA_PKCS1_SHA384 => Some(SignatureScheme::RSA_PSS_SHA384),
+        SignatureScheme::RSA_PKCS1_SHA512 => Some(SignatureScheme::RSA_PSS_SHA512),
+        _ => None,
     }
 }
 
@@ -140,7 +156,7 @@ impl CertChain {
     /// Like [`CertChain::required_schemes`], but assumes standard curves for unknown signers.
     ///
     /// Only for the alternate, which goes only to clients that can't verify the primary, so a
-    /// wrong guess can't break a client.
+    /// wrong guess only affects those.
     pub(crate) fn likely_required_schemes(&self, other: &CertChain) -> RequiredSchemes {
         self.schemes(other, UnknownSigner::StandardCurve)
     }

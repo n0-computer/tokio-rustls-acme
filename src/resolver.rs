@@ -144,6 +144,7 @@ mod tests {
     const P256: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
     const P384: SignatureScheme = SignatureScheme::ECDSA_NISTP384_SHA384;
     const RSA: SignatureScheme = SignatureScheme::RSA_PKCS1_SHA256;
+    const RSA_PSS: SignatureScheme = SignatureScheme::RSA_PSS_SHA256;
 
     /// Returns a resolver that serves the primary of [`CROSS_SIGNED_ROOT`], and that primary.
     fn resolver() -> (Arc<ResolvesServerCertAcme>, Arc<CertifiedKey>) {
@@ -181,6 +182,8 @@ mod tests {
         let cases = [
             (known(&[P256, RSA]), known(&[P256]), &[P256][..], true),
             (known(&[P256, RSA]), known(&[P256]), &[P256, RSA], false),
+            // TLS 1.3 clients may list RSA PKCS#1 only for certificates, out of rustls' sight.
+            (known(&[P256, RSA]), known(&[P256]), &[P256, RSA_PSS], false),
             // The client can verify neither chain.
             (known(&[P256, RSA]), known(&[P384]), &[P256], false),
             (RequiredSchemes::Unknown, known(&[P256]), &[P256], false),
