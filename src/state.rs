@@ -671,7 +671,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             }
         }
     }
-    /// Fetches the first alternate chain with the leaf `leaf` whose root issuer CN is `target_issuer`.
+    /// Fetches the first alternate chain whose leaf is `leaf` and whose root is `target_issuer`.
     ///
     /// Returns `None` if no alternate matches. An alternate with another leaf is
     /// skipped, as serving it would lose the issued certificate.
