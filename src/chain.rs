@@ -110,10 +110,13 @@ impl CertChain {
         &self.certs[0]
     }
 
-    /// Returns when the leaf expires, if it parses.
-    pub(crate) fn leaf_expiry(&self) -> Option<OffsetDateTime> {
-        let leaf = parse(self.leaf())?;
-        Some(leaf.validity().not_after.to_datetime())
+    /// Returns when the first certificate of the chain expires, if all parse.
+    pub(crate) fn expiry(&self) -> Option<OffsetDateTime> {
+        let certs = self.parse_all()?;
+        certs
+            .iter()
+            .map(|cert| cert.validity().not_after.to_datetime())
+            .min()
     }
 
     /// Returns the certificates, leaf first.
@@ -426,6 +429,15 @@ mod tests {
                 "{certs:?} to {root}"
             );
         }
+    }
+
+    #[test]
+    fn chain_expires_with_its_first_certificate() {
+        let now = OffsetDateTime::now_utc();
+        let valid = chain(&[Cert::Leaf, Cert::Intermediate]).expiry();
+        let expired = chain(&[Cert::Leaf, Cert::IntermediateExpired]).expiry();
+        assert!(valid.is_some_and(|expiry| now < expiry));
+        assert!(expired.is_some_and(|expiry| expiry <= now));
     }
 
     #[test]

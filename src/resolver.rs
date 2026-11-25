@@ -29,7 +29,7 @@ pub struct ResolvesServerCertAcme {
 pub(crate) struct AlternateChain {
     /// The alternate chain with the primary's key.
     pub(crate) key: Arc<CertifiedKey>,
-    /// When the leaf expires.
+    /// When the first certificate of the chain expires, and with it the chain.
     expiry: OffsetDateTime,
     /// The schemes a client needs to verify the primary chain.
     pub(crate) primary_schemes: RequiredSchemes,
@@ -50,8 +50,8 @@ impl AlternateChain {
         Self {
             primary_schemes: primary_chain.required_schemes(&chain, algorithms),
             alternate_schemes: chain.likely_required_schemes(&primary_chain, algorithms),
-            // A leaf that doesn't parse can't be served.
-            expiry: chain.leaf_expiry().unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            // A chain that doesn't parse can't be served.
+            expiry: chain.expiry().unwrap_or(OffsetDateTime::UNIX_EPOCH),
             key: Arc::new(CertifiedKey::new(chain.into_certs(), primary.key.clone())),
         }
     }
@@ -66,7 +66,7 @@ impl AlternateChain {
         }
     }
 
-    /// Returns whether the leaf has expired at `now`.
+    /// Returns whether the chain has expired at `now`.
     fn is_expired(&self, now: OffsetDateTime) -> bool {
         self.expiry <= now
     }
