@@ -723,11 +723,10 @@ async fn test_profile_selects_lifetime() {
     }
 }
 
-/// Checks that an order for a profile the CA doesn't offer fails before it is sent.
+/// Checks that the CA rejects an order for a profile it doesn't offer.
 ///
-/// Pebble lists its profiles in the directory, so the client rejects the profile itself. The
-/// test does not listen, and the identifier is a documentation address, so a regression that
-/// validates hits no listener.
+/// Pebble rejects the order before it validates anything, so the test does not listen. The
+/// identifier is a documentation address, so a regression that validates hits no listener.
 #[tokio::test]
 #[ignore]
 async fn test_unknown_profile_is_rejected() {
@@ -739,14 +738,8 @@ async fn test_unknown_profile_is_rejected() {
         .deploy()
         .await
         .expect_err("order with an unknown profile should fail");
-    match err {
-        OrderError::UnknownProfile { profile, offered } => {
-            assert_eq!(profile, "no-such-profile");
-            assert!(
-                offered.iter().any(|name| name == "shortlived"),
-                "offered profiles should come from Pebble's directory, got {offered:?}"
-            );
-        }
-        err => panic!("expected an unknown profile error, got {err:?}"),
-    }
+    assert!(
+        matches!(err, OrderError::Acme(_)) && err.to_string().contains("invalidProfile"),
+        "expected Pebble's invalidProfile error, got {err:?}"
+    );
 }

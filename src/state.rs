@@ -21,8 +21,8 @@ use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
-    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, InvalidIdentifier, Order,
-    OrderStatus,
+    Account, AcmeError, Auth, AuthStatus, CreatedOrder, Directory, Identifier, InvalidIdentifier,
+    Order, OrderStatus,
 };
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
@@ -203,13 +203,15 @@ pub enum OrderError {
     /// A configured identifier is not a valid IP address or DNS name.
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(#[from] InvalidIdentifier),
-    /// The CA does not offer the configured profile.
-    #[error("the CA does not offer profile {profile:?}, it offers {offered:?}")]
-    UnknownProfile {
+    /// The CA did not confirm the configured profile in the order it created.
+    ///
+    /// See [`AcmeConfig::profile`]. The order is not finalized.
+    #[error("the CA selected profile {selected:?} instead of {requested:?}")]
+    ProfileMismatch {
         /// The configured profile.
-        profile: String,
-        /// The profiles the CA offers.
-        offered: Vec<String>,
+        requested: String,
+        /// The profile the CA named in the order, if any.
+        selected: Option<String>,
     },
     /// The order stayed `processing` or stopped advancing for too long.
     #[error("order did not reach a final status in time, last status {:?}", .0.status)]
@@ -464,19 +466,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         account: &Account,
         identifiers: &[Identifier],
     ) -> Result<Vec<u8>, OrderError> {
-        if let Some(profile) = &config.profile {
-            let meta = &account.directory.meta;
-            match meta.offers_profile(profile) {
-                Some(true) => {}
-                Some(false) => {
-                    return Err(OrderError::UnknownProfile {
-                        profile: profile.clone(),
-                        offered: meta.profile_names(),
-                    });
-                }
-                None => warn!(%profile, "the CA lists no profiles and may ignore the profile"),
-            }
-        }
         if config.profile.is_none() && identifiers.iter().any(|id| matches!(id, Identifier::Ip(_)))
         {
             warn!(
@@ -492,14 +481,26 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         params.distinguished_name = DistinguishedName::new();
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(rcgen_err)?;
 
-        let (order_url, mut order) = account
+        let CreatedOrder {
+            url: order_url,
+            mut order,
+            profile,
+        } = account
             .new_order(
                 &config.client_config,
                 identifiers,
                 config.profile.as_deref(),
             )
             .await?;
-        info!(profile = ?config.profile, "created order");
+        if let Some(requested) = &config.profile
+            && profile.as_ref() != Some(requested)
+        {
+            return Err(OrderError::ProfileMismatch {
+                requested: requested.clone(),
+                selected: profile,
+            });
+        }
+        info!(?profile, "created order");
         let mut stalled_rounds = 0;
         loop {
             let previous_progress = order.status.progress();

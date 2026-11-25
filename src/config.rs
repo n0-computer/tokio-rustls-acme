@@ -284,13 +284,17 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         Ok(identifiers)
     }
 
-    /// Requests certificates with the given ACME profile.
+    /// Requires the ACME profile `profile` for new orders.
     ///
-    /// Profiles are defined by the CA and listed in its directory under `meta.profiles` (see
-    /// [draft-ietf-acme-profiles](https://datatracker.ietf.org/doc/draft-ietf-acme-profiles/)).
-    /// If unset, no profile is sent and the CA picks its default. A CA that supports profiles
-    /// rejects an order for a profile it does not offer. A CA without profile support ignores the
-    /// field and issues its default certificate.
+    /// Profiles are defined by the CA, see
+    /// [draft-ietf-acme-profiles](https://datatracker.ietf.org/doc/draft-ietf-acme-profiles/), and
+    /// CAs list their public ones in the directory under `meta.profiles`. If unset, no profile is
+    /// sent and the CA picks its default.
+    ///
+    /// The profile is a requirement: the CA must name it in the order it creates, or the order fails
+    /// with [`OrderError::ProfileMismatch`](crate::OrderError::ProfileMismatch) before it is
+    /// finalized. A CA without profile support names none, so with such a CA every order fails,
+    /// renewals included. A CA that doesn't offer the profile rejects the order.
     ///
     /// The profile applies to new orders. A certificate loaded from the cache is served until its
     /// renewal, even if it was issued under another profile.
@@ -299,8 +303,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     /// (about 6 days of validity), so set it when any identifier is an IP address:
     ///
     /// ```rust
-    /// # use tokio_rustls_acme::AcmeConfig;
+    /// # #[cfg(feature = "tls-webpki-roots")]
+    /// # {
+    /// use tokio_rustls_acme::AcmeConfig;
+    ///
     /// let config = AcmeConfig::new(["192.0.2.1"]).profile("shortlived");
+    /// # }
     /// ```
     pub fn profile(mut self, profile: impl AsRef<str>) -> Self {
         self.profile = Some(profile.as_ref().into());

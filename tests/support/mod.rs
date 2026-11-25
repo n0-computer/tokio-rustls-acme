@@ -403,6 +403,8 @@ pub(crate) struct MockAcmeState {
     pub issue_validity: Validity,
     /// Token of the tls-alpn-01 challenge.
     pub token: String,
+    /// `profile` of the `newOrder` response, left out if `None`.
+    pub profile: Option<Value>,
     /// Domain of the most recent order.
     pub domain: String,
     /// JWK of the most recent `newAccount` request.
@@ -463,6 +465,7 @@ impl MockAcme {
             order_script: OrderScript::Normal,
             issue_validity: Validity::Fresh,
             token: "bW9jay1hY21lLXRva2Vu".to_string(),
+            profile: None,
             domain: String::new(),
             account_jwk: None,
             deactivated_key: None,
@@ -577,8 +580,11 @@ fn handle_acme(
                 .unwrap_or_default()
                 .to_string();
             state.issued = None;
-            Response::json(201, &order_json(base, &state))
-                .header("location", format!("{base}/order/1"))
+            let mut created = order_json(base, &state);
+            if let Some(profile) = &state.profile {
+                created["profile"] = profile.clone();
+            }
+            Response::json(201, &created).header("location", format!("{base}/order/1"))
         }
         "POST /order/1" => Response::json(200, &order_json(base, &state)),
         "POST /authz/1" => Response::json(

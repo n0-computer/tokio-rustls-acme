@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
@@ -150,18 +149,17 @@ impl Account {
         client_config: &Arc<ClientConfig>,
         identifiers: &[Identifier],
         profile: Option<&str>,
-    ) -> Result<(String, Order), AcmeError> {
+    ) -> Result<CreatedOrder, AcmeError> {
         let payload = serde_json::to_string(&NewOrder {
             identifiers,
             profile,
         })
         .map_err(json_err)?;
-        let response = self
+        let (location, body) = self
             .request(client_config, &self.directory.new_order, &payload)
             .await?;
-        let url = response.0.ok_or(AcmeError::MissingHeader("Location"))?;
-        let order = serde_json::from_str(&response.1).map_err(json_err)?;
-        Ok((url, order))
+        let url = location.ok_or(AcmeError::MissingHeader("Location"))?;
+        CreatedOrder::from_response(url, &body)
     }
     /// Fetches the authorization object at `url`.
     pub(crate) async fn auth(
@@ -255,36 +253,6 @@ pub(crate) struct Directory {
     pub(crate) new_account: String,
     /// URL to create a new order.
     pub(crate) new_order: String,
-    /// Metadata about the server.
-    #[serde(default)]
-    pub(crate) meta: DirectoryMeta,
-}
-
-/// Metadata of an ACME server from its directory (RFC 8555 section 7.1.1).
-#[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct DirectoryMeta {
-    /// Certificate profiles the server offers, by name, with their descriptions.
-    ///
-    /// `None` if the server lists no profiles (draft-ietf-acme-profiles).
-    #[serde(default)]
-    pub(crate) profiles: Option<BTreeMap<String, String>>,
-}
-
-impl DirectoryMeta {
-    /// Returns whether the server offers `profile`, or `None` if it lists no profiles.
-    pub(crate) fn offers_profile(&self, profile: &str) -> Option<bool> {
-        self.profiles
-            .as_ref()
-            .map(|profiles| profiles.contains_key(profile))
-    }
-
-    /// Returns the names of the profiles the server offers.
-    pub(crate) fn profile_names(&self) -> Vec<String> {
-        self.profiles
-            .iter()
-            .flat_map(|profiles| profiles.keys().cloned())
-            .collect()
-    }
 }
 
 impl Directory {
@@ -576,6 +544,37 @@ fn reverse_dns_name(ip: IpAddr) -> String {
     }
 }
 
+/// An order that `newOrder` created.
+#[derive(Debug)]
+pub(crate) struct CreatedOrder {
+    /// URL of the order, from the `Location` header.
+    pub(crate) url: String,
+    /// The order as created.
+    pub(crate) order: Order,
+    /// The profile the CA selected for the order (draft-ietf-acme-profiles), if it named one.
+    pub(crate) profile: Option<String>,
+}
+
+impl CreatedOrder {
+    /// Parses the `newOrder` response `body` of the order at `url`.
+    ///
+    /// A `profile` that is not a string counts as none, so a malformed optional field can't fail
+    /// orders that request no profile.
+    fn from_response(url: String, body: &str) -> Result<Self, AcmeError> {
+        let value: serde_json::Value = serde_json::from_str(body).map_err(json_err)?;
+        let profile = value
+            .get("profile")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let order = Order::deserialize(value).map_err(json_err)?;
+        Ok(Self {
+            url,
+            order,
+            profile,
+        })
+    }
+}
+
 /// The payload of a `newOrder` request (RFC 8555 section 7.4).
 #[derive(Debug, Serialize)]
 struct NewOrder<'a> {
@@ -754,6 +753,29 @@ mod tests {
     }
 
     #[test]
+    fn created_order_reads_a_string_profile_only() {
+        let order = r#""status":"pending","authorizations":[],"finalize":"https://ca.example/f""#;
+        let cases = [
+            (format!("{{{order}}}"), None),
+            (
+                format!(r#"{{{order},"profile":"shortlived"}}"#),
+                Some("shortlived"),
+            ),
+            (format!(r#"{{{order},"profile":null}}"#), None),
+            (
+                format!(r#"{{{order},"profile":{{"name":"shortlived"}}}}"#),
+                None,
+            ),
+        ];
+        for (body, profile) in cases {
+            let created = CreatedOrder::from_response("https://ca.example/o".into(), &body)
+                .unwrap_or_else(|err| panic!("{body}: {err}"));
+            assert_eq!(created.profile.as_deref(), profile, "{body}");
+            assert_eq!(created.order.status, OrderStatus::Pending, "{body}");
+        }
+    }
+
+    #[test]
     fn validated_checks_typed_identifiers_like_parsed_ones() {
         assert_eq!(
             Identifier::Dns("Example.ORG.".into()).validated(),
@@ -793,26 +815,6 @@ mod tests {
             payload(Some("shortlived")),
             r#"{"identifiers":[{"type":"ip","value":"192.0.2.1"}],"profile":"shortlived"}"#
         );
-    }
-
-    #[test]
-    fn directory_meta_lists_offered_profiles() {
-        let with_profiles: Directory = serde_json::from_str(
-            r#"{"newNonce":"n","newAccount":"a","newOrder":"o",
-                "meta":{"profiles":{"classic":"90 days","shortlived":"6 days"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(with_profiles.meta.offers_profile("shortlived"), Some(true));
-        assert_eq!(with_profiles.meta.offers_profile("tlsserver"), Some(false));
-        assert_eq!(
-            with_profiles.meta.profile_names(),
-            ["classic", "shortlived"]
-        );
-
-        let without_meta: Directory =
-            serde_json::from_str(r#"{"newNonce":"n","newAccount":"a","newOrder":"o"}"#).unwrap();
-        assert_eq!(without_meta.meta.offers_profile("shortlived"), None);
-        assert!(without_meta.meta.profile_names().is_empty());
     }
 
     #[test]
@@ -932,7 +934,6 @@ mod tests {
                 new_nonce: String::new(),
                 new_account: String::new(),
                 new_order: String::new(),
-                meta: DirectoryMeta::default(),
             },
             kid: String::new(),
         };
@@ -982,7 +983,6 @@ mod tests {
                 new_nonce: new_nonce.into(),
                 new_account: new_nonce.into(),
                 new_order: new_order.into(),
-                meta: Default::default(),
             };
             assert_eq!(directory.https_only(), expected, "{new_nonce} {new_order}");
         }

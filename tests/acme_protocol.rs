@@ -13,6 +13,7 @@ use rustls::{
     ClientConfig, DEFAULT_VERSIONS, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, ServerName},
 };
+use serde_json::json;
 use support::{ACME_IDENTIFIER_OID, ACME_TLS_ALPN, AcceptAnyCert, MockAcme};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
@@ -284,6 +285,82 @@ async fn invalid_identifier_fails_before_contacting_the_ca() {
             "{domains:?}: the client contacted the CA"
         );
     }
+}
+
+/// Fails an order whose profile the CA does not confirm, before finalizing it.
+#[tokio::test]
+async fn unconfirmed_profile_fails_the_order() {
+    for selected in [None, Some("classic")] {
+        let mock = MockAcme::start().await;
+        mock.state().profile = selected.map(|name| json!(name));
+        let mut state =
+            AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
+                .directory(&mock.directory_url)
+                .profile("shortlived")
+                .state();
+        match first_order_error(&mut state).await {
+            OrderError::ProfileMismatch {
+                requested,
+                selected: actual,
+            } => {
+                assert_eq!(requested, "shortlived");
+                assert_eq!(actual.as_deref(), selected);
+            }
+            err => panic!("{selected:?}: expected a profile mismatch, got {err:?}"),
+        }
+        assert_eq!(
+            mock.state().hits("POST /finalize/1"),
+            0,
+            "{selected:?}: the client finalized the order"
+        );
+    }
+}
+
+/// Deploys a certificate whose profile the CA confirms.
+#[tokio::test]
+async fn confirmed_profile_deploys() {
+    let mock = MockAcme::start().await;
+    mock.state().profile = Some(json!("shortlived"));
+    let state = AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
+        .directory(&mock.directory_url)
+        .profile("shortlived")
+        .state();
+    deploy(state)
+        .await
+        .expect("order with a confirmed profile failed");
+}
+
+/// Ignores a malformed `profile` in the order when no profile is configured.
+#[tokio::test]
+async fn malformed_profile_is_ignored_without_a_configured_profile() {
+    let mock = MockAcme::start().await;
+    mock.state().profile = Some(json!({"name": 42}));
+    let state = AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
+        .directory(&mock.directory_url)
+        .state();
+    deploy(state)
+        .await
+        .expect("order with a malformed profile failed");
+}
+
+/// Drives `state` until it deploys a new certificate, or returns the first order error.
+#[allow(
+    clippy::result_large_err,
+    reason = "the crate returns `OrderError` by value in its events too"
+)]
+async fn deploy(mut state: AcmeState) -> Result<(), OrderError> {
+    tokio::time::timeout(LIMIT, async {
+        loop {
+            match state.next().await.expect("state stream ended") {
+                Ok(EventOk::DeployedNewCert) => return Ok(()),
+                Ok(_) => {}
+                Err(EventError::Order(err)) => return Err(err),
+                Err(err) => panic!("expected an order error, got {err:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the order")
 }
 
 /// Drives `state` until its first error, which must be an order error.
