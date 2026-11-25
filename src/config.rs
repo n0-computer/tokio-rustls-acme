@@ -10,7 +10,8 @@ use n0_future::Stream;
 use rustls::DEFAULT_VERSIONS;
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, ServerConfig};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::convert::Infallible;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -24,17 +25,6 @@ enum ConfiguredIdentifier {
 }
 
 impl ConfiguredIdentifier {
-    /// Returns the text that keys the certificate cache.
-    ///
-    /// Strings stay as given, so existing cache entries keep matching. Typed identifiers use their
-    /// canonical text.
-    fn cache_key(&self) -> String {
-        match self {
-            Self::Text(text) => text.clone(),
-            Self::Typed(identifier) => identifier.to_string(),
-        }
-    }
-
     /// Returns the identifier to order, keeping the type of a typed identifier.
     fn to_identifier(&self) -> Result<Identifier, InvalidIdentifier> {
         match self {
@@ -42,6 +32,15 @@ impl ConfiguredIdentifier {
             Self::Typed(identifier) => identifier.clone().validated(),
         }
     }
+}
+
+/// The identifiers of a config, validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Identifiers {
+    /// The identifiers to order, without duplicates.
+    pub(crate) order: Vec<Identifier>,
+    /// The strings that key the certificate cache, see [`AcmeConfig::domains`].
+    pub(crate) cache_key: Vec<String>,
 }
 
 /// Configuration for an ACME resolver.
@@ -200,11 +199,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     /// Sets the identifiers to request a certificate for, replacing the current ones.
     ///
     /// Each identifier is a DNS name or an IP address, see [`Identifier`]'s [`FromStr`] impl.
-    /// Invalid identifiers fail the order before any request to the CA.
+    /// Invalid identifiers, or none, fail every order before any request to the CA, and the state
+    /// serves no cached certificate for them.
     ///
     /// The strings, as given and in order, key the certificate cache. Changing their spelling or
-    /// order, or switching to [`AcmeConfig::identifiers`], misses an existing cache entry and
-    /// orders a new certificate.
+    /// order misses an existing cache entry and orders a new certificate. Typed identifiers key
+    /// it by their canonical text, so switching to [`AcmeConfig::identifiers`] keeps the entry
+    /// only for strings in canonical text, like `example.com` and `2001:db8::1`.
     ///
     /// [`FromStr`]: std::str::FromStr
     pub fn domains(mut self, domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
@@ -215,7 +216,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     ///
     /// Takes [`Identifier`]s or [`IpAddr`](std::net::IpAddr)s. Each keeps its type, so an
     /// [`Identifier::Dns`] must be a valid DNS name, see [`Identifier::validated`]. The
-    /// certificate cache is keyed by their canonical text, see [`AcmeConfig::domains`].
+    /// certificate cache is keyed by their canonical text, like `example.com` for
+    /// `Dns("Example.COM.")`, see [`AcmeConfig::domains`].
     ///
     /// ```rust
     /// # #[cfg(feature = "tls-webpki-roots")]
@@ -255,33 +257,38 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             .collect()
     }
 
-    /// Returns the strings that key the certificate cache, see [`AcmeConfig::domains`].
-    pub(crate) fn cache_domains(&self) -> Vec<String> {
-        self.identifiers
-            .iter()
-            .map(ConfiguredIdentifier::cache_key)
-            .collect()
-    }
-
-    /// Returns the validated identifiers to order, without duplicates.
+    /// Returns the validated identifiers.
     ///
-    /// Fails on an invalid identifier, and on two identifiers that the CA would validate with the
-    /// same challenge SNI, see [`InvalidIdentifier::ChallengeNameConflict`].
-    pub(crate) fn parsed_identifiers(&self) -> Result<Vec<Identifier>, InvalidIdentifier> {
-        let mut identifiers: Vec<Identifier> = Vec::new();
-        let mut challenge_names = BTreeSet::new();
+    /// Fails on an empty list, an invalid identifier, and on two identifiers that the CA would
+    /// validate with the same challenge SNI, see [`InvalidIdentifier::ChallengeNameConflict`].
+    pub(crate) fn validated_identifiers(&self) -> Result<Identifiers, InvalidIdentifier> {
+        if self.identifiers.is_empty() {
+            return Err(InvalidIdentifier::NoIdentifiers);
+        }
+        let mut order = Vec::new();
+        let mut cache_key = Vec::new();
+        let mut challenge_names = BTreeMap::new();
         for configured in &self.identifiers {
             let identifier = configured.to_identifier()?;
-            if identifiers.contains(&identifier) {
-                continue;
+            cache_key.push(match configured {
+                // Strings stay as given, so existing cache entries keep matching.
+                ConfiguredIdentifier::Text(text) => text.clone(),
+                ConfiguredIdentifier::Typed(_) => identifier.to_string(),
+            });
+            match challenge_names.entry(identifier.tls_alpn_01_server_name()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(identifier.clone());
+                    order.push(identifier);
+                }
+                Entry::Occupied(entry) if *entry.get() == identifier => {}
+                Entry::Occupied(entry) => {
+                    return Err(InvalidIdentifier::ChallengeNameConflict(
+                        entry.key().clone(),
+                    ));
+                }
             }
-            let challenge_name = identifier.tls_alpn_01_server_name();
-            if !challenge_names.insert(challenge_name.clone()) {
-                return Err(InvalidIdentifier::ChallengeNameConflict(challenge_name));
-            }
-            identifiers.push(identifier);
         }
-        Ok(identifiers)
+        Ok(Identifiers { order, cache_key })
     }
 
     /// Requires the ACME profile `profile` for new orders.
@@ -425,11 +432,18 @@ mod tests {
         AcmeConfig::new_with_client_tls_config(domains, Arc::new(client_config))
     }
 
+    /// Returns the identifiers to order of `config`.
+    fn order(config: &AcmeConfig<Infallible>) -> Result<Vec<Identifier>, InvalidIdentifier> {
+        config
+            .validated_identifiers()
+            .map(|identifiers| identifiers.order)
+    }
+
     #[test]
-    fn parsed_identifiers_normalizes_and_deduplicates() {
+    fn validated_identifiers_normalizes_and_deduplicates() {
         let config = config(&["Example.COM.", "example.com", "::1", "0:0::1"]);
         assert_eq!(
-            config.parsed_identifiers(),
+            order(&config),
             Ok(vec![
                 Identifier::Dns("example.com".into()),
                 Identifier::Ip("::1".parse().unwrap()),
@@ -438,16 +452,20 @@ mod tests {
     }
 
     #[test]
-    fn parsed_identifiers_rejects_an_invalid_identifier() {
+    fn validated_identifiers_rejects_invalid_and_empty_lists() {
         let config = config(&["example.com", "*.example.com"]);
         assert_eq!(
-            config.parsed_identifiers(),
+            order(&config),
             Err(InvalidIdentifier::Wildcard("*.example.com".into()))
+        );
+        assert_eq!(
+            order(&config.domains([""; 0])),
+            Err(InvalidIdentifier::NoIdentifiers)
         );
     }
 
     #[test]
-    fn parsed_identifiers_rejects_identifiers_that_share_a_challenge_name() {
+    fn validated_identifiers_rejects_identifiers_that_share_a_challenge_name() {
         let ipv6_reverse = format!("1.{}8.b.d.0.1.0.0.2.ip6.arpa", "0.".repeat(23));
         let cases = [
             ("192.0.2.1", "1.2.0.192.in-addr.arpa".to_string()),
@@ -455,7 +473,7 @@ mod tests {
         ];
         for (ip, reverse) in cases {
             assert_eq!(
-                config(&[ip, &reverse]).parsed_identifiers(),
+                order(&config(&[ip, &reverse])),
                 Err(InvalidIdentifier::ChallengeNameConflict(reverse.clone())),
                 "{ip}"
             );
@@ -467,17 +485,35 @@ mod tests {
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let typed_dns = config(&[]).identifiers([Identifier::Dns(ip.to_string())]);
         assert_eq!(
-            typed_dns.parsed_identifiers(),
+            order(&typed_dns),
             Err(InvalidIdentifier::InvalidDnsName(ip.to_string()))
         );
         let typed_ip = config(&[]).identifiers([ip]);
-        assert_eq!(typed_ip.parsed_identifiers(), Ok(vec![Identifier::Ip(ip)]));
-        assert_eq!(typed_ip.cache_domains(), [ip.to_string()]);
+        assert_eq!(order(&typed_ip), Ok(vec![Identifier::Ip(ip)]));
     }
 
     #[test]
-    fn cache_domains_keep_strings_as_given() {
+    fn cache_keys_are_strings_as_given_and_canonical_typed_identifiers() {
         let domains = ["Example.COM.", "0:0::1", "example.com"];
-        assert_eq!(config(&domains).cache_domains(), domains);
+        let cache_key = |config: AcmeConfig<Infallible>| {
+            config
+                .validated_identifiers()
+                .map(|identifiers| identifiers.cache_key)
+        };
+        assert_eq!(
+            cache_key(config(&domains)),
+            Ok(domains.map(String::from).to_vec())
+        );
+        let typed = domains.map(|domain| domain.parse::<Identifier>().unwrap());
+        assert_eq!(
+            cache_key(config(&[]).identifiers(typed)),
+            Ok(vec![
+                "example.com".into(),
+                "::1".into(),
+                "example.com".into()
+            ])
+        );
+        let unvalidated = config(&[]).identifiers([Identifier::Dns("Example.COM.".into())]);
+        assert_eq!(cache_key(unvalidated), Ok(vec!["example.com".into()]));
     }
 }

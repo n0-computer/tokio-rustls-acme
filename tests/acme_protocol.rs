@@ -5,7 +5,13 @@
 
 mod support;
 
-use std::{convert::TryFrom, sync::Arc, time::Duration};
+use std::{
+    convert::{Infallible, TryFrom},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use async_trait::async_trait;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use n0_future::StreamExt;
@@ -18,7 +24,10 @@ use support::{ACME_IDENTIFIER_OID, ACME_TLS_ALPN, AcceptAnyCert, MockAcme};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 use tokio_rustls_acme::{
-    AcmeAcceptor, AcmeConfig, AcmeState, EventError, EventOk, OrderError, ResolvesServerCertAcme,
+    AcmeAcceptor, AcmeConfig, AcmeState, CertCache, EventError, EventOk, OrderError,
+    ResolvesServerCertAcme,
+    acme::Identifier,
+    caches::{NoCache, TestCache},
 };
 use x509_parser::{
     certificate::X509Certificate, extensions::GeneralName, oid_registry::Oid, prelude::FromDer,
@@ -26,6 +35,9 @@ use x509_parser::{
 
 const DOMAIN: &str = "invariants.example.com";
 const LIMIT: Duration = Duration::from_secs(30);
+
+/// Sets the identifiers of a config.
+type Configure = fn(AcmeConfig<Infallible>) -> AcmeConfig<Infallible>;
 
 /// An ACME order that waits for the CA to validate its tls-alpn-01 challenge.
 struct PendingChallenge {
@@ -260,30 +272,69 @@ async fn validated_order_follows_jws_rules_and_deploys_own_key() {
     );
 }
 
-/// Fails the order of invalid identifiers before any request to the CA.
+/// Fails invalid identifiers before any request to the CA, and without a cached certificate.
 #[tokio::test]
-async fn invalid_identifier_fails_before_contacting_the_ca() {
-    let cases: [&[&str]; 3] = [
-        &["foo bar"],
-        &["example.org.."],
+async fn invalid_identifiers_fail_before_the_cache_and_the_ca() {
+    let cases: [Configure; 6] = [
+        |config| config.domains(["foo bar"]),
+        |config| config.domains(["example.org.."]),
+        |config| config.domains(["b\u{fc}cher.example"]),
         // Both identifiers would need the same challenge SNI.
-        &["192.0.2.1", "1.2.0.192.in-addr.arpa"],
+        |config| config.domains(["192.0.2.1", "1.2.0.192.in-addr.arpa"]),
+        |config| config.identifiers([Identifier::Dns("192.0.2.1".into())]),
+        |config| config.domains([""; 0]),
     ];
-    for domains in cases {
-        let mock = MockAcme::start().await;
-        let mut state = AcmeConfig::new_with_client_tls_config(domains, mock.client_config.clone())
-            .directory(&mock.directory_url)
+    let mock = MockAcme::start().await;
+    for (case, configure) in cases.into_iter().enumerate() {
+        let config = || configure(mock_config(&mock));
+        // TestCache holds a certificate for any identifiers, like a cache of an earlier version.
+        let cold = config().state();
+        let warm = config()
+            .cache(TestCache::<Infallible, Infallible>::new())
             .state();
-        let err = first_order_error(&mut state).await;
-        assert!(
-            matches!(err, OrderError::InvalidIdentifier(_)),
-            "{domains:?}: expected an invalid identifier error, got {err:?}"
-        );
-        assert_eq!(
-            mock.state().hits("GET /dir"),
-            0,
-            "{domains:?}: the client contacted the CA"
-        );
+        for (start, mut state) in [("cold", cold), ("warm", warm)] {
+            let event = tokio::time::timeout(LIMIT, state.next()).await;
+            assert!(
+                matches!(
+                    event,
+                    Ok(Some(Err(EventError::Order(OrderError::InvalidIdentifier(
+                        _
+                    )))))
+                ),
+                "case {case}, {start} start: {event:?}"
+            );
+        }
+    }
+    assert_eq!(
+        mock.state().hits("GET /dir"),
+        0,
+        "the client contacted the CA"
+    );
+}
+
+/// Keys the cache by strings as given, and by the canonical text of typed identifiers.
+#[tokio::test]
+async fn cache_keys_follow_the_builder() {
+    let cases: [(Configure, &str); 2] = [
+        (
+            |config| config.domains(["Invariants.Example.COM."]),
+            "Invariants.Example.COM.",
+        ),
+        (
+            |config| config.identifiers([Identifier::Dns("Invariants.Example.COM.".into())]),
+            DOMAIN,
+        ),
+    ];
+    for (configure, key) in cases {
+        let mock = MockAcme::start().await;
+        let cache = KeyRecorder::default();
+        let keys = cache.keys.clone();
+        let state = configure(mock_config(&mock))
+            .cache_compose(cache, NoCache::<Infallible>::new())
+            .state();
+        deploy(state).await.expect("order failed");
+        let expected = [format!("load {key}"), format!("store {key}")];
+        assert_eq!(*keys.lock().expect("poisoned"), expected);
     }
 }
 
@@ -343,7 +394,37 @@ async fn malformed_profile_is_ignored_without_a_configured_profile() {
         .expect("order with a malformed profile failed");
 }
 
-/// Drives `state` until it deploys a new certificate, or returns the first order error.
+/// Returns a config for the CA of `mock`, without identifiers.
+fn mock_config(mock: &MockAcme) -> AcmeConfig<Infallible> {
+    AcmeConfig::new_with_client_tls_config([""; 0], mock.client_config.clone())
+        .directory(&mock.directory_url)
+}
+
+/// A cert cache that stays empty and records the keys of its loads and stores.
+#[derive(Debug, Default)]
+struct KeyRecorder {
+    /// Each load and store, like `load example.com,example.org`.
+    keys: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl CertCache for KeyRecorder {
+    type EC = Infallible;
+
+    async fn load_cert(&self, domains: &[String], _: &str) -> Result<Option<Vec<u8>>, Infallible> {
+        let mut keys = self.keys.lock().expect("poisoned");
+        keys.push(format!("load {}", domains.join(",")));
+        Ok(None)
+    }
+
+    async fn store_cert(&self, domains: &[String], _: &str, _: &[u8]) -> Result<(), Infallible> {
+        let mut keys = self.keys.lock().expect("poisoned");
+        keys.push(format!("store {}", domains.join(",")));
+        Ok(())
+    }
+}
+
+/// Drives `state` until it stores a new certificate, or returns the first order error.
 #[allow(
     clippy::result_large_err,
     reason = "the crate returns `OrderError` by value in its events too"
@@ -352,7 +433,7 @@ async fn deploy(mut state: AcmeState) -> Result<(), OrderError> {
     tokio::time::timeout(LIMIT, async {
         loop {
             match state.next().await.expect("state stream ended") {
-                Ok(EventOk::DeployedNewCert) => return Ok(()),
+                Ok(EventOk::CertCacheStore) => return Ok(()),
                 Ok(_) => {}
                 Err(EventError::Order(err)) => return Err(err),
                 Err(err) => panic!("expected an order error, got {err:?}"),

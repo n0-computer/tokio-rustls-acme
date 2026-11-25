@@ -434,10 +434,13 @@ impl FromStr for Identifier {
     }
 }
 
-/// An error from parsing an [`Identifier`].
+/// Why an identifier, or the identifiers of a config, can't be ordered.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InvalidIdentifier {
+    /// The config has no identifiers.
+    #[error("no identifiers to order")]
+    NoIdentifiers,
     /// Two identifiers of the order share the challenge name that the CA sends as SNI.
     ///
     /// An IP address and its reverse-DNS name, like `192.0.2.1` and `1.2.0.192.in-addr.arpa`,
