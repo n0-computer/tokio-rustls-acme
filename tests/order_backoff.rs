@@ -196,6 +196,29 @@ async fn renewal_keeps_previous_certificate_when_new_certificate_is_unusable() {
     }
 }
 
+/// A cached certificate without an identifier is served, but renewed at once.
+#[tokio::test]
+async fn cached_certificate_without_an_identifier_is_renewed_at_once() {
+    let mock = MockAcme::start().await;
+    let cached = MockCa::new().issue_with_key(DOMAIN, Validity::Fresh);
+    let state =
+        AcmeConfig::new_with_client_tls_config([DOMAIN, "192.0.2.1"], mock.client_config.clone())
+            .directory(&mock.directory_url)
+            .cache(RecordingCache::new(cached))
+            .state();
+    let (driver, events) = drive(state);
+
+    mock.wait_for_hits("POST /order", 1, LIMIT).await;
+    driver.abort();
+
+    let events = events.lock().expect("poisoned");
+    assert_eq!(
+        events.first().map(Result::as_deref),
+        Some(Ok("DeployedCachedCert")),
+        "the client did not serve the cached certificate: {events:#?}"
+    );
+}
+
 /// A cache that starts with one certificate and records what the client stores.
 struct RecordingCache {
     cert: Vec<u8>,

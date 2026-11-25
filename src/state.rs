@@ -428,18 +428,24 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             return Err(EventError::NewCertParse(CertParseError::Expired));
         }
         // Without one, clients that connect by it would fail after a successful deployment.
-        if !cached
-            && let Ok(identifiers) = &self.identifiers
-            && let Some(missing) = uncertified_identifier(&cert, identifiers)
-        {
-            warn!(%missing, "the CA left an ordered identifier out, keeping the deployed one");
-            let missing = missing.clone();
-            return Err(EventError::NewCertParse(CertParseError::MissingIdentifier(
-                missing,
-            )));
-        }
+        let missing = (self.identifiers.as_ref().ok())
+            .and_then(|identifiers| uncertified_identifier(&cert, identifiers))
+            .cloned();
+        let renew_at = match missing {
+            None => renewal_time(not_before, not_after),
+            Some(missing) if !cached => {
+                warn!(%missing, "the CA left an ordered identifier out, keeping the deployed one");
+                return Err(EventError::NewCertParse(CertParseError::MissingIdentifier(
+                    missing,
+                )));
+            }
+            Some(missing) => {
+                warn!(%missing, "the cached certificate lacks an identifier, renewing it now");
+                OffsetDateTime::now_utc()
+            }
+        };
         self.resolver.set_cert(Arc::new(cert));
-        self.renew_at = Some(renewal_time(not_before, not_after));
+        self.renew_at = Some(renew_at);
         self.cert_expiry = Some(not_after);
         if cached {
             return Ok(EventOk::DeployedCachedCert);
