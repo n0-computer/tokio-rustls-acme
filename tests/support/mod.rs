@@ -18,7 +18,7 @@ use std::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
-    PKCS_ECDSA_P256_SHA256, PublicKeyData, SignatureAlgorithm,
+    PKCS_ECDSA_P256_SHA256, PKCS_ED25519, PublicKeyData, SignatureAlgorithm,
 };
 use rustls::{
     ClientConfig, DEFAULT_VERSIONS, DigitallySignedStruct, RootCertStore, ServerConfig,
@@ -47,6 +47,12 @@ const HIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// OID of the `acmeIdentifier` extension, RFC 8737 section 6.1.
 pub(crate) const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
+
+/// Common name of the CA of [`MockCa`], which issues the certificates.
+pub(crate) const MOCK_CA_CN: &str = "Mock ACME CA";
+
+/// Common name of the Ed25519 root that cross-signs the CA of [`MockCa`].
+pub(crate) const CROSS_SIGNING_ROOT_CN: &str = "Mock Ed25519 Root";
 
 /// Returns the provider all tests use for TLS, whatever the crate features select.
 pub(crate) fn provider() -> Arc<CryptoProvider> {
@@ -411,12 +417,15 @@ pub(crate) struct MockAcmeState {
     pub deactivated_key: Option<[u8; 65]>,
     /// Answers the next finalization with `unauthorized`, then resets.
     pub reject_finalize: bool,
+    /// Issues the default chain through the Ed25519 root, with the chain to the CA as alternate.
+    pub alternate_chain: bool,
     /// Number of requests per `"METHOD /path"`.
     pub hits: HashMap<String, usize>,
     /// Arrival times of the requests per `"METHOD /path"`, on the real clock.
     pub arrivals: HashMap<String, Vec<Instant>>,
     /// JWS requests that break the RFC 8555 section 6 rules.
     pub jws_violations: Vec<String>,
+    /// PEM of the leaf issued for the order.
     issued: Option<String>,
     nonce_counter: u64,
     issued_nonces: HashSet<String>,
@@ -444,6 +453,8 @@ pub(crate) struct MockAcme {
     pub client_config: Arc<ClientConfig>,
     /// Root store with the CA that signs the issued certificates.
     pub issued_roots: RootCertStore,
+    /// Root store with the Ed25519 root that cross-signs the CA.
+    pub cross_signing_root: RootCertStore,
     pub state: Arc<Mutex<MockAcmeState>>,
     _server: Server,
 }
@@ -454,10 +465,12 @@ impl MockAcme {
         let (listener, addr) = Server::bind().await;
         let base = format!("https://{addr}");
         let ca = MockCa::new();
-        let mut issued_roots = RootCertStore::empty();
-        issued_roots
-            .add(ca.cert_der.clone())
-            .expect("add mock CA root");
+        let roots = |root: &CertificateDer<'static>| {
+            let mut roots = RootCertStore::empty();
+            roots.add(root.clone()).expect("add mock root");
+            roots
+        };
+        let (issued_roots, cross_signing_root) = (roots(&ca.cert_der), roots(&ca.root_der));
         let state = Arc::new(Mutex::new(MockAcmeState {
             authz_status: "valid",
             order_script: OrderScript::Normal,
@@ -467,6 +480,7 @@ impl MockAcme {
             account_jwk: None,
             deactivated_key: None,
             reject_finalize: false,
+            alternate_chain: false,
             hits: HashMap::new(),
             arrivals: HashMap::new(),
             jws_violations: Vec::new(),
@@ -484,6 +498,7 @@ impl MockAcme {
             directory_url: format!("{base}/dir"),
             client_config: tls.client_config,
             issued_roots,
+            cross_signing_root,
             state,
             _server: server,
         }
@@ -612,18 +627,27 @@ fn handle_acme(
             state.issued = Some(ca.issue_for_csr(&csr, &state.domain, state.issue_validity));
             Response::json(200, &order_json(base, &state))
         }
-        "POST /cert/1" => {
-            let chain = state.issued.clone().unwrap_or_default();
-            Response::new(200)
-                .header("content-type", "application/pem-certificate-chain")
-                .body(chain)
+        "POST /cert/1" if state.alternate_chain => {
+            let leaf = state.issued.as_deref().unwrap_or_default();
+            pem_chain(ca.cross_signed_chain(leaf))
+                .header("link", format!("<{base}/cert/1/alt>;rel=\"alternate\""))
+        }
+        "POST /cert/1" | "POST /cert/1/alt" => {
+            pem_chain(ca.chain(state.issued.as_deref().unwrap_or_default()))
         }
         _ => Response::new(404),
     }
 }
 
 /// Paths that must receive a POST-as-GET request, RFC 8555 section 6.3.
-const POST_AS_GET: [&str; 3] = ["/authz/1", "/order/1", "/cert/1"];
+const POST_AS_GET: [&str; 4] = ["/authz/1", "/order/1", "/cert/1", "/cert/1/alt"];
+
+/// Returns a certificate chain response with `chain`.
+fn pem_chain(chain: String) -> Response {
+    Response::new(200)
+        .header("content-type", "application/pem-certificate-chain")
+        .body(chain)
+}
 
 /// Records how `protected` deviates from RFC 8555 section 6.
 fn check_jws_header(state: &mut MockAcmeState, base: &str, path: &str, protected: &Value) {
@@ -689,10 +713,15 @@ pub(crate) enum Validity {
     Expired,
 }
 
+/// A CA that issues for CSRs, and that an Ed25519 root cross-signs.
 pub(crate) struct MockCa {
     issuer: Issuer<'static, KeyPair>,
     cert_pem: String,
     pub cert_der: CertificateDer<'static>,
+    /// The CA cross-signed by the Ed25519 root.
+    cross_signed_pem: String,
+    /// The Ed25519 root.
+    pub root_der: CertificateDer<'static>,
 }
 
 /// The public key of a CSR, in the form rcgen needs to sign for it.
@@ -710,20 +739,34 @@ impl PublicKeyData for CsrPublicKey {
 
 impl MockCa {
     pub(crate) fn new() -> Self {
-        let mut params = CertificateParams::default();
-        let mut name = DistinguishedName::new();
-        name.push(DnType::CommonName, "Mock ACME CA");
-        params.distinguished_name = name;
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let root_params = ca_params(CROSS_SIGNING_ROOT_CN);
+        let root_key = KeyPair::generate_for(&PKCS_ED25519).expect("generate key");
+        let root = root_params.self_signed(&root_key).expect("self-sign");
+        let root_issuer = Issuer::new(root_params, root_key);
+        let params = ca_params(MOCK_CA_CN);
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate key");
         let cert = params.self_signed(&key).expect("self-sign");
+        let cross_signed = params.signed_by(&key, &root_issuer).expect("cross-sign");
         Self {
             cert_pem: cert.pem(),
             cert_der: cert.der().clone(),
+            cross_signed_pem: cross_signed.pem(),
+            root_der: root.der().clone(),
             issuer: Issuer::new(params, key),
         }
     }
 
+    /// Returns the chain of `leaf` to the CA.
+    pub(crate) fn chain(&self, leaf: &str) -> String {
+        format!("{leaf}\n{}", self.cert_pem)
+    }
+
+    /// Returns the chain of `leaf` to the cross-signing Ed25519 root.
+    pub(crate) fn cross_signed_chain(&self, leaf: &str) -> String {
+        format!("{leaf}\n{}", self.cross_signed_pem)
+    }
+
+    /// Issues the leaf PEM for the CSR `csr_der`.
     pub(crate) fn issue_for_csr(&self, csr_der: &[u8], domain: &str, validity: Validity) -> String {
         let (_, csr) = X509CertificationRequest::from_der(csr_der).expect("parse CSR");
         let public_key = csr
@@ -738,10 +781,11 @@ impl MockCa {
     /// Issues a new key and chain for `domain` as cache PEM.
     pub(crate) fn issue_with_key(&self, domain: &str, validity: Validity) -> Vec<u8> {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate key");
-        let chain = self.issue(&key, domain, validity);
+        let chain = self.chain(&self.issue(&key, domain, validity));
         format!("{}\n{chain}", key.serialize_pem()).into_bytes()
     }
 
+    /// Issues the leaf PEM for `public_key`.
     fn issue(&self, public_key: &impl PublicKeyData, domain: &str, validity: Validity) -> String {
         let mut params = CertificateParams::new(vec![domain.to_string()]).expect("valid domain");
         params.distinguished_name = DistinguishedName::new();
@@ -755,6 +799,16 @@ impl MockCa {
         let leaf = params
             .signed_by(public_key, &self.issuer)
             .expect("sign leaf");
-        format!("{}\n{}", leaf.pem(), self.cert_pem)
+        leaf.pem()
     }
+}
+
+/// Returns the parameters of a CA certificate for `common_name`.
+fn ca_params(common_name: &str) -> CertificateParams {
+    let mut params = CertificateParams::default();
+    let mut name = DistinguishedName::new();
+    name.push(DnType::CommonName, common_name);
+    params.distinguished_name = name;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
 }
