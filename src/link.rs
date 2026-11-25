@@ -1,7 +1,7 @@
 //! `Link` headers (RFC 8288 section 3), which point to the alternate chains of a certificate.
 
+use reqwest::Url;
 use reqwest::header::{HeaderMap, LINK};
-use url::Url;
 
 /// Limit for the alternate chains fetched per certificate, since each costs a signed request.
 const MAX_ALTERNATE_CHAINS: usize = 8;
@@ -29,15 +29,20 @@ impl Link<'_> {
             .map(|(_, value)| value.as_str())
     }
 
-    /// Returns whether this link points to an alternate of the response it came with.
+    /// Returns whether this link points to an alternate of the response at `base`.
     ///
-    /// A link with an `anchor` describes another resource, see RFC 8288 section 3.2.
-    fn is_alternate(&self) -> bool {
+    /// An `anchor` other than `base` makes the link describe another resource, see RFC 8288
+    /// section 3.2.
+    fn is_alternate_of(&self, base: Option<&Url>) -> bool {
         let is_alternate = self.param("rel").is_some_and(|rel| {
             rel.split_ascii_whitespace()
                 .any(|rel| rel.eq_ignore_ascii_case("alternate"))
         });
-        is_alternate && self.param("anchor").is_none()
+        let describes_base = match self.param("anchor") {
+            None => true,
+            Some(anchor) => base.is_some_and(|base| base.join(anchor).ok().as_ref() == Some(base)),
+        };
+        is_alternate && describes_base
     }
 }
 
@@ -53,7 +58,7 @@ pub(crate) fn alternate_urls(base: &str, headers: &HeaderMap) -> Vec<String> {
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(parse_links)
-        .filter(Link::is_alternate)
+        .filter(|link| link.is_alternate_of(base.as_ref()))
         .filter_map(|link| match &base {
             Some(base) => base.join(link.target).ok(),
             None => Url::parse(link.target).ok(),
@@ -100,6 +105,11 @@ fn parse_link(s: &str) -> Option<(Link<'_>, &str)> {
     while let Some(after) = rest.trim_start_matches(WHITESPACE).strip_prefix(';') {
         let (name, after) = token(after.trim_start_matches(WHITESPACE));
         if name.is_empty() {
+            // An empty parameter, like after a trailing `;`, is no parameter.
+            if after.is_empty() || after.starts_with([',', ';']) {
+                rest = after;
+                continue;
+            }
             return None;
         }
         rest = after.trim_start_matches(WHITESPACE);
@@ -183,6 +193,11 @@ mod tests {
                 ),
                 // A parameter without a value, and a relative URL.
                 r#"<f>; crossorigin; rel="alternate""#,
+                // Empty parameters.
+                concat!(
+                    r#"<https://ca.example/g>; rel="alternate";, "#,
+                    r#"<https://ca.example/h>;;rel=alternate"#,
+                ),
             ]),
             [
                 "https://ca.example/a",
@@ -191,6 +206,8 @@ mod tests {
                 "https://ca.example/d",
                 "https://ca.example/e",
                 "https://ca.example/acme/cert/f",
+                "https://ca.example/g",
+                "https://ca.example/h",
             ],
         );
     }
@@ -225,6 +242,9 @@ mod tests {
             ])
             .is_empty()
         );
+        // An anchor that is the response itself is no other context.
+        let anchored = format!(r#"<https://ca.example/f>;rel="alternate";anchor="{BASE}""#);
+        assert_eq!(alternates(&[&anchored]), ["https://ca.example/f"]);
     }
 
     #[test]

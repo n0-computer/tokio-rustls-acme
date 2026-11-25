@@ -208,6 +208,7 @@ impl Account {
         let response = self.post(client_config, url, "").await?;
         let alternate_urls = link::alternate_urls(url, response.headers());
         let pem = https_helper::text(response).await?;
+        debug!(?pem, ?alternate_urls, "certificate");
         Ok(CertificateWithAlternateUrls {
             pem,
             alternate_urls,

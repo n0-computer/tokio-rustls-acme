@@ -7,9 +7,6 @@ use std::io::{ErrorKind, Write};
 use std::path::Path;
 use tokio::fs;
 
-/// Suffix of the alternate chain file next to the certificate file.
-const ALT_CERT_SUFFIX: &str = "_alt";
-
 /// Mode of directories that [`DirCache`] creates.
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
@@ -84,14 +81,23 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
         format!("cached_account_{hash}")
     }
     fn cached_cert_file_name(domains: &[String], directory_url: impl AsRef<str>) -> String {
+        format!("cached_cert_{}", Self::domains_hash(domains, directory_url))
+    }
+    fn cached_alt_cert_file_name(domains: &[String], directory_url: impl AsRef<str>) -> String {
+        format!(
+            "cached_alt_cert_{}",
+            Self::domains_hash(domains, directory_url)
+        )
+    }
+    /// Returns the hash of `domains` and `directory_url` that names their files.
+    fn domains_hash(domains: &[String], directory_url: impl AsRef<str>) -> String {
         let mut ctx = Context::new(&SHA256);
         for domain in domains {
             ctx.update(domain.as_ref());
             ctx.update(&[0])
         }
         ctx.update(directory_url.as_ref().as_bytes());
-        let hash = URL_SAFE_NO_PAD.encode(ctx.finish());
-        format!("cached_cert_{hash}")
+        URL_SAFE_NO_PAD.encode(ctx.finish())
     }
 }
 
@@ -120,7 +126,7 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         domains: &[String],
         directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
-        let file_name = Self::cached_cert_file_name(domains, directory_url) + ALT_CERT_SUFFIX;
+        let file_name = Self::cached_alt_cert_file_name(domains, directory_url);
         self.read_if_exist(file_name).await
     }
     async fn store_alt_cert(
@@ -129,7 +135,7 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         directory_url: &str,
         chain: Option<&[u8]>,
     ) -> Result<(), Self::EC> {
-        let file_name = Self::cached_cert_file_name(domains, directory_url) + ALT_CERT_SUFFIX;
+        let file_name = Self::cached_alt_cert_file_name(domains, directory_url);
         match chain {
             Some(chain) => self.write(file_name, chain).await,
             None => self.remove_if_exist(file_name).await,

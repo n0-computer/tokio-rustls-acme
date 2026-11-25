@@ -131,15 +131,15 @@ impl CertChain {
 
     /// Returns whether the chain is a valid alternate to `leaf` that ends at `root`.
     ///
-    /// Each certificate must be issued and signed by the next, a CA certificate valid now, as
-    /// `algorithms` verify. The root may be left out.
+    /// It holds the leaf and at least its issuer, and each certificate must be issued and signed
+    /// by the next, a CA certificate valid now, as `algorithms` verify. The root may be left out.
     pub(crate) fn is_alternate_for(
         &self,
         leaf: &CertificateDer<'_>,
         root: &ChainRoot,
         algorithms: &WebPkiSupportedAlgorithms,
     ) -> bool {
-        if self.leaf() != leaf || !self.ends_at(root) {
+        if self.certs.len() < 2 || self.leaf() != leaf || !self.ends_at(root) {
             return false;
         }
         let Some(certs) = self.parse_all() else {
@@ -407,8 +407,9 @@ mod tests {
                 true,
             ),
             (CROSS_SIGNED_ROOT.alternate, &rsa, false),
-            // Without the leaf.
+            // Without the leaf, and the leaf alone.
             (&[Cert::Intermediate], &ec, false),
+            (&[Cert::Leaf], &ChainRoot::new("intermediate"), false),
             // Without the intermediate.
             (&[Cert::Leaf, Cert::EcRoot], &ec, false),
             // Issuers that may not issue certificates.

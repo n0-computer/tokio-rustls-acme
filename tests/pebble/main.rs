@@ -543,7 +543,7 @@ async fn test_dual_chain_cache() {
         .find(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("cached_cert_") && name.ends_with("_alt"))
+                .is_some_and(|name| name.starts_with("cached_alt_cert_"))
         })
         .expect("should have an alternate cert cache file");
     let alt_pems = pem::parse_many(std::fs::read(&alt_file).expect("failed to read alt cache"))
