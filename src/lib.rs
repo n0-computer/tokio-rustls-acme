@@ -51,6 +51,8 @@
 //! well as accepting TLS connections, which are handed over to the caller on success.
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "tls-webpki-roots")]
+//! # {
 //! use std::io;
 //! use std::time::Duration;
 //! use tokio::io::AsyncWriteExt;
@@ -106,6 +108,7 @@
 //! Content-Type: text/plain; charset=utf-8
 //!
 //! Hello Tls!"#;
+//! # }
 //! ```
 //!
 //! `examples/high_level.rs` implements a "Hello Tls!" server similar to the one above, which accepts

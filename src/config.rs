@@ -107,9 +107,13 @@ impl CertChainPreference {
     /// Returns a preference for the chain to `root`.
     ///
     /// ```rust
-    /// # use tokio_rustls_acme::{AcmeConfig, CertChainPreference};
+    /// # #[cfg(feature = "tls-webpki-roots")]
+    /// # {
+    /// use tokio_rustls_acme::{AcmeConfig, CertChainPreference};
+    ///
     /// let config = AcmeConfig::new(["example.com"])
     ///     .cert_chain(CertChainPreference::preferred_chain("ISRG Root X2"));
+    /// # }
     /// ```
     pub fn preferred_chain(root: impl Into<ChainRoot>) -> Self {
         Self::PreferredChain(root.into())
@@ -117,9 +121,13 @@ impl CertChainPreference {
     /// Returns a preference that also serves the chain to `root` to clients that only verify it.
     ///
     /// ```rust
-    /// # use tokio_rustls_acme::{AcmeConfig, CertChainPreference};
+    /// # #[cfg(feature = "tls-webpki-roots")]
+    /// # {
+    /// use tokio_rustls_acme::{AcmeConfig, CertChainPreference};
+    ///
     /// let config = AcmeConfig::new(["example.com"])
     ///     .cert_chain(CertChainPreference::dual_chain("ISRG Root X2"));
+    /// # }
     /// ```
     pub fn dual_chain(root: impl Into<ChainRoot>) -> Self {
         Self::DualChain(root.into())
