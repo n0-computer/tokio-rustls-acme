@@ -20,15 +20,22 @@ const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
 /// Controls which certificate chain to serve, of those the CA offers (RFC 8555 section 7.4.2).
 ///
 /// A chain is named by the issuer common name of its topmost certificate, like certbot's
-/// `--preferred-chain`. An alternate is used only if it is a valid chain for the certificate.
+/// `--preferred-chain`. An alternate is used only if each of its certificates is issued and
+/// signed by the next. This checks the CA's response, it is no path validation.
 /// Let's Encrypt's default chain ends at ISRG Root X1, an RSA root, and it also offers one to
 /// ISRG Root X2, which needs no RSA, see <https://letsencrypt.org/certificates/>.
 ///
 /// [`DualChain`](CertChainPreference::DualChain) picks the chain per connection from the
 /// `signature_algorithms` of the ClientHello: clients that can verify only the alternate get it.
-/// A client that verifies RSA certificates but offers no RSA scheme gets the alternate too.
+/// A client that offers RSA-PSS counts as verifying RSA PKCS#1 with the same hash, since TLS 1.3
+/// clients may list PKCS#1 only for certificates; one that can't gets the default chain. A
+/// client that verifies RSA certificates but offers no RSA scheme gets the alternate.
 /// This happens in [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream), which
 /// [`Incoming`](crate::Incoming) and the Axum acceptor use. A preference applies to new orders.
+///
+/// After a renewal, the previous certificate's alternate is served until the new one's arrives,
+/// or it expires. It is served with the previous key, to the clients that the previous
+/// certificate's chains called for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CertChainPreference {

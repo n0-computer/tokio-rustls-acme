@@ -29,7 +29,8 @@ pub trait CertCache: Send + Sync {
     /// Loads the alternate chain of [`CertChainPreference::DualChain`], see `store_alt_cert`.
     ///
     /// The default implementation stores nothing, so a restart serves no alternate until the
-    /// next renewal. A cache that wraps another must forward both methods.
+    /// next renewal. A cache that wraps another must forward both methods. The state machine
+    /// gives up on either after 10 seconds, and only logs it.
     ///
     /// [`CertChainPreference::DualChain`]: crate::CertChainPreference::DualChain
     async fn load_alt_cert(

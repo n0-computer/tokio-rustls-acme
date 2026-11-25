@@ -135,7 +135,7 @@ pub type Event<EC, EA> = Result<EventOk, EventError<EC, EA>>;
 pub enum EventOk {
     /// A certificate from the cache is now served.
     DeployedCachedCert,
-    /// A newly issued certificate is now served.
+    /// A newly issued certificate is now served, and storing it follows.
     DeployedNewCert,
     /// The newly issued certificate was stored in the cache.
     CertCacheStore,
@@ -159,11 +159,13 @@ pub enum EventError<EC: Debug, EA: Debug> {
     #[error("account cache load: {0}")]
     AccountCacheLoad(EA),
     /// Storing the newly issued certificate in the cache failed.
+    ///
+    /// It is served, but after a restart the previously cached one is, with its alternate.
     #[error("cert cache store: {0}")]
     CertCacheStore(EC),
-    /// Storing the alternate chain of the newly issued certificate failed.
+    /// Storing the new certificate's alternate chain, or removing the cached one, failed.
     ///
-    /// The alternate is served, but after a restart only from the next renewal on.
+    /// A served alternate is served after a restart only from the next renewal on.
     #[error("alternate cert cache store: {0}")]
     AltCertCacheStore(EC),
     /// Loading the cached alternate chain failed, so it is served from the next renewal on.
