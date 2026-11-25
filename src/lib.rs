@@ -1,4 +1,5 @@
 //! An easy-to-use, async compatible [ACME] client library using [rustls].
+//!
 //! The validation mechanism used is tls-alpn-01, which allows serving acme challenge responses and
 //! regular TLS traffic on the same port.
 //!
