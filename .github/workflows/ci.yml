@@ -7,7 +7,6 @@ on:
       - main
 
 env:
-  MSRV: "1.63"
   RUST_BACKTRACE: 1
   # Denies warnings like RUSTFLAGS=-Dwarnings, without changing the build cache key.
   CARGO_BUILD_WARNINGS: deny
@@ -179,7 +178,6 @@ jobs:
       # for the analyzer, so denying warnings would just turn unrelated
       # rustdoc lints (e.g. `private-intra-doc-links`) into hard failures
       # here. Allow them for this job.
-      RUSTDOCFLAGS: ""
       CARGO_BUILD_WARNINGS: allow
       # Pin to the nightly that the pinned `cargo-check-external-types`
       # release was last tested against. Update both together.
@@ -198,9 +196,7 @@ jobs:
       - name: Install cargo-check-external-types
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: |
-            cargo-make
-            cargo-check-external-types@${{ env.CARGO_CHECK_EXTERNAL_TYPES_VERSION }}
+          tool: cargo-make@${{ env.CARGO_MAKE_VERSION }},cargo-check-external-types@${{ env.CARGO_CHECK_EXTERNAL_TYPES_VERSION }}
 
       - name: Check external types
         run: cargo make check-external-types
