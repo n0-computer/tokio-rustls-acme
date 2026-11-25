@@ -1,5 +1,6 @@
-//! Integration tests against a Pebble ACME test server that validates challenges and offers
-//! alternate chains.
+//! Integration tests against a Pebble ACME test server that validates challenges.
+//!
+//! Pebble runs with alternate roots, so it also offers alternate chains.
 //!
 //! They require Pebble and `challtestsrv` from `docker-compose.pebble.yml`:
 //! `docker compose -f docker-compose.pebble.yml up -d`
@@ -149,8 +150,9 @@ async fn fetch_pebble_cert(path: &str) -> CertificateDer<'static> {
     CertificateDer::from(pems[0].contents().to_vec())
 }
 
-/// Fetches the subject CN of Pebble's root `index`, 0 for the default chain and 1 for the
-/// alternate.
+/// Fetches the subject CN of Pebble's root `index`.
+///
+/// Index 0 is the root of the default chain, 1 the root of the alternate.
 async fn fetch_root_cn(index: usize) -> String {
     let der = fetch_pebble_cert(&format!("roots/{index}")).await;
     let (_, cert) = x509_parser::parse_x509_certificate(&der).expect("failed to parse root");
@@ -162,8 +164,9 @@ async fn fetch_root_cn(index: usize) -> String {
         .to_owned()
 }
 
-/// Fetches Pebble's intermediate for chain `index`, 0 for the default chain and 1 for the
-/// alternate.
+/// Fetches Pebble's intermediate for chain `index`.
+///
+/// Index 0 is the default chain, 1 the alternate.
 ///
 /// With alternate roots, every chain has the same intermediate key, signed by a different root,
 /// so the DER identifies the chain exactly.

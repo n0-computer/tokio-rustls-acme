@@ -13,7 +13,7 @@ use crate::jose::{key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rcgen::{CustomExtension, PKCS_ECDSA_P256_SHA256};
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, LINK};
 use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig,
@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tracing::debug;
+use url::Url;
 
 /// Directory URL of the Let's Encrypt staging environment.
 pub const LETS_ENCRYPT_STAGING_DIRECTORY: &str =
@@ -33,6 +34,8 @@ pub const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str =
     "https://acme-v02.api.letsencrypt.org/directory";
 /// ALPN protocol name that marks a `tls-alpn-01` validation handshake (RFC 8737).
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
+/// Maximum number of alternate chains to download per certificate.
+const MAX_ALTERNATE_CHAINS: usize = 8;
 
 /// An account at an ACME server, with the key that signs its requests.
 #[derive(Debug)]
@@ -461,6 +464,7 @@ pub enum AcmeError {
     NoTlsAlpn01Challenge,
 }
 
+/// The parts of an ACME API response that the client uses.
 struct ApiResponse {
     body: String,
     location: Option<String>,
@@ -470,21 +474,24 @@ struct ApiResponse {
 /// The response from downloading a certificate, including any alternate chain URLs.
 pub(crate) struct CertificateWithAlternateUrls {
     /// The PEM-encoded certificate chain.
-    pub pem: String,
+    pub(crate) pem: String,
     /// URLs of alternate certificate chains (from `Link: <url>;rel="alternate"` headers).
-    pub alternate_urls: Vec<String>,
+    pub(crate) alternate_urls: Vec<String>,
 }
 
 /// Returns the `rel="alternate"` URLs of the `Link` headers (RFC 8555 section 7.4.2).
 ///
 /// Relative URLs are resolved against `base`, the URL of the response (RFC 8288 section 3.2).
+/// Only `https` URLs are kept, without duplicates and at most [`MAX_ALTERNATE_CHAINS`], since
+/// each is fetched with a signed request.
 fn parse_link_alternate(base: &str, headers: &HeaderMap) -> Vec<String> {
-    let base = url::Url::parse(base).ok();
-    headers
-        .get_all(reqwest::header::LINK)
+    let base = Url::parse(base).ok();
+    let mut urls: Vec<String> = Vec::new();
+    let targets = headers
+        .get_all(LINK)
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .flat_map(split_unquoted(','))
+        .flat_map(|value| split_unquoted(value, ','))
         .filter_map(|link| {
             let (target, mut params) = parse_link_value(link)?;
             params
@@ -497,40 +504,51 @@ fn parse_link_alternate(base: &str, headers: &HeaderMap) -> Vec<String> {
                 .then_some(target)
         })
         .filter_map(|target| match &base {
-            Some(base) => base.join(target).ok().map(String::from),
-            None => url::Url::parse(target).ok().map(String::from),
+            Some(base) => base.join(target).ok(),
+            None => Url::parse(target).ok(),
         })
-        .collect()
+        .filter(|url| url.scheme() == "https");
+    for url in targets {
+        let url = String::from(url);
+        if urls.len() == MAX_ALTERNATE_CHAINS {
+            break;
+        }
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
 }
 
 /// Splits `s` on `sep`, except inside `<...>` and `"..."` (RFC 8288 link values).
-fn split_unquoted(sep: char) -> impl Fn(&str) -> Vec<&str> {
-    move |s| {
-        let mut parts = Vec::new();
-        let (mut start, mut in_uri, mut in_quotes) = (0, false, false);
-        for (i, c) in s.char_indices() {
-            match c {
-                '<' if !in_quotes => in_uri = true,
-                '>' if !in_quotes => in_uri = false,
-                '"' if !in_uri => in_quotes = !in_quotes,
-                c if c == sep && !in_uri && !in_quotes => {
-                    parts.push(&s[start..i]);
-                    start = i + 1;
-                }
-                _ => {}
+///
+/// Escaped quotes inside quoted strings are not handled, which CAs don't send.
+fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut in_uri, mut in_quotes) = (0, false, false);
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' if !in_quotes => in_uri = true,
+            '>' if !in_quotes => in_uri = false,
+            '"' if !in_uri => in_quotes = !in_quotes,
+            c if c == sep && !in_uri && !in_quotes => {
+                parts.push(&s[start..i]);
+                start = i + 1;
             }
+            _ => {}
         }
-        parts.push(&s[start..]);
-        parts
     }
+    parts.push(&s[start..]);
+    parts
 }
 
-/// Parses one link value, `<target>; name=value; name="value"`, into the
-/// target and its parameters (names as written, values unquoted).
+/// Parses one link value, `<target>; name=value; name="value"`, into its target and parameters.
+///
+/// Parameter names stay as written, and values are unquoted.
 fn parse_link_value(link: &str) -> Option<(&str, impl Iterator<Item = (&str, &str)>)> {
     let link = link.trim().strip_prefix('<')?;
     let (target, params) = link.split_once('>')?;
-    let params = split_unquoted(';')(params).into_iter().filter_map(|param| {
+    let params = split_unquoted(params, ';').into_iter().filter_map(|param| {
         let (name, value) = param.split_once('=')?;
         let value = value.trim();
         let value = value
@@ -616,6 +634,23 @@ mod tests {
                 "https://ca.example/acme/cert/1/2",
                 "https://ca.example/other/3"
             ],
+        );
+    }
+
+    #[test]
+    fn link_alternate_keeps_https_urls_once_up_to_the_cap() {
+        let mut values = vec![
+            r#"<http://ca.example/plain>;rel="alternate""#.to_string(),
+            r#"<https://ca.example/a>;rel="alternate""#.to_string(),
+            r#"<https://ca.example/a>;rel="alternate""#.to_string(),
+        ];
+        values.extend((0..20).map(|i| format!(r#"<https://ca.example/n/{i}>;rel="alternate""#)));
+        let values: Vec<&str> = values.iter().map(String::as_str).collect();
+        let urls = alternates(&values);
+        assert_eq!(urls.len(), MAX_ALTERNATE_CHAINS);
+        assert_eq!(
+            urls[..2],
+            ["https://ca.example/a", "https://ca.example/n/0"]
         );
     }
 

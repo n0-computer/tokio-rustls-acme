@@ -7,6 +7,9 @@ use std::io::ErrorKind;
 use std::path::Path;
 use tokio::fs;
 
+/// Suffix of the alternate chain file next to the certificate file.
+const ALT_CERT_SUFFIX: &str = "_alt";
+
 pub struct DirCache<P: AsRef<Path> + Send + Sync> {
     inner: P,
 }
@@ -85,7 +88,7 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         domains: &[String],
         directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
-        let file_name = Self::cached_cert_file_name(domains, directory_url) + "_alt";
+        let file_name = Self::cached_cert_file_name(domains, directory_url) + ALT_CERT_SUFFIX;
         self.read_if_exist(file_name).await
     }
     async fn store_alt_cert(
@@ -94,7 +97,7 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         directory_url: &str,
         cert: &[u8],
     ) -> Result<(), Self::EC> {
-        let file_name = Self::cached_cert_file_name(domains, directory_url) + "_alt";
+        let file_name = Self::cached_cert_file_name(domains, directory_url) + ALT_CERT_SUFFIX;
         self.write(file_name, cert).await
     }
 }

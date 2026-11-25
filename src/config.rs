@@ -14,6 +14,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Common name of Let's Encrypt's ECDSA root.
 const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
 
 /// Controls which certificate chain to serve to clients.
@@ -41,22 +42,25 @@ const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
 ///
 /// The preference applies to new orders. A certificate loaded from the cache keeps the chain it
 /// was issued with until its renewal.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CertChainPreference {
-    /// Use the default chain from the ACME server.
+    /// Serves the default chain from the ACME server.
     #[default]
     Default,
-    /// Use the alternate chain whose root issuer common name matches the given string. Falls
-    /// back to the default chain if none matches, or if fetching the alternates fails.
+    /// Serves the chain whose root issuer common name is the given string.
+    ///
+    /// Falls back to the default chain if no chain matches, or if fetching the alternates fails.
     PreferredChain(String),
-    /// Serve the default chain, plus the alternate whose root issuer common name matches the
-    /// given string to clients that can only verify that one. See the type docs.
+    /// Serves the default chain, and the chain to the given root to clients that only verify it.
+    ///
+    /// The root is named by its issuer common name. See the type docs for how the chain is
+    /// picked per connection.
     DualChain(String),
 }
 
 impl CertChainPreference {
-    /// Use Let's Encrypt's chain to ISRG Root X2, which is ECDSA-only.
+    /// Returns a preference for Let's Encrypt's chain to ISRG Root X2, which is ECDSA-only.
     ///
     /// For ECDSA certificates, Let's Encrypt's default chain has its intermediate signed by
     /// ISRG Root X1 (RSA), with the X2-signed one offered as an alternate. Certificates from
@@ -65,9 +69,10 @@ impl CertChainPreference {
     pub fn letsencrypt_x2() -> Self {
         Self::PreferredChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
     }
-    /// Serve Let's Encrypt's default chain (intermediate signed by ISRG Root X1, RSA) and the
-    /// ISRG Root X2 chain (ECDSA-only) to clients without RSA. Same caveats as
-    /// [`letsencrypt_x2`](Self::letsencrypt_x2).
+    /// Returns a preference that adds Let's Encrypt's ISRG Root X2 chain for clients without RSA.
+    ///
+    /// The default chain, with the intermediate signed by ISRG Root X1 (RSA), stays the
+    /// primary. Same caveats as [`letsencrypt_x2`](Self::letsencrypt_x2).
     pub fn letsencrypt_dual_chain() -> Self {
         Self::DualChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
     }
@@ -242,7 +247,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
-    /// Set the certificate chain preference. See [`CertChainPreference`] for details.
+    /// Sets the certificate chain preference, see [`CertChainPreference`].
     pub fn cert_chain(mut self, preference: CertChainPreference) -> Self {
         self.cert_chain = preference;
         self
