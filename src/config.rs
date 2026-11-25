@@ -257,6 +257,15 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             .collect()
     }
 
+    /// Returns whether the directory is one of Let's Encrypt's.
+    pub(crate) fn is_lets_encrypt(&self) -> bool {
+        [
+            LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+            LETS_ENCRYPT_STAGING_DIRECTORY,
+        ]
+        .contains(&self.directory_url.as_str())
+    }
+
     /// Returns the validated identifiers.
     ///
     /// Fails on an empty list, an invalid identifier, and on two identifiers that the CA would

@@ -498,8 +498,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         account: &Account,
         identifiers: &[Identifier],
     ) -> Result<Vec<u8>, OrderError> {
-        if config.profile.is_none() && identifiers.iter().any(|id| matches!(id, Identifier::Ip(_)))
-        {
+        let has_ip = identifiers.iter().any(|id| matches!(id, Identifier::Ip(_)));
+        if has_ip && config.profile.is_none() && config.is_lets_encrypt() {
             warn!(
                 "ordering IP identifiers without a profile, Let's Encrypt issues IP certificates only under the `shortlived` profile"
             );
