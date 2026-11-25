@@ -347,9 +347,15 @@ async fn cache_keys_follow_the_builder() {
 /// Fails an order whose profile the CA does not confirm, before finalizing it.
 #[tokio::test]
 async fn unconfirmed_profile_fails_the_order() {
-    for selected in [None, Some("classic")] {
+    let cases = [
+        (None, None),
+        (Some(json!("classic")), Some("classic")),
+        // A malformed profile names none.
+        (Some(json!({"name": 42})), None),
+    ];
+    for (profile, selected) in cases {
         let mock = MockAcme::start().await;
-        mock.state().profile = selected.map(|name| json!(name));
+        mock.state().profile = profile.clone();
         let mut state =
             AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
                 .directory(&mock.directory_url)
@@ -363,12 +369,12 @@ async fn unconfirmed_profile_fails_the_order() {
                 assert_eq!(requested, "shortlived");
                 assert_eq!(actual.as_deref(), selected);
             }
-            err => panic!("{selected:?}: expected a profile mismatch, got {err:?}"),
+            err => panic!("{profile:?}: expected a profile mismatch, got {err:?}"),
         }
         assert_eq!(
             mock.state().hits("POST /finalize/1"),
             0,
-            "{selected:?}: the client finalized the order"
+            "{profile:?}: the client finalized the order"
         );
     }
 }

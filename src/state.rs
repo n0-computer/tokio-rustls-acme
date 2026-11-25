@@ -792,7 +792,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> Stream for AcmeState<EC, EA> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::crypto::ring;
+    use rustls::{ClientConfig, DEFAULT_VERSIONS, RootCertStore};
+    use tokio::time::Instant;
 
+    const SECOND: Duration = Duration::from_secs(1);
     const MIN: Duration = Duration::from_secs(60);
     const HOUR: Duration = Duration::from_secs(60 * 60);
 
@@ -839,6 +843,37 @@ mod tests {
                 renewal_time(not_before, not_before + lifetime),
                 not_before + renew_after,
                 "lifetime {lifetime}"
+            );
+        }
+    }
+
+    /// The state backs off from its certificate's expiry, also after many failed orders.
+    #[tokio::test(start_paused = true)]
+    async fn back_off_caps_the_delay_by_the_remaining_validity() {
+        let client_config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_protocol_versions(DEFAULT_VERSIONS)
+            .expect("ring supports the default versions")
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        let config =
+            AcmeConfig::new_with_client_tls_config(["example.com"], Arc::new(client_config));
+        let mut state = config.state();
+        let now = OffsetDateTime::now_utc();
+        let cases = [
+            (None, MAX_RETRY_DELAY),
+            (Some(now + 4 * MIN), 2 * MIN),
+            (Some(now - MIN), MIN_RETRY_DELAY_CAP),
+        ];
+        for (expiry, cap) in cases {
+            state.cert_expiry = expiry;
+            state.backoff_cnt = MAX_BACKOFF_EXPONENT;
+            state.back_off();
+            let wait = state.wait.as_ref().expect("a backoff");
+            let delay = wait.deadline() - Instant::now();
+            // The expiry nears while the test runs.
+            assert!(
+                delay <= cap && cap - delay < SECOND,
+                "{expiry:?}: {delay:?}"
             );
         }
     }
