@@ -174,8 +174,11 @@ pub mod axum;
 mod cache;
 /// Ready-made [`Cache`] implementations.
 pub mod caches;
+mod chain;
 mod config;
 mod crypto;
+#[cfg(test)]
+mod fixture;
 mod https_helper;
 mod incoming;
 mod jose;

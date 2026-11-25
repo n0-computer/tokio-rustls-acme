@@ -1,5 +1,5 @@
 use crate::acme::ACME_TLS_ALPN_NAME;
-use rustls::SignatureScheme;
+use crate::chain::RequiredSchemes;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::BTreeMap;
@@ -12,25 +12,6 @@ use tracing::{debug, warn};
 #[derive(Debug)]
 pub struct ResolvesServerCertAcme {
     inner: Mutex<Inner>,
-}
-
-/// The signature schemes a client needs to verify a certificate chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RequiredSchemes {
-    /// The schemes of all signatures in the chain.
-    Known(Vec<SignatureScheme>),
-    /// A signature in the chain has an algorithm without a known scheme.
-    Unknown,
-}
-
-impl RequiredSchemes {
-    /// Returns whether a client offering `offered` can verify the chain, or `None` if unknown.
-    fn supported_by(&self, offered: &[SignatureScheme]) -> Option<bool> {
-        match self {
-            Self::Known(schemes) => Some(schemes.iter().all(|s| offered.contains(s))),
-            Self::Unknown => None,
-        }
-    }
 }
 
 /// A certificate chain with its key, and the schemes needed to verify the chain.
@@ -141,6 +122,7 @@ mod tests {
     use super::*;
     use crate::CertCache;
     use crate::caches::TestCache;
+    use rustls::SignatureScheme;
     use rustls::crypto::{CryptoProvider, ring};
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -386,20 +368,5 @@ mod tests {
 
         let peer_certs = do_handshake(resolver, make_root_store(cache.ca_pem())).await;
         assert_eq!(peer_certs, primary_chain);
-    }
-
-    #[test]
-    fn required_schemes_supported_by() {
-        let offered = [P256, SignatureScheme::ED25519];
-        assert_eq!(
-            RequiredSchemes::Known(vec![P256]).supported_by(&offered),
-            Some(true)
-        );
-        assert_eq!(
-            RequiredSchemes::Known(vec![P256, SignatureScheme::RSA_PKCS1_SHA256])
-                .supported_by(&offered),
-            Some(false)
-        );
-        assert_eq!(RequiredSchemes::Unknown.supported_by(&offered), None);
     }
 }

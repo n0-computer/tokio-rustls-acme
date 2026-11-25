@@ -11,26 +11,21 @@ use rcgen::{CertificateParams, DistinguishedName, PKCS_ECDSA_P256_SHA256};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
-use rustls::{ClientConfig, ServerConfig, SignatureScheme};
+use rustls::{ClientConfig, ServerConfig};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
 use tracing::{debug, error, info, warn};
-use x509_parser::asn1_rs::Oid;
-use x509_parser::oid_registry::{
-    OID_PKCS1_RSASSAPSS, OID_PKCS1_SHA256WITHRSA, OID_PKCS1_SHA384WITHRSA, OID_PKCS1_SHA512WITHRSA,
-    OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ECDSA_WITH_SHA512, OID_SIG_ED448,
-    OID_SIG_ED25519,
-};
 use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
     Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
 };
-use crate::config::CertChainPreference;
-use crate::resolver::{RequiredSchemes, ServedCert};
+use crate::chain::{CertChain, RequiredSchemes};
+use crate::config::{CertChainPreference, ChainRoot};
+use crate::resolver::ServedCert;
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
 /// First delay of the order backoffs, which double it on each retry.
@@ -202,66 +197,12 @@ struct ParsedCert {
     not_before: OffsetDateTime,
     /// `notAfter` of the leaf.
     not_after: OffsetDateTime,
-    /// The schemes a client needs to verify the chain.
-    schemes: RequiredSchemes,
 }
 
 /// A PEM bundle of key and certificate chain, with the alternate chain bundle in DualChain mode.
 struct CertBundle {
     primary: Vec<u8>,
     alternate: Option<Vec<u8>>,
-}
-
-/// Returns the issuer common name of the last certificate in the PEM chain `cert_pem`.
-///
-/// For a typical chain [leaf, intermediate], this is the CN of the root that
-/// signed the intermediate, which the chain itself may not include.
-fn chain_root_issuer(cert_pem: &str) -> Option<String> {
-    let pems = pem::parse_many(cert_pem).ok()?;
-    let last_der = pems.last()?.contents().to_vec();
-    let (_, cert) = parse_x509_certificate(&last_der).ok()?;
-    cert.issuer()
-        .iter_common_name()
-        .next()
-        .and_then(|cn| cn.as_str().ok())
-        .map(|s| s.to_string())
-}
-
-/// Returns the DER of the first certificate, the leaf, in the PEM chain `cert_pem`.
-fn chain_leaf(cert_pem: &str) -> Option<Vec<u8>> {
-    let pems = pem::parse_many(cert_pem).ok()?;
-    pems.into_iter().next().map(pem::Pem::into_contents)
-}
-
-/// Returns the rustls signature scheme of an X.509 signature algorithm OID.
-///
-/// This is a heuristic: a TLS scheme also fixes the signer's curve (ECDSA) or
-/// the PSS hash, which the OID alone doesn't. ECDSA is mapped by hash
-/// (`ecdsa-with-SHA384` to `ECDSA_NISTP384_SHA384`) and RSA-PSS to
-/// `RSA_PSS_SHA256`. That's right for Let's Encrypt's chains, whose ECDSA
-/// intermediates and roots are P-384.
-fn sig_oid_to_scheme(oid: &Oid) -> Option<SignatureScheme> {
-    if *oid == OID_PKCS1_SHA256WITHRSA {
-        Some(SignatureScheme::RSA_PKCS1_SHA256)
-    } else if *oid == OID_PKCS1_SHA384WITHRSA {
-        Some(SignatureScheme::RSA_PKCS1_SHA384)
-    } else if *oid == OID_PKCS1_SHA512WITHRSA {
-        Some(SignatureScheme::RSA_PKCS1_SHA512)
-    } else if *oid == OID_PKCS1_RSASSAPSS {
-        Some(SignatureScheme::RSA_PSS_SHA256)
-    } else if *oid == OID_SIG_ECDSA_WITH_SHA256 {
-        Some(SignatureScheme::ECDSA_NISTP256_SHA256)
-    } else if *oid == OID_SIG_ECDSA_WITH_SHA384 {
-        Some(SignatureScheme::ECDSA_NISTP384_SHA384)
-    } else if *oid == OID_SIG_ECDSA_WITH_SHA512 {
-        Some(SignatureScheme::ECDSA_NISTP521_SHA512)
-    } else if *oid == OID_SIG_ED25519 {
-        Some(SignatureScheme::ED25519)
-    } else if *oid == OID_SIG_ED448 {
-        Some(SignatureScheme::ED448)
-    } else {
-        None
-    }
 }
 
 fn rcgen_err(err: rcgen::Error) -> OrderError {
@@ -413,25 +354,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             validity.not_before.to_datetime(),
             validity.not_after.to_datetime(),
         );
-        // A chain certificate that fails to parse only makes the schemes unknown, which
-        // keeps the primary chain in DualChain mode.
-        let mut schemes = Vec::new();
-        let mut known = true;
-        for der in &cert_chain {
-            let scheme = parse_x509_certificate(der.as_ref())
-                .ok()
-                .and_then(|(_, cert)| sig_oid_to_scheme(&cert.signature_algorithm.algorithm));
-            match scheme {
-                Some(scheme) if !schemes.contains(&scheme) => schemes.push(scheme),
-                Some(_) => {}
-                None => known = false,
-            }
-        }
-        let schemes = if known {
-            RequiredSchemes::Known(schemes)
-        } else {
-            RequiredSchemes::Unknown
-        };
         let certified_key = CertifiedKey::from_der(cert_chain, pk_der.into(), crypto_provider)
             .map_err(|err| {
                 warn!(%err, "rejecting certificate and private key");
@@ -441,8 +363,34 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             certified_key,
             not_before,
             not_after,
-            schemes,
         })
+    }
+
+    /// Parses the alternate bundle `pem` for the primary `primary_chain`.
+    ///
+    /// Returns `None`, and logs why, unless the preference is DualChain and the alternate is a
+    /// valid chain for the primary's leaf that ends at the preferred root.
+    fn alternate_chain(
+        &self,
+        provider: &CryptoProvider,
+        pem: &[u8],
+        primary_chain: &CertChain,
+    ) -> Option<CertifiedKey> {
+        let CertChainPreference::DualChain(root) = &self.config.cert_chain else {
+            return None;
+        };
+        let alternate = match Self::parse_cert(provider, pem) {
+            Ok(alternate) => alternate.certified_key,
+            Err(err) => {
+                warn!(%err, "failed to parse alternate cert chain");
+                return None;
+            }
+        };
+        if !CertChain::new(alternate.cert.clone()).is_alternate_for(primary_chain.leaf(), root) {
+            warn!(%root, "alternate chain is no valid chain to the root for this certificate");
+            return None;
+        }
+        Some(alternate)
     }
 
     #[allow(
@@ -456,20 +404,21 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             Err(err) if cached => return Err(EventError::CachedCertParse(err)),
             Err(err) => return Err(EventError::NewCertParse(err)),
         };
-        let alternate =
-            bundle
-                .alternate
-                .as_deref()
-                .and_then(|pem| match Self::parse_cert(&provider, pem) {
-                    Ok(alt) => Some(ServedCert {
-                        key: Arc::new(alt.certified_key),
-                        schemes: alt.schemes,
-                    }),
-                    Err(err) => {
-                        warn!(%err, "failed to parse alternate cert chain");
-                        None
-                    }
-                });
+        let primary_chain = CertChain::new(parsed.certified_key.cert.clone());
+        let alternate = bundle
+            .alternate
+            .as_deref()
+            .and_then(|pem| self.alternate_chain(&provider, pem, &primary_chain));
+        let primary_schemes = match &alternate {
+            Some(alternate) => {
+                primary_chain.required_schemes(&CertChain::new(alternate.cert.clone()))
+            }
+            None => RequiredSchemes::Unknown,
+        };
+        let alternate = alternate.map(|alternate| ServedCert {
+            schemes: CertChain::new(alternate.cert.clone()).likely_required_schemes(&primary_chain),
+            key: Arc::new(alternate),
+        });
         let (not_before, not_after) = (parsed.not_before, parsed.not_after);
         // The deployed certificate may still be valid, so keep it and the cache.
         if !cached && not_after <= OffsetDateTime::now_utc() {
@@ -478,7 +427,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
         let primary = ServedCert {
             key: Arc::new(parsed.certified_key),
-            schemes: parsed.schemes,
+            schemes: primary_schemes,
         };
         let alternate_installed = self.resolver.set_certs(primary, alternate);
         if alternate_installed {
@@ -598,64 +547,46 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         .certificate_with_alternate_urls(&config.client_config, &certificate)
                         .await?;
                     let key_pem = key_pair.serialize_pem();
-                    let leaf = chain_leaf(&cert_response.pem).unwrap_or_default();
-
                     // Build key+cert PEM bundle(s) based on chain preference.
-                    let make_pem = |cert_pem: &str| -> Vec<u8> {
-                        [&key_pem, "\n", cert_pem].concat().into_bytes()
+                    let make_pem = |cert_pem: &[u8]| -> Vec<u8> {
+                        [key_pem.as_bytes(), b"\n", cert_pem].concat()
                     };
-
-                    let (primary, alternate) = match &config.cert_chain {
-                        // Use the default chain as-is.
-                        CertChainPreference::Default => (make_pem(&cert_response.pem), None),
-
-                        // Use a single chain: prefer an alternate matching `issuer`,
-                        // fall back to the default if not found.
-                        CertChainPreference::PreferredChain(root) => {
-                            let issuer = root.common_name();
-                            let default_matches =
-                                chain_root_issuer(&cert_response.pem).as_deref() == Some(issuer);
-                            let pem = if default_matches {
-                                cert_response.pem
-                            } else {
-                                Self::fetch_chain_by_issuer(
-                                    account,
-                                    &config.client_config,
-                                    &cert_response.alternate_urls,
-                                    &leaf,
-                                    issuer,
-                                )
-                                .await
-                                .unwrap_or(cert_response.pem)
-                            };
-                            (make_pem(&pem), None)
+                    let default_pem = cert_response.pem.as_bytes();
+                    let default_chain = CertChain::from_pem(default_pem);
+                    // The root of a PreferredChain or DualChain preference, unless the default
+                    // chain already ends there.
+                    let wanted_root = match &config.cert_chain {
+                        CertChainPreference::PreferredChain(root)
+                        | CertChainPreference::DualChain(root) => {
+                            Some(root).filter(|root| match &default_chain {
+                                Some(chain) => !chain.ends_at(root),
+                                None => false,
+                            })
                         }
-
-                        // Serve two chains: the default as primary, and an alternate
-                        // matching `issuer` for clients whose signature schemes differ.
-                        // If the default chain already matches, there is nothing to add.
-                        CertChainPreference::DualChain(root) => {
-                            let issuer = root.common_name();
-                            let default_matches =
-                                chain_root_issuer(&cert_response.pem).as_deref() == Some(issuer);
-                            let alternate = if default_matches {
-                                debug!(%issuer, "the default chain matches, serving no alternate");
-                                None
-                            } else {
-                                Self::fetch_chain_by_issuer(
-                                    account,
-                                    &config.client_config,
-                                    &cert_response.alternate_urls,
-                                    &leaf,
-                                    issuer,
-                                )
-                                .await
-                                .map(|pem| make_pem(&pem))
-                            };
-                            (make_pem(&cert_response.pem), alternate)
-                        }
+                        _ => None,
                     };
-
+                    let alternate = match (wanted_root, &default_chain) {
+                        (Some(root), Some(default_chain)) => {
+                            Self::fetch_alternate_chain(
+                                account,
+                                &config.client_config,
+                                &cert_response.alternate_urls,
+                                default_chain.leaf(),
+                                root,
+                            )
+                            .await
+                        }
+                        _ => None,
+                    };
+                    let (primary, alternate) = match (&config.cert_chain, alternate) {
+                        (CertChainPreference::PreferredChain(_), Some(alternate)) => {
+                            (make_pem(&alternate.to_pem()), None)
+                        }
+                        (CertChainPreference::DualChain(_), Some(alternate)) => {
+                            (make_pem(default_pem), Some(make_pem(&alternate.to_pem())))
+                        }
+                        _ => (make_pem(default_pem), None),
+                    };
                     return Ok(CertBundle { primary, alternate });
                 }
                 OrderStatus::Invalid => return Err(OrderError::BadOrder(order)),
@@ -671,46 +602,34 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             }
         }
     }
-    /// Fetches the first alternate chain whose leaf is `leaf` and whose root is `target_issuer`.
+    /// Fetches the first alternate chain for the leaf `leaf` that ends at `root`.
     ///
-    /// Returns `None` if no alternate matches. An alternate with another leaf is
-    /// skipped, as serving it would lose the issued certificate.
+    /// Returns `None` if no alternate is a valid chain for `leaf` to `root`, see
+    /// [`CertChain::is_alternate_for`]. Serving a broken alternate would lose the issued
+    /// certificate for the clients that get it.
     ///
     /// Download errors are logged and skipped, not returned. By now the order
     /// is valid and the default chain is in hand. Failing the order would
     /// throw away the issued certificate and order a new one, which counts
     /// against the CA's rate limits.
-    async fn fetch_chain_by_issuer(
+    async fn fetch_alternate_chain(
         account: &Account,
         client_config: &Arc<ClientConfig>,
         alternate_urls: &[String],
-        leaf: &[u8],
-        target_issuer: &str,
-    ) -> Option<String> {
+        leaf: &RustlsCertificate<'_>,
+        root: &ChainRoot,
+    ) -> Option<CertChain> {
         for url in alternate_urls {
             debug!(%url, "fetching alternate chain");
-            let alt_pem = match account.certificate(client_config, url).await {
-                Ok(pem) => pem,
-                Err(err) => {
-                    warn!(%url, %err, "failed to fetch alternate chain");
-                    continue;
-                }
-            };
-            if chain_leaf(&alt_pem).as_deref() != Some(leaf) {
-                warn!(%url, "alternate chain has another leaf certificate, skipping it");
-                continue;
-            }
-            if let Some(issuer) = chain_root_issuer(&alt_pem) {
-                debug!(%issuer, "alternate chain root issuer");
-                if issuer == target_issuer {
-                    return Some(alt_pem);
-                }
+            match account.certificate(client_config, url).await {
+                Ok(pem) => match CertChain::from_pem(pem.as_bytes()) {
+                    Some(chain) if chain.is_alternate_for(leaf, root) => return Some(chain),
+                    _ => debug!(%url, "alternate is no valid chain to the root for the leaf"),
+                },
+                Err(err) => warn!(%url, %err, "failed to fetch alternate chain"),
             }
         }
-        warn!(
-            issuer = %target_issuer,
-            "no alternate chain matches the issuer, using the default chain"
-        );
+        warn!(%root, "no alternate chain ends at the root, using the default chain");
         None
     }
     async fn authorize(
@@ -899,65 +818,59 @@ impl<EC: 'static + Debug, EA: 'static + Debug> Stream for AcmeState<EC, EA> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CertCache;
-    use crate::caches::TestCache;
+    use crate::fixture::{
+        self, CROSS_SIGNED_ROOT, Cert, EC_ROOT_CN, INTERMEDIATE_BY_EACH_ROOT, LEAF_NAME,
+    };
+    use rustls::RootCertStore;
     use rustls::crypto::ring;
-    use x509_parser::oid_registry::OID_X509_COMMON_NAME;
 
-    const DOMAIN: &str = "example.com";
-    /// Common name of the CA that [`TestCache`] issues from.
-    const TEST_CA_NAME: &str = "Test CA";
     const MIN: Duration = Duration::from_secs(60);
     const HOUR: Duration = Duration::from_secs(60 * 60);
-
-    /// Returns a PEM bundle from the test CA, the key followed by the leaf and the CA certificate.
-    async fn test_bundle() -> Vec<u8> {
-        TestCache::<Infallible, Infallible>::new()
-            .load_cert(&[DOMAIN.to_string()], "")
-            .await
-            .unwrap()
-            .unwrap()
-    }
-
-    /// Returns the certificates of a PEM bundle, without the key.
-    fn chain_pem(bundle: &[u8]) -> String {
-        pem::parse_many(bundle).unwrap()[1..]
-            .iter()
-            .map(pem::encode)
-            .collect()
+    /// Returns a DualChain config for the fixture's ECDSA root that needs no webpki roots.
+    fn dual_chain_config() -> AcmeConfig<Infallible> {
+        let client_config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default versions")
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        AcmeConfig::new_with_client_tls_config([LEAF_NAME], Arc::new(client_config))
+            .cert_chain(CertChainPreference::dual_chain(EC_ROOT_CN))
     }
 
     #[tokio::test]
-    async fn parse_cert_derives_the_schemes_of_the_chain() {
-        let parsed =
-            AcmeState::<Infallible>::parse_cert(&ring::default_provider(), &test_bundle().await)
-                .unwrap();
-        assert_eq!(
-            parsed.schemes,
-            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP256_SHA256])
-        );
-    }
-
-    #[tokio::test]
-    async fn chain_root_issuer_and_leaf() {
-        let bundle = test_bundle().await;
-        let chain = chain_pem(&bundle);
-        assert_eq!(chain_root_issuer(&chain).as_deref(), Some(TEST_CA_NAME));
-        let leaf = pem::parse_many(&bundle).unwrap()[1].contents().to_vec();
-        assert_eq!(chain_leaf(&chain), Some(leaf));
-    }
-
-    #[test]
-    fn sig_oid_to_scheme_maps_known_and_rejects_unknown() {
-        assert_eq!(
-            sig_oid_to_scheme(&OID_SIG_ECDSA_WITH_SHA384),
-            Some(SignatureScheme::ECDSA_NISTP384_SHA384)
-        );
-        assert_eq!(
-            sig_oid_to_scheme(&OID_PKCS1_SHA256WITHRSA),
-            Some(SignatureScheme::RSA_PKCS1_SHA256)
-        );
-        assert_eq!(sig_oid_to_scheme(&OID_X509_COMMON_NAME), None);
+    async fn dual_chain_installs_only_a_valid_alternate() {
+        let cases = [
+            (CROSS_SIGNED_ROOT.primary, CROSS_SIGNED_ROOT.alternate, true),
+            (
+                INTERMEDIATE_BY_EACH_ROOT.primary,
+                INTERMEDIATE_BY_EACH_ROOT.alternate,
+                true,
+            ),
+            // Without the intermediate.
+            (
+                CROSS_SIGNED_ROOT.primary,
+                &[Cert::Leaf, Cert::EcRoot],
+                false,
+            ),
+            // To the wrong root.
+            (
+                INTERMEDIATE_BY_EACH_ROOT.primary,
+                INTERMEDIATE_BY_EACH_ROOT.primary,
+                false,
+            ),
+        ];
+        for (primary, alternate, installed) in cases {
+            let mut state = dual_chain_config().state();
+            let event = state.process_cert(
+                CertBundle {
+                    primary: fixture::bundle(primary),
+                    alternate: Some(fixture::bundle(alternate)),
+                },
+                false,
+            );
+            assert!(matches!(event, Ok(EventOk::DeployedNewCert)), "{event:?}");
+            assert_eq!(state.resolver().serves_alternate_chain(), installed);
+        }
     }
 
     #[test]
