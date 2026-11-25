@@ -13,7 +13,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
 use tracing::{error, info, warn};
@@ -34,6 +34,20 @@ const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
 /// Number of order rounds that can fail to advance the order status before the order fails.
 const MAX_STALLED_ROUNDS: u32 = 10;
 
+/// Lifetime under which certificates renew at half their lifetime instead of two thirds.
+const SHORT_LIFETIME: TimeDuration = TimeDuration::days(10);
+
+/// Longest delay between failed orders.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Lower bound of the cap on the delay between failed orders while a certificate is deployed.
+///
+/// About the refill time of Let's Encrypt's failed-authorization limit.
+const MIN_RETRY_DELAY_CAP: Duration = Duration::from_secs(10 * 60);
+
+/// Part of the remaining validity that caps the delay between failed orders.
+const RETRY_DELAY_VALIDITY_DIVISOR: u32 = 10;
+
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 pub(crate) fn after(d: Duration) -> Pin<Box<Sleep>> {
@@ -49,6 +63,32 @@ fn time_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration>
 /// Returns how long to sleep before the next renewal check, or `None` once renewal is due.
 fn renewal_sleep(renew_at: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
     time_until(renew_at, now).map(|left| left.min(MAX_RENEWAL_SLEEP))
+}
+
+/// Returns when to renew a certificate valid from `not_before` to `not_after`.
+///
+/// Renews at two thirds of the lifetime, or at half for lifetimes under [`SHORT_LIFETIME`], like
+/// certbot, lego and Let's Encrypt's renewal information. A 6-day certificate thus has 3 days
+/// left to renew.
+fn renewal_time(not_before: OffsetDateTime, not_after: OffsetDateTime) -> OffsetDateTime {
+    let lifetime = not_after - not_before;
+    if lifetime < SHORT_LIFETIME {
+        not_before + lifetime / 2
+    } else {
+        not_before + lifetime * 2 / 3
+    }
+}
+
+/// Returns the longest delay between failed orders for a certificate that expires at `expiry`.
+///
+/// A tenth of the remaining validity, at least [`MIN_RETRY_DELAY_CAP`] and at most
+/// [`MAX_RETRY_DELAY`], so short-lived certificates retry often enough before they expire.
+fn max_retry_delay(expiry: Option<OffsetDateTime>, now: OffsetDateTime) -> Duration {
+    let Some(expiry) = expiry else {
+        return MAX_RETRY_DELAY;
+    };
+    let left = time_until(expiry, now).unwrap_or_default();
+    (left / RETRY_DELAY_VALIDITY_DIVISOR).clamp(MIN_RETRY_DELAY_CAP, MAX_RETRY_DELAY)
 }
 
 /// Returns the delay after stalled order round `round`, or `None` once the order should fail.
@@ -83,6 +123,8 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     backoff_cnt: usize,
     wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
+    /// Expiry of the deployed certificate.
+    cert_expiry: Option<OffsetDateTime>,
 }
 
 /// Item of the [`AcmeState`] stream, reporting the outcome of one step.
@@ -157,6 +199,14 @@ pub enum OrderError {
     /// The authorization for the given domain was still pending after the last check.
     #[error("authorization for {0} failed too many times")]
     TooManyAttemptsAuth(String),
+    /// The CA does not offer the configured profile.
+    #[error("the CA does not offer profile {profile:?}, it offers {offered:?}")]
+    UnknownProfile {
+        /// The configured profile.
+        profile: String,
+        /// The profiles the CA offers.
+        offered: Vec<String>,
+    },
     /// The order stayed `processing` or stopped advancing for too long.
     #[error("order did not reach a final status in time, last status {:?}", .0.status)]
     ProcessingTimeout(Order),
@@ -294,6 +344,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             backoff_cnt: 0,
             wait: None,
             renew_at: None,
+            cert_expiry: None,
         }
     }
     fn parse_cert(
@@ -345,7 +396,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             return Err(EventError::NewCertParse(CertParseError::Expired));
         }
         self.resolver.set_cert(Arc::new(cert));
-        self.renew_at = Some(not_after - (not_after - not_before) / 3_i32);
+        self.renew_at = Some(renewal_time(not_before, not_after));
+        self.cert_expiry = Some(not_after);
         if cached {
             return Ok(EventOk::DeployedCachedCert);
         }
@@ -402,7 +454,20 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         resolver: &ResolvesServerCertAcme,
         account: &Account,
     ) -> Result<Vec<u8>, OrderError> {
-        let identifiers = config.identifiers();
+        if let Some(profile) = &config.profile {
+            let meta = &account.directory.meta;
+            match meta.offers_profile(profile) {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(OrderError::UnknownProfile {
+                        profile: profile.clone(),
+                        offered: meta.profile_names(),
+                    });
+                }
+                None => warn!(%profile, "the CA lists no profiles and may ignore the profile"),
+            }
+        }
+        let identifiers = config.parsed_identifiers();
         if config.profile.is_none() && identifiers.iter().any(|id| matches!(id, Identifier::Ip(_)))
         {
             warn!(
@@ -522,9 +587,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
         Err(OrderError::TooManyAttemptsAuth(identifier.to_string()))
     }
-    /// Delays the next order with an exponential backoff.
+    /// Delays the next order with an exponential backoff, capped by [`max_retry_delay`].
     fn back_off(&mut self) {
-        self.wait = Some(after(BACKOFF_BASE_DELAY * (1 << self.backoff_cnt)));
+        let cap = max_retry_delay(self.cert_expiry, OffsetDateTime::now_utc());
+        self.wait = Some(after(
+            (BACKOFF_BASE_DELAY * (1 << self.backoff_cnt)).min(cap),
+        ));
         self.backoff_cnt = (self.backoff_cnt + 1).min(16);
     }
     fn poll_next_infinite(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Event<EC, EA>> {
@@ -698,5 +766,39 @@ mod tests {
             .chain([None])
             .collect();
         assert_eq!(delays, expected);
+    }
+
+    #[test]
+    fn renewal_time_is_half_the_lifetime_for_short_certificates() {
+        let not_before = OffsetDateTime::UNIX_EPOCH;
+        let cases = [
+            // Let's Encrypt's `shortlived` profile, 160 hours.
+            (TimeDuration::hours(160), TimeDuration::hours(80)),
+            (TimeDuration::days(90), TimeDuration::days(60)),
+            (SHORT_LIFETIME, SHORT_LIFETIME * 2 / 3),
+        ];
+        for (lifetime, renew_after) in cases {
+            assert_eq!(
+                renewal_time(not_before, not_before + lifetime),
+                not_before + renew_after,
+                "lifetime {lifetime}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_retry_delay_follows_the_remaining_validity() {
+        const HOUR: TimeDuration = TimeDuration::hours(1);
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let cases = [
+            (None, MAX_RETRY_DELAY),
+            (Some(now + 80 * HOUR), Duration::from_secs(8 * 60 * 60)),
+            (Some(now + 30 * 24 * HOUR), MAX_RETRY_DELAY),
+            (Some(now + HOUR), MIN_RETRY_DELAY_CAP),
+            (Some(now - HOUR), MIN_RETRY_DELAY_CAP),
+        ];
+        for (expiry, expected) in cases {
+            assert_eq!(max_retry_delay(expiry, now), expected, "expiry {expiry:?}");
+        }
     }
 }

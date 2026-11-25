@@ -175,6 +175,28 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self.domains = domains.into_iter().map(|s| s.as_ref().into()).collect();
         self
     }
+    /// Sets the identifiers to request a certificate for from typed values, replacing the others.
+    ///
+    /// Takes [`Identifier`]s or [`IpAddr`](std::net::IpAddr)s, and stores them in canonical text
+    /// form, like [`AcmeConfig::domains`] does for strings.
+    ///
+    /// ```rust
+    /// # use std::net::{IpAddr, Ipv4Addr};
+    /// # use tokio_rustls_acme::AcmeConfig;
+    /// let config = AcmeConfig::new(["example.com"])
+    ///     .identifiers([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))])
+    ///     .profile("shortlived");
+    /// ```
+    pub fn identifiers(
+        mut self,
+        identifiers: impl IntoIterator<Item = impl Into<Identifier>>,
+    ) -> Self {
+        self.domains = identifiers
+            .into_iter()
+            .map(|identifier| identifier.into().to_string())
+            .collect();
+        self
+    }
     /// Adds an identifier (DNS name or IP address) to request a certificate for.
     pub fn domains_push(mut self, domain: impl AsRef<str>) -> Self {
         self.domains.push(domain.as_ref().into());
@@ -182,10 +204,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     }
 
     /// Returns the configured identifiers, parsed and without duplicates.
-    pub(crate) fn identifiers(&self) -> Vec<Identifier> {
+    pub(crate) fn parsed_identifiers(&self) -> Vec<Identifier> {
         let mut identifiers = Vec::new();
         for domain in &self.domains {
-            let identifier = Identifier::from(domain.as_str());
+            let identifier = Identifier::from_text(domain);
             if !identifiers.contains(&identifier) {
                 identifiers.push(identifier);
             }

@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::fmt;
 use std::net::IpAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub use crate::crypto::CryptoError;
@@ -40,9 +43,9 @@ pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 pub(crate) struct Account {
     pub(crate) key_pair: EcdsaKeyPair,
     /// Directory of the ACME server that holds this account.
-    pub directory: Directory,
+    pub(crate) directory: Directory,
     /// Account URL from the server, sent as `kid` in signed requests.
-    pub kid: String,
+    pub(crate) kid: String,
 }
 
 static ALG: &EcdsaSigningAlgorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
@@ -248,11 +251,41 @@ impl Account {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Directory {
     /// URL that hands out fresh replay nonces.
-    pub new_nonce: String,
+    pub(crate) new_nonce: String,
     /// URL to create an account or look up an existing one.
-    pub new_account: String,
+    pub(crate) new_account: String,
     /// URL to create a new order.
-    pub new_order: String,
+    pub(crate) new_order: String,
+    /// Metadata about the server.
+    #[serde(default)]
+    pub(crate) meta: DirectoryMeta,
+}
+
+/// Metadata of an ACME server from its directory (RFC 8555 section 7.1.1).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct DirectoryMeta {
+    /// Certificate profiles the server offers, by name, with their descriptions.
+    ///
+    /// `None` if the server lists no profiles (draft-ietf-acme-profiles).
+    #[serde(default)]
+    pub(crate) profiles: Option<BTreeMap<String, String>>,
+}
+
+impl DirectoryMeta {
+    /// Returns whether the server offers `profile`, or `None` if it lists no profiles.
+    pub(crate) fn offers_profile(&self, profile: &str) -> Option<bool> {
+        self.profiles
+            .as_ref()
+            .map(|profiles| profiles.contains_key(profile))
+    }
+
+    /// Returns the names of the profiles the server offers.
+    pub(crate) fn profile_names(&self) -> Vec<String> {
+        self.profiles
+            .iter()
+            .flat_map(|profiles| profiles.keys().cloned())
+            .collect()
+    }
 }
 
 impl Directory {
@@ -285,7 +318,7 @@ impl Directory {
 /// A key that binds a new account to an external CA account (RFC 8555 section 7.3.4).
 pub(crate) struct ExternalAccountKey {
     /// Key identifier that the CA assigned to the external account.
-    pub kid: String,
+    pub(crate) kid: String,
     pub(crate) key: hmac::Key,
 }
 
@@ -398,7 +431,7 @@ pub enum AuthStatus {
 
 /// An ACME identifier (RFC 8555 section 9.7.7, RFC 8738 for IP addresses).
 ///
-/// Converting from a string picks [`Identifier::Ip`] if the string parses as an IP address and
+/// Parsing a string with [`str::parse`] picks [`Identifier::Ip`] if it is an IP address and
 /// [`Identifier::Dns`] otherwise. IP addresses serialize in their canonical text form (RFC 5952
 /// for IPv6), as RFC 8738 section 3 requires.
 ///
@@ -415,18 +448,18 @@ pub enum Identifier {
     Ip(IpAddr),
 }
 
-impl From<String> for Identifier {
-    fn from(s: String) -> Self {
-        match s.parse::<IpAddr>() {
-            Ok(ip) => Identifier::Ip(ip),
-            Err(_) => Identifier::Dns(s),
-        }
+impl From<IpAddr> for Identifier {
+    fn from(ip: IpAddr) -> Self {
+        Identifier::Ip(ip)
     }
 }
 
-impl From<&str> for Identifier {
-    fn from(s: &str) -> Self {
-        s.to_owned().into()
+impl FromStr for Identifier {
+    type Err = Infallible;
+
+    /// Parses `s` as an IP identifier if it is an IP address, and as a DNS identifier otherwise.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_text(s))
     }
 }
 
@@ -440,6 +473,13 @@ impl fmt::Display for Identifier {
 }
 
 impl Identifier {
+    /// Returns `s` as an IP identifier if it is an IP address, and as a DNS identifier otherwise.
+    pub(crate) fn from_text(s: &str) -> Self {
+        match s.parse::<IpAddr>() {
+            Ok(ip) => Identifier::Ip(ip),
+            Err(_) => Identifier::Dns(s.to_owned()),
+        }
+    }
     /// Returns the subject alternative name that certifies this identifier.
     pub(crate) fn subject_alt_name(&self) -> Result<SanType, rcgen::Error> {
         Ok(match self {
@@ -606,7 +646,7 @@ mod tests {
 
     #[test]
     fn new_order_payload_has_profile_only_when_set() {
-        let identifiers = [Identifier::from("192.0.2.1")];
+        let identifiers = [Identifier::from_text("192.0.2.1")];
         let payload = |profile| {
             serde_json::to_string(&NewOrder {
                 identifiers: &identifiers,
@@ -625,13 +665,37 @@ mod tests {
     }
 
     #[test]
+    fn directory_meta_lists_offered_profiles() {
+        let with_profiles: Directory = serde_json::from_str(
+            r#"{"newNonce":"n","newAccount":"a","newOrder":"o",
+                "meta":{"profiles":{"classic":"90 days","shortlived":"6 days"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(with_profiles.meta.offers_profile("shortlived"), Some(true));
+        assert_eq!(with_profiles.meta.offers_profile("tlsserver"), Some(false));
+        assert_eq!(
+            with_profiles.meta.profile_names(),
+            ["classic", "shortlived"]
+        );
+
+        let without_meta: Directory =
+            serde_json::from_str(r#"{"newNonce":"n","newAccount":"a","newOrder":"o"}"#).unwrap();
+        assert_eq!(without_meta.meta.offers_profile("shortlived"), None);
+        assert!(without_meta.meta.profile_names().is_empty());
+    }
+
+    #[test]
     fn subject_alt_name_matches_the_identifier() {
         assert_eq!(
-            Identifier::from("192.0.2.1").subject_alt_name().unwrap(),
+            Identifier::from_text("192.0.2.1")
+                .subject_alt_name()
+                .unwrap(),
             SanType::IpAddress("192.0.2.1".parse().unwrap())
         );
         assert_eq!(
-            Identifier::from("example.com").subject_alt_name().unwrap(),
+            Identifier::from_text("example.com")
+                .subject_alt_name()
+                .unwrap(),
             SanType::DnsName("example.com".try_into().unwrap())
         );
     }
@@ -660,11 +724,11 @@ mod tests {
     #[test]
     fn server_name_for_identifier() {
         assert_eq!(
-            Identifier::from("Example.COM").tls_alpn_01_server_name(),
+            Identifier::from_text("Example.COM").tls_alpn_01_server_name(),
             "example.com"
         );
         assert_eq!(
-            Identifier::from("10.0.0.1").tls_alpn_01_server_name(),
+            Identifier::from_text("10.0.0.1").tls_alpn_01_server_name(),
             "1.0.0.10.in-addr.arpa"
         );
     }
@@ -672,20 +736,20 @@ mod tests {
     #[test]
     fn identifier_from_str() {
         assert_eq!(
-            Identifier::from("example.com"),
+            Identifier::from_text("example.com"),
             Identifier::Dns("example.com".into())
         );
         assert_eq!(
-            Identifier::from("192.0.2.1"),
+            Identifier::from_text("192.0.2.1"),
             Identifier::Ip("192.0.2.1".parse().unwrap())
         );
         assert_eq!(
-            Identifier::from("2001:db8::1".to_string()),
+            Identifier::from_text("2001:db8::1"),
             Identifier::Ip("2001:db8::1".parse().unwrap())
         );
         // Not a valid IPv4 address (leading zero), so it falls through to DNS.
         assert_eq!(
-            Identifier::from("010.1.1.1"),
+            Identifier::from_text("010.1.1.1"),
             Identifier::Dns("010.1.1.1".into())
         );
     }
@@ -695,20 +759,20 @@ mod tests {
         // RFC 5952: lowercase, longest zero run compressed, no leading zeros.
         for input in ["2001:DB8:0:0::1", "2001:0db8:0000:0000:0000:0000:0000:0001"] {
             assert_eq!(
-                Identifier::from(input),
+                Identifier::from_text(input),
                 Identifier::Ip("2001:db8::1".parse().unwrap()),
                 "{input}"
             );
         }
-        assert_eq!(Identifier::from("0:0::1").to_string(), "::1");
+        assert_eq!(Identifier::from_text("0:0::1").to_string(), "::1");
     }
 
     #[test]
     fn identifier_wire_format() {
         let ids = [
-            Identifier::from("example.com"),
-            Identifier::from("192.0.2.1"),
-            Identifier::from("2001:DB8::1"),
+            Identifier::from_text("example.com"),
+            Identifier::from_text("192.0.2.1"),
+            Identifier::from_text("2001:DB8::1"),
         ];
         let json = serde_json::to_string(&ids).unwrap();
         assert_eq!(
@@ -721,8 +785,11 @@ mod tests {
 
     #[test]
     fn identifier_display() {
-        assert_eq!(Identifier::from("::1").to_string(), "::1");
-        assert_eq!(Identifier::from("example.com").to_string(), "example.com");
+        assert_eq!(Identifier::from_text("::1").to_string(), "::1");
+        assert_eq!(
+            Identifier::from_text("example.com").to_string(),
+            "example.com"
+        );
     }
 
     #[derive(Debug)]
@@ -752,6 +819,7 @@ mod tests {
                 new_nonce: String::new(),
                 new_account: String::new(),
                 new_order: String::new(),
+                meta: DirectoryMeta::default(),
             },
             kid: String::new(),
         };
@@ -762,7 +830,11 @@ mod tests {
             error: None,
         }];
 
-        let result = account.tls_alpn_01(&provider, &challenges, &Identifier::from("example.com"));
+        let result = account.tls_alpn_01(
+            &provider,
+            &challenges,
+            &Identifier::from_text("example.com"),
+        );
         assert!(matches!(result, Err(AcmeError::Crypto(_))));
     }
 
@@ -801,6 +873,7 @@ mod tests {
                 new_nonce: new_nonce.into(),
                 new_account: new_nonce.into(),
                 new_order: new_order.into(),
+                meta: Default::default(),
             };
             assert_eq!(directory.https_only(), expected, "{new_nonce} {new_order}");
         }

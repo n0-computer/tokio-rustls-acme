@@ -201,7 +201,7 @@ mod tests {
         ] {
             let resolver = ResolvesServerCertAcme::new();
             let (key, der) = certified_key(ip);
-            resolver.set_auth_key(&Identifier::from(ip), key);
+            resolver.set_auth_key(&Identifier::from_text(ip), key);
             let served = validation_handshake(resolver, &sni)
                 .await
                 .unwrap_or_else(|err| panic!("handshake for {ip} with SNI {sni} failed: {err}"));
@@ -213,7 +213,7 @@ mod tests {
     async fn resolves_dns_identifier_by_sni() {
         let resolver = ResolvesServerCertAcme::new();
         let (key, der) = certified_key("example.org");
-        resolver.set_auth_key(&Identifier::from("example.org"), key);
+        resolver.set_auth_key(&Identifier::from_text("example.org"), key);
         let served = validation_handshake(resolver, "example.org").await.unwrap();
         assert_eq!(served, der);
     }
@@ -222,7 +222,7 @@ mod tests {
     async fn resolves_mixed_case_dns_identifier() {
         let resolver = ResolvesServerCertAcme::new();
         let (key, der) = certified_key("example.org");
-        resolver.set_auth_key(&Identifier::from("Example.ORG"), key);
+        resolver.set_auth_key(&Identifier::from_text("Example.ORG"), key);
         let served = validation_handshake(resolver, "EXAMPLE.org").await.unwrap();
         assert_eq!(served, der);
     }
@@ -231,7 +231,7 @@ mod tests {
     async fn serves_no_challenge_certificate_for_unknown_names() {
         let resolver = ResolvesServerCertAcme::new();
         let (key, _) = certified_key("example.org");
-        resolver.set_auth_key(&Identifier::from("example.org"), key);
+        resolver.set_auth_key(&Identifier::from_text("example.org"), key);
         assert!(validation_handshake(resolver, "other.org").await.is_err());
     }
 }

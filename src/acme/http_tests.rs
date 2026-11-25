@@ -169,6 +169,7 @@ async fn signed_request_is_not_redirected() {
         new_nonce: format!("https://{addr}/nonce"),
         new_account: format!("https://{addr}/acct"),
         new_order: format!("https://{addr}/order"),
+        meta: Default::default(),
     };
     let contact: [&str; 0] = [];
     let account = Account::create_with_keypair(
@@ -217,6 +218,7 @@ async fn plain_http_object_url_is_refused_for_https_directory() {
         new_nonce: format!("https://{addr}/nonce"),
         new_account: format!("https://{addr}/acct"),
         new_order: format!("https://{addr}/order"),
+        meta: Default::default(),
     };
     let contact: [&str; 0] = [];
     let account = Account::create_with_keypair(
