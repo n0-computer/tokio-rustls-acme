@@ -17,39 +17,14 @@ use std::fmt::{self, Debug};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// An identifier as configured: a string as given, or a typed [`Identifier`].
-#[derive(Debug, Clone)]
-enum ConfiguredIdentifier {
-    Text(String),
-    Typed(Identifier),
-}
-
-impl ConfiguredIdentifier {
-    /// Returns the identifier to order, keeping the type of a typed identifier.
-    fn to_identifier(&self) -> Result<Identifier, InvalidIdentifier> {
-        match self {
-            Self::Text(text) => text.parse(),
-            Self::Typed(identifier) => identifier.clone().validated(),
-        }
-    }
-}
-
-/// The identifiers of a config, validated.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Identifiers {
-    /// The identifiers to order, without duplicates.
-    pub(crate) order: Vec<Identifier>,
-    /// The strings that key the certificate cache, see [`AcmeConfig::domains`].
-    pub(crate) cache_key: Vec<String>,
-}
-
 /// Configuration for an ACME resolver.
 ///
 /// The type parameters represent the error types for the certificate cache and account cache.
 pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) client_config: Arc<ClientConfig>,
     pub(crate) directory_url: String,
-    identifiers: Vec<ConfiguredIdentifier>,
+    /// The identifiers as configured, not yet validated.
+    identifiers: Vec<Identifier>,
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
@@ -196,39 +171,34 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     }
     /// Sets the identifiers to request a certificate for, DNS names or IP addresses.
     ///
-    /// Invalid ones fail every order, see [`Identifier::validated`]. The strings, as given, key
-    /// the certificate cache.
+    /// Invalid ones fail every order, see [`Identifier::validated`]. They key the certificate
+    /// cache as given, IP addresses in canonical form.
     pub fn domains(mut self, domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         self.identifiers = Self::text_identifiers(domains);
         self
     }
     /// Sets typed identifiers to request a certificate for, like [`IpAddr`](std::net::IpAddr)s.
     ///
-    /// Each keeps its type. They key the certificate cache by their canonical text.
+    /// Each keeps its type, and keys the certificate cache like [`AcmeConfig::domains`].
     pub fn identifiers(
         mut self,
         identifiers: impl IntoIterator<Item = impl Into<Identifier>>,
     ) -> Self {
-        self.identifiers = identifiers
-            .into_iter()
-            .map(|identifier| ConfiguredIdentifier::Typed(identifier.into()))
-            .collect();
+        self.identifiers = identifiers.into_iter().map(Into::into).collect();
         self
     }
     /// Adds an identifier (DNS name or IP address) to request a certificate for.
     pub fn domains_push(mut self, domain: impl AsRef<str>) -> Self {
         self.identifiers
-            .push(ConfiguredIdentifier::Text(domain.as_ref().into()));
+            .push(Identifier::from_text(domain.as_ref()));
         self
     }
 
-    /// Returns string identifiers as configured.
-    fn text_identifiers(
-        domains: impl IntoIterator<Item = impl AsRef<str>>,
-    ) -> Vec<ConfiguredIdentifier> {
+    /// Returns `domains` as identifiers, not yet validated.
+    fn text_identifiers(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<Identifier> {
         domains
             .into_iter()
-            .map(|domain| ConfiguredIdentifier::Text(domain.as_ref().into()))
+            .map(|domain| Identifier::from_text(domain.as_ref()))
             .collect()
     }
 
@@ -241,25 +211,24 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         .contains(&self.directory_url.as_str())
     }
 
-    /// Returns the validated identifiers, or why they can't be ordered.
-    pub(crate) fn validated_identifiers(&self) -> Result<Identifiers, InvalidIdentifier> {
+    /// Returns the strings that key the certificate cache, see [`AcmeConfig::domains`].
+    pub(crate) fn cache_key(&self) -> Vec<String> {
+        self.identifiers.iter().map(Identifier::to_string).collect()
+    }
+
+    /// Returns the validated identifiers to order, without duplicates, or why they can't be.
+    pub(crate) fn validated_identifiers(&self) -> Result<Vec<Identifier>, InvalidIdentifier> {
         if self.identifiers.is_empty() {
             return Err(InvalidIdentifier::NoIdentifiers);
         }
-        let mut order = Vec::new();
-        let mut cache_key = Vec::new();
+        let mut identifiers = Vec::new();
         let mut challenge_names = BTreeMap::new();
-        for configured in &self.identifiers {
-            let identifier = configured.to_identifier()?;
-            cache_key.push(match configured {
-                // Strings stay as given, so existing cache entries keep matching.
-                ConfiguredIdentifier::Text(text) => text.clone(),
-                ConfiguredIdentifier::Typed(_) => identifier.to_string(),
-            });
+        for identifier in &self.identifiers {
+            let identifier = identifier.clone().validated()?;
             match challenge_names.entry(identifier.tls_alpn_01_server_name()) {
                 Entry::Vacant(entry) => {
                     entry.insert(identifier.clone());
-                    order.push(identifier);
+                    identifiers.push(identifier);
                 }
                 Entry::Occupied(entry) if *entry.get() == identifier => {}
                 Entry::Occupied(entry) => {
@@ -269,7 +238,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
                 }
             }
         }
-        Ok(Identifiers { order, cache_key })
+        Ok(identifiers)
     }
 
     /// Requires the ACME profile `profile` (draft-ietf-acme-profiles) for new orders.
@@ -415,29 +384,23 @@ mod tests {
             ),
         ];
         for (domains, expected) in cases {
-            let order = config(&domains)
-                .validated_identifiers()
-                .map(|identifiers| identifiers.order);
-            assert_eq!(order, expected, "{domains:?}");
+            let identifiers = config(&domains).validated_identifiers();
+            assert_eq!(identifiers, expected, "{domains:?}");
         }
     }
 
     #[test]
-    fn cache_keys_are_strings_as_given_and_canonical_typed_identifiers() {
-        let domains = ["Example.COM.", "0:0::1"];
-        let cache_key = |config: AcmeConfig<Infallible>| {
-            config
-                .validated_identifiers()
-                .map(|identifiers| identifiers.cache_key)
-        };
-        assert_eq!(
-            cache_key(config(&domains)),
-            Ok(domains.map(String::from).to_vec())
-        );
-        let typed = domains.map(|domain| domain.parse::<Identifier>().unwrap());
-        assert_eq!(
-            cache_key(config(&[]).identifiers(typed)),
-            Ok(vec!["example.com".into(), "::1".into()])
-        );
+    fn cache_keys_are_identifiers_as_given_with_canonical_ips() {
+        let typed = [
+            Identifier::Dns("Example.COM.".into()),
+            Identifier::from_text("0:0::1"),
+        ];
+        let configs = [
+            config(&["Example.COM.", "0:0::1"]),
+            config(&[]).identifiers(typed),
+        ];
+        for config in configs {
+            assert_eq!(config.cache_key(), ["Example.COM.", "::1"]);
+        }
     }
 }

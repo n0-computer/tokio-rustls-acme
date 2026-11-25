@@ -416,11 +416,7 @@ impl FromStr for Identifier {
 
     /// Parses `s` as an IP address, or else as a DNS name, see [`Identifier::validated`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.parse::<IpAddr>() {
-            Ok(ip) => Identifier::Ip(ip),
-            Err(_) => Identifier::Dns(s.to_owned()),
-        }
-        .validated()
+        Self::from_text(s).validated()
     }
 }
 
@@ -461,6 +457,13 @@ impl fmt::Display for Identifier {
 }
 
 impl Identifier {
+    /// Returns `text` as an IP identifier if it is an IP address, else as a DNS one, unvalidated.
+    pub(crate) fn from_text(text: &str) -> Self {
+        match text.parse::<IpAddr>() {
+            Ok(ip) => Identifier::Ip(ip),
+            Err(_) => Identifier::Dns(text.to_owned()),
+        }
+    }
     /// Returns the identifier normalized for an order, or why it can't be ordered.
     ///
     /// DNS names are lowercased, lose one trailing dot, and must be valid ASCII names without a

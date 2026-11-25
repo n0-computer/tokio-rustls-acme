@@ -315,20 +315,15 @@ async fn invalid_identifiers_fail_before_the_cache_and_the_ca() {
     );
 }
 
-/// Keys the cache by strings as given, and by the canonical text of typed identifiers.
+/// Loads and stores the certificate under the identifiers as given, from either builder.
 #[tokio::test]
 async fn cache_keys_follow_the_builder() {
-    let cases: [(Configure, &str); 2] = [
-        (
-            |config| config.domains(["Invariants.Example.COM."]),
-            "Invariants.Example.COM.",
-        ),
-        (
-            |config| config.identifiers([Identifier::Dns("Invariants.Example.COM.".into())]),
-            DOMAIN,
-        ),
+    let key = "Invariants.Example.COM.";
+    let cases: [Configure; 2] = [
+        |config| config.domains(["Invariants.Example.COM."]),
+        |config| config.identifiers([Identifier::Dns("Invariants.Example.COM.".into())]),
     ];
-    for (configure, key) in cases {
+    for configure in cases {
         let mock = MockAcme::start().await;
         let cache = KeyRecorder::default();
         let keys = cache.keys.clone();

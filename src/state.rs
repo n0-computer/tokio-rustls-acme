@@ -24,7 +24,6 @@ use crate::acme::{
     Account, AcmeError, Auth, AuthStatus, CreatedOrder, Directory, Identifier, InvalidIdentifier,
     Order, OrderStatus,
 };
-use crate::config::Identifiers;
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
 /// First delay of the order backoffs, which double it on each retry.
@@ -117,22 +116,6 @@ fn stall_delay(round: u32) -> Option<Duration> {
     (round < MAX_STALLED_ROUNDS).then(|| BACKOFF_BASE_DELAY * (1 << round))
 }
 
-/// A newly issued certificate.
-struct IssuedCert {
-    /// The PEM bundle of key and certificate chain.
-    pem: Vec<u8>,
-    /// The identifiers it was ordered for, whose cache key it is stored under.
-    identifiers: Arc<Identifiers>,
-}
-
-/// Where a certificate to deploy comes from.
-enum CertSource {
-    /// The cache, so it needs no store.
-    Cache,
-    /// An order for the identifiers, so it is stored under their cache key.
-    Order(Arc<Identifiers>),
-}
-
 /// A failed order.
 struct OrderFailure {
     error: OrderError,
@@ -151,14 +134,14 @@ struct OrderFailure {
 pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
     /// The identifiers of the config, validated once, since the config doesn't change.
-    identifiers: Result<Arc<Identifiers>, InvalidIdentifier>,
+    identifiers: Result<Arc<[Identifier]>, InvalidIdentifier>,
     resolver: Arc<ResolvesServerCertAcme>,
     account_key: Option<Vec<u8>>,
 
     early_action: Option<BoxFuture<Event<EC, EA>>>,
     load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
-    order: Option<BoxFuture<Result<IssuedCert, OrderFailure>>>,
+    order: Option<BoxFuture<Result<Vec<u8>, OrderFailure>>>,
     backoff_cnt: u32,
     wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
@@ -364,14 +347,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     /// [`AcmeConfig::state`].
     pub fn new(config: AcmeConfig<EC, EA>) -> Self {
         let config = Arc::new(config);
-        let identifiers = config.validated_identifiers().map(Arc::new);
+        let identifiers = config.validated_identifiers().map(Arc::from);
         // A config that can't order serves no cached certificate either.
-        let load_cert = identifiers.as_ref().ok().map(|identifiers| {
-            let (config, identifiers) = (config.clone(), identifiers.clone());
+        let load_cert = identifiers.is_ok().then(|| {
+            let config = config.clone();
             Box::pin(async move {
                 config
                     .cache
-                    .load_cert(&identifiers.cache_key, &config.directory_url)
+                    .load_cert(&config.cache_key(), &config.directory_url)
                     .await
             }) as BoxFuture<_>
         });
@@ -430,8 +413,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         clippy::result_large_err,
         reason = "runs once per certificate, so the error size does not matter"
     )]
-    fn process_cert(&mut self, pem: Vec<u8>, source: CertSource) -> Event<EC, EA> {
-        let cached = matches!(source, CertSource::Cache);
+    fn process_cert(&mut self, pem: Vec<u8>, cached: bool) -> Event<EC, EA> {
         let provider = self.crypto_provider();
         let (cert, validity) = match (Self::parse_cert(&provider, &pem), cached) {
             (Ok(r), _) => r,
@@ -449,8 +431,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             return Err(EventError::NewCertParse(CertParseError::Expired));
         }
         // Without one, clients that connect by it would fail after a successful deployment.
-        if let CertSource::Order(identifiers) = &source
-            && let Some(missing) = uncertified_identifier(&cert, &identifiers.order)
+        if !cached
+            && let Ok(identifiers) = &self.identifiers
+            && let Some(missing) = uncertified_identifier(&cert, identifiers)
         {
             warn!(%missing, "the CA left an ordered identifier out, keeping the deployed one");
             let missing = missing.clone();
@@ -461,14 +444,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         self.resolver.set_cert(Arc::new(cert));
         self.renew_at = Some(renewal_time(not_before, not_after));
         self.cert_expiry = Some(not_after);
-        let CertSource::Order(identifiers) = source else {
+        if cached {
             return Ok(EventOk::DeployedCachedCert);
-        };
+        }
         let config = self.config.clone();
         self.early_action = Some(Box::pin(async move {
             match config
                 .cache
-                .store_cert(&identifiers.cache_key, &config.directory_url, &pem)
+                .store_cert(&config.cache_key(), &config.directory_url, &pem)
                 .await
             {
                 Ok(()) => Ok(EventOk::CertCacheStore),
@@ -486,8 +469,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         config: Arc<AcmeConfig<EC, EA>>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
-        identifiers: Arc<Identifiers>,
-    ) -> Result<IssuedCert, OrderFailure> {
+        identifiers: Arc<[Identifier]>,
+    ) -> Result<Vec<u8>, OrderFailure> {
         let account = async {
             let directory =
                 Directory::discover(&config.client_config, &config.directory_url).await?;
@@ -506,13 +489,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             error: err.into(),
         })?;
         // CAs also use `unauthorized` for order problems, so only account errors count.
-        let pem = Self::order_with_account(&config, &resolver, &account, &identifiers.order)
+        Self::order_with_account(&config, &resolver, &account, &identifiers)
             .await
             .map_err(|error| OrderFailure {
                 error,
                 account_rejected: false,
-            })?;
-        Ok(IssuedCert { pem, identifiers })
+            })
     }
     async fn order_with_account(
         config: &AcmeConfig<EC, EA>,
@@ -701,7 +683,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 self.load_cert.take();
                 match result {
                     Ok(Some(pem)) => {
-                        return Poll::Ready(self.process_cert(pem, CertSource::Cache));
+                        return Poll::Ready(self.process_cert(pem, true));
                     }
                     Ok(None) => {}
                     Err(err) => return Poll::Ready(Err(EventError::CertCacheLoad(err))),
@@ -737,8 +719,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let result = ready!(order.poll(cx));
                 self.order.take();
                 match result {
-                    Ok(IssuedCert { pem, identifiers }) => {
-                        let event = self.process_cert(pem, CertSource::Order(identifiers));
+                    Ok(pem) => {
+                        let event = self.process_cert(pem, false);
                         // An unusable or already due certificate counts as a failed order.
                         let now = OffsetDateTime::now_utc();
                         let due = self.renew_at.is_some_and(|t| time_until(t, now).is_none());
