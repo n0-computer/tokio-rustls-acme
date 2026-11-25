@@ -48,6 +48,8 @@ const CHALLTESTSRV_MGMT: &str = "http://127.0.0.1:8055";
 /// The tls-alpn-01 port, `tlsPort` in `test/pebble-config.json`.
 const TLS_ALPN_PORT: u16 = 5001;
 const ORDER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time for the state machine to finish work that reports no event.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Read the Pebble minica root cert from the path in PEBBLE_MINICA_CERT.
 fn load_minica_cert() -> Vec<u8> {
@@ -255,6 +257,14 @@ impl Site {
         })
         .await
         .expect("timed out waiting for certificate deployment")
+    }
+
+    /// Polls the state machine for [`IDLE_TIMEOUT`], in which it must report nothing.
+    ///
+    /// Lets it finish work without an event, like loading a cached alternate chain.
+    async fn run_idle(&mut self) {
+        let event = tokio::time::timeout(IDLE_TIMEOUT, self.state.next()).await;
+        assert!(event.is_err(), "unexpected event {event:?}");
     }
 
     /// Closes the listeners and waits until their ports are free.
@@ -652,33 +662,6 @@ async fn test_preferred_chain() {
     );
 }
 
-/// DualChain serves the default chain to a client that verifies it.
-#[tokio::test]
-#[ignore]
-async fn test_dual_chain() {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    let domain = "dual-chain.example.com";
-    let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 11));
-    set_dns_record(domain, addr).await;
-    let alt_root_cn = fetch_root_cn(1).await;
-
-    let config = pebble_config(&[domain]).cert_chain(CertChainPreference::dual_chain(alt_root_cn));
-    let mut site = Site::bind(config, &[addr]).await;
-    site.deploy().await.expect("order failed");
-
-    let chain = fetch_chain_for(addr, domain).await;
-    assert_eq!(
-        chain.last(),
-        Some(&fetch_intermediate(0).await),
-        "a client that verifies the default chain should get it"
-    );
-    assert!(
-        site.state.resolver().serves_alternate_chain(),
-        "DualChain should install the alternate chain"
-    );
-}
-
 /// Falls back to the default chain when no offered chain matches the PreferredChain root.
 #[tokio::test]
 #[ignore]
@@ -702,7 +685,7 @@ async fn test_preferred_chain_falls_back_to_default() {
     );
 }
 
-/// DualChain stores the alternate chain in its own cache file and loads it on the next run.
+/// DualChain serves and stores the alternate chain, and loads it on the next run.
 #[tokio::test]
 #[ignore]
 async fn test_dual_chain_cache() {
@@ -740,13 +723,17 @@ async fn test_dual_chain_cache() {
         .expect("should have an alternate cert cache file");
     let alt_pems = pem::parse_many(std::fs::read(&alt_file).expect("failed to read alt cache"))
         .expect("failed to parse alt cache");
+    assert!(
+        alt_pems.iter().all(|p| p.tag() == "CERTIFICATE"),
+        "the alternate cache file should hold no key"
+    );
     assert_eq!(
         alt_pems.last().map(|p| p.contents()),
         Some(fetch_intermediate(1).await.as_ref()),
         "the alternate cache file should hold the alternate chain"
     );
 
-    let (site, events) = acquire_cert_with_cache(
+    let (mut site, events) = acquire_cert_with_cache(
         domain,
         addr,
         CertChainPreference::dual_chain(alt_root_cn),
@@ -757,6 +744,7 @@ async fn test_dual_chain_cache() {
         events.deployed_cached && !events.deployed_new,
         "second run should deploy the cached cert, got {events:?}"
     );
+    site.run_idle().await;
     assert!(
         site.state.resolver().serves_alternate_chain(),
         "the reload should install the cached alternate chain"

@@ -58,10 +58,10 @@ impl<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> CertCache for Co
         &self,
         domains: &[String],
         directory_url: &str,
-        cert: Option<&[u8]>,
+        chain: Option<&[u8]>,
     ) -> Result<(), Self::EC> {
         self.cert_cache
-            .store_alt_cert(domains, directory_url, cert)
+            .store_alt_cert(domains, directory_url, chain)
             .await
     }
 }

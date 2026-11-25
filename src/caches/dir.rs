@@ -127,11 +127,11 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         &self,
         domains: &[String],
         directory_url: &str,
-        cert: Option<&[u8]>,
+        chain: Option<&[u8]>,
     ) -> Result<(), Self::EC> {
         let file_name = Self::cached_cert_file_name(domains, directory_url) + ALT_CERT_SUFFIX;
-        match cert {
-            Some(cert) => self.write(file_name, cert).await,
+        match chain {
+            Some(chain) => self.write(file_name, chain).await,
             None => self.remove_if_exist(file_name).await,
         }
     }

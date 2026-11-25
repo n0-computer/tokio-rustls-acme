@@ -229,7 +229,6 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Future for Handshake<IO> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::CertChain;
     use crate::fixture::{self, CROSS_SIGNED_ROOT, Cert, HIERARCHIES, Hierarchy, LEAF_NAME};
     use crate::resolver::AlternateChain;
     use rustls::crypto::ring;
@@ -268,12 +267,10 @@ mod tests {
     /// Returns an acceptor that serves `hierarchy` in DualChain mode, and its config.
     fn dual_chain(hierarchy: Hierarchy) -> (AcmeAcceptor, Arc<ServerConfig>) {
         let resolver = ResolvesServerCertAcme::new();
-        let primary = fixture::certified_key(hierarchy.primary);
-        let alternate = AlternateChain::new(
-            &CertChain::new(primary.cert.clone()),
-            fixture::certified_key(hierarchy.alternate),
-        );
-        assert!(resolver.set_certs(Arc::new(primary), Some(alternate)));
+        let primary = Arc::new(fixture::certified_key(hierarchy.primary));
+        resolver.set_cert(primary.clone());
+        let alternate = AlternateChain::new(&primary, fixture::chain(hierarchy.alternate));
+        assert!(resolver.set_alternate(alternate));
         let provider = Arc::new(ring::default_provider());
         let config = server_config(provider.clone(), resolver.clone());
         (AcmeAcceptor::new(resolver, provider), Arc::new(config))

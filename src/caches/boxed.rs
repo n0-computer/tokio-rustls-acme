@@ -67,10 +67,10 @@ where
         &self,
         domains: &[String],
         directory_url: &str,
-        cert: Option<&[u8]>,
+        chain: Option<&[u8]>,
     ) -> Result<(), Self::EC> {
         self.inner
-            .store_alt_cert(domains, directory_url, cert)
+            .store_alt_cert(domains, directory_url, chain)
             .await
             .map_err(box_err)
     }

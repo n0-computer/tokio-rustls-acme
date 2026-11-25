@@ -15,7 +15,7 @@ use rustls::{ClientConfig, ServerConfig};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::time::Sleep;
+use tokio::time::{Sleep, timeout};
 use tracing::{debug, error, info, warn};
 use x509_parser::parse_x509_certificate;
 
@@ -37,6 +37,11 @@ const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
 /// Number of order rounds that can fail to advance the order status before the order fails.
 const MAX_STALLED_ROUNDS: u32 = 10;
 
+/// Limit for looking up an alternate chain, in the cache or at the CA.
+///
+/// The alternate is optional, so a slow cache or CA must not hold up the state machine.
+const ALTERNATE_TIMEOUT: Duration = Duration::from_secs(10);
+
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 pub(crate) fn after(d: Duration) -> Pin<Box<Sleep>> {
@@ -52,6 +57,29 @@ fn time_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration>
 /// Returns how long to sleep before the next renewal check, or `None` once renewal is due.
 fn renewal_sleep(renew_at: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
     time_until(renew_at, now).map(|left| left.min(MAX_RENEWAL_SLEEP))
+}
+
+/// Runs the alternate chain lookup `lookup`, or returns `None` after [`ALTERNATE_TIMEOUT`].
+async fn bounded<T>(lookup: impl Future<Output = Option<T>>) -> Option<T> {
+    timeout(ALTERNATE_TIMEOUT, lookup)
+        .await
+        .unwrap_or_else(|_| {
+            warn!("looking up the alternate chain timed out, serving the default chain only");
+            None
+        })
+}
+
+/// Serves `chain` as the alternate of the certificate `cert`, and returns whether it does.
+fn serve_alternate(
+    resolver: &ResolvesServerCertAcme,
+    cert: &CertifiedKey,
+    chain: CertChain,
+) -> bool {
+    let served = resolver.set_alternate(AlternateChain::new(cert, chain));
+    if served {
+        info!("serving an alternate chain to clients that can't verify the default one");
+    }
+    served
 }
 
 /// Returns the delay after stalled order round `round`, or `None` once the order should fail.
@@ -79,10 +107,11 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     resolver: Arc<ResolvesServerCertAcme>,
     account_key: Option<Vec<u8>>,
 
-    early_action: Option<BoxFuture<Event<EC, EA>>>,
-    load_cert: Option<BoxFuture<Result<Option<CertBundle>, EC>>>,
+    /// Work that runs before anything else, and that may end with an event.
+    early_action: Option<BoxFuture<Option<Event<EC, EA>>>>,
+    load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
-    order: Option<BoxFuture<Result<CertBundle, OrderFailure>>>,
+    order: Option<BoxFuture<Result<IssuedCert, OrderFailure>>>,
     backoff_cnt: usize,
     wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
@@ -123,6 +152,12 @@ pub enum EventError<EC: Debug, EA: Debug> {
     /// Storing the newly issued certificate in the cache failed.
     #[error("cert cache store: {0}")]
     CertCacheStore(EC),
+    /// Storing the alternate chain of the newly issued certificate failed.
+    ///
+    /// The certificate is stored, and the alternate is served until a restart. After one,
+    /// [`CertChainPreference::DualChain`] serves no alternate until the next renewal.
+    #[error("alternate cert cache store: {0}")]
+    AltCertCacheStore(EC),
     /// Storing the newly generated account key in the cache failed.
     #[error("account cache store: {0}")]
     AccountCacheStore(EA),
@@ -199,10 +234,12 @@ struct ParsedCert {
     not_after: OffsetDateTime,
 }
 
-/// A PEM bundle of key and certificate chain, with the alternate chain bundle in DualChain mode.
-struct CertBundle {
-    primary: Vec<u8>,
-    alternate: Option<Vec<u8>>,
+/// A newly issued certificate.
+struct IssuedCert {
+    /// The PEM bundle of key and certificate chain.
+    pem: Vec<u8>,
+    /// Downloads the alternate chain of [`CertChainPreference::DualChain`].
+    alternate: Option<BoxFuture<Option<CertChain>>>,
 }
 
 fn rcgen_err(err: rcgen::Error) -> OrderError {
@@ -299,30 +336,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             load_cert: Some(Box::pin({
                 let config = config.clone();
                 async move {
-                    let Some(primary) = config
+                    config
                         .cache
                         .load_cert(&config.domains, &config.directory_url)
-                        .await?
-                    else {
-                        return Ok(None);
-                    };
-                    // Only DualChain serves an alternate. A cached one from an
-                    // earlier DualChain run is ignored in the other modes.
-                    let alternate = match config.cert_chain {
-                        CertChainPreference::DualChain(_) => match config
-                            .cache
-                            .load_alt_cert(&config.domains, &config.directory_url)
-                            .await
-                        {
-                            Ok(alternate) => alternate,
-                            Err(err) => {
-                                warn!(?err, "failed to load cached alternate cert");
-                                None
-                            }
-                        },
-                        _ => None,
-                    };
-                    Ok(Some(CertBundle { primary, alternate }))
+                        .await
                 }
             })),
             load_account: Some(Box::pin({
@@ -372,90 +389,111 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         })
     }
 
-    /// Parses the alternate bundle `pem` for the primary `primary_chain`.
+    /// Parses the PEM bundle `pem` of key and certificate chain, serves it, and returns it.
     ///
-    /// Returns `None`, and logs why, unless the preference is DualChain and the alternate is a
-    /// valid chain for the primary's leaf that ends at the preferred root.
-    fn alternate_chain(
-        &self,
-        provider: &CryptoProvider,
-        pem: &[u8],
-        primary_chain: &CertChain,
-    ) -> Option<CertifiedKey> {
-        let CertChainPreference::DualChain(root) = &self.config.cert_chain else {
-            return None;
-        };
-        let alternate = match Self::parse_cert(provider, pem) {
-            Ok(alternate) => alternate.certified_key,
-            Err(err) => {
-                warn!(%err, "failed to parse alternate cert chain");
-                return None;
-            }
-        };
-        if !CertChain::new(alternate.cert.clone()).is_alternate_for(primary_chain.leaf(), root) {
-            warn!(%root, "alternate chain is no valid chain to the root for this certificate");
-            return None;
-        }
-        Some(alternate)
-    }
-
+    /// A new certificate that has already expired is rejected, so the deployed one stays.
     #[allow(
         clippy::result_large_err,
         reason = "runs once per certificate, so the error size does not matter"
     )]
-    fn process_cert(&mut self, bundle: CertBundle, cached: bool) -> Event<EC, EA> {
-        let provider = self.crypto_provider();
-        let parsed = match Self::parse_cert(&provider, &bundle.primary) {
+    fn deploy_cert(
+        &mut self,
+        pem: &[u8],
+        cached: bool,
+    ) -> Result<Arc<CertifiedKey>, EventError<EC, EA>> {
+        let parsed = match Self::parse_cert(&self.crypto_provider(), pem) {
             Ok(parsed) => parsed,
             Err(err) if cached => return Err(EventError::CachedCertParse(err)),
             Err(err) => return Err(EventError::NewCertParse(err)),
         };
-        let primary_chain = CertChain::new(parsed.certified_key.cert.clone());
-        let alternate = bundle
-            .alternate
-            .as_deref()
-            .and_then(|pem| self.alternate_chain(&provider, pem, &primary_chain));
-        let alternate = alternate.map(|alternate| AlternateChain::new(&primary_chain, alternate));
         let (not_before, not_after) = (parsed.not_before, parsed.not_after);
         // The deployed certificate may still be valid, so keep it and the cache.
         if !cached && not_after <= OffsetDateTime::now_utc() {
             warn!(%not_after, "the CA issued an expired certificate, keeping the deployed one");
             return Err(EventError::NewCertParse(CertParseError::Expired));
         }
-        let alternate_installed = self
-            .resolver
-            .set_certs(Arc::new(parsed.certified_key), alternate);
-        if alternate_installed {
-            info!("serving an alternate chain to clients that can't verify the default one");
-        }
+        let cert = Arc::new(parsed.certified_key);
+        self.resolver.set_cert(cert.clone());
         self.renew_at = Some(not_after - (not_after - not_before) / 3_i32);
-        if cached {
-            return Ok(EventOk::DeployedCachedCert);
+        Ok(cert)
+    }
+
+    /// Serves the cached PEM bundle `pem`, then loads its alternate chain in DualChain mode.
+    #[allow(
+        clippy::result_large_err,
+        reason = "runs once per certificate, so the error size does not matter"
+    )]
+    fn process_cached_cert(&mut self, pem: &[u8]) -> Event<EC, EA> {
+        let cert = self.deploy_cert(pem, true)?;
+        // Only DualChain serves an alternate. One cached by an earlier DualChain run is ignored.
+        if let CertChainPreference::DualChain(root) = &self.config.cert_chain {
+            let (config, resolver, root) =
+                (self.config.clone(), self.resolver.clone(), root.clone());
+            self.early_action = Some(Box::pin(async move {
+                let load = async {
+                    let loaded = config
+                        .cache
+                        .load_alt_cert(&config.domains, &config.directory_url)
+                        .await;
+                    loaded.unwrap_or_else(|err| {
+                        warn!(?err, "failed to load the cached alternate chain");
+                        None
+                    })
+                };
+                let leaf = cert.end_entity_cert().ok()?;
+                match CertChain::from_pem(&bounded(load).await?) {
+                    Some(chain) if chain.is_alternate_for(leaf, &root) => {
+                        serve_alternate(&resolver, &cert, chain);
+                    }
+                    _ => {
+                        warn!(%root, "cached alternate is no chain to the root for the certificate")
+                    }
+                }
+                None
+            }));
         }
-        let config = self.config.clone();
-        let alternate = bundle.alternate.filter(|_| alternate_installed);
+        Ok(EventOk::DeployedCachedCert)
+    }
+
+    /// Serves the new certificate `issued`, then its alternate, and stores both.
+    #[allow(
+        clippy::result_large_err,
+        reason = "runs once per certificate, so the error size does not matter"
+    )]
+    fn process_new_cert(&mut self, issued: IssuedCert) -> Event<EC, EA> {
+        let cert = self.deploy_cert(&issued.pem, false)?;
+        let (config, resolver) = (self.config.clone(), self.resolver.clone());
         self.early_action = Some(Box::pin(async move {
+            // The certificate is served already, so only its cache store waits for the alternate.
+            let alternate = match issued.alternate {
+                Some(download) => bounded(download).await,
+                None => None,
+            };
+            let alternate = alternate.and_then(|chain| {
+                let pem = chain.to_pem();
+                serve_alternate(&resolver, &cert, chain).then_some(pem)
+            });
             if let Err(err) = config
                 .cache
-                .store_cert(&config.domains, &config.directory_url, &bundle.primary)
+                .store_cert(&config.domains, &config.directory_url, &issued.pem)
                 .await
             {
-                return Err(EventError::CertCacheStore(err));
+                // The cached alternate must belong to the cached certificate, so keep the old one.
+                return Some(Err(EventError::CertCacheStore(err)));
             }
-            // The primary is stored, so a failed alternate store only costs the
-            // alternate until the next order. Without an alternate, this removes
-            // one stored for an earlier certificate.
-            if let Err(err) = config
+            // Without an alternate, this removes the one of an earlier certificate.
+            let stored = config
                 .cache
                 .store_alt_cert(&config.domains, &config.directory_url, alternate.as_deref())
-                .await
-            {
-                warn!(?err, "failed to store the alternate cert chain");
-            }
-            Ok(EventOk::CertCacheStore)
+                .await;
+            Some(match stored {
+                Ok(()) => Ok(EventOk::CertCacheStore),
+                Err(err) => Err(EventError::AltCertCacheStore(err)),
+            })
         }));
-        Event::Ok(EventOk::DeployedNewCert)
+        Ok(EventOk::DeployedNewCert)
     }
+
     /// Runs one order.
     #[allow(
         clippy::result_large_err,
@@ -465,7 +503,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         config: Arc<AcmeConfig<EC, EA>>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
-    ) -> Result<CertBundle, OrderFailure> {
+    ) -> Result<IssuedCert, OrderFailure> {
         let account = async {
             let directory =
                 Directory::discover(&config.client_config, &config.directory_url).await?;
@@ -484,7 +522,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             error: err.into(),
         })?;
         // CAs also use `unauthorized` for order problems, so only account errors count.
-        Self::order_with_account(&config, &resolver, &account)
+        Self::order_with_account(&config, &resolver, &Arc::new(account))
             .await
             .map_err(|error| OrderFailure {
                 error,
@@ -494,8 +532,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     async fn order_with_account(
         config: &AcmeConfig<EC, EA>,
         resolver: &ResolvesServerCertAcme,
-        account: &Account,
-    ) -> Result<CertBundle, OrderError> {
+        account: &Arc<Account>,
+    ) -> Result<IssuedCert, OrderError> {
         let mut params = CertificateParams::new(config.domains.clone()).map_err(rcgen_err)?;
         params.distinguished_name = DistinguishedName::new();
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(rcgen_err)?;
@@ -538,51 +576,53 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
                 OrderStatus::Valid { certificate } => {
                     info!("download certificate");
-                    let cert_response = account
+                    let response = account
                         .certificate_with_alternate_urls(&config.client_config, &certificate)
                         .await?;
                     let key_pem = key_pair.serialize_pem();
-                    // Build key+cert PEM bundle(s) based on chain preference.
-                    let make_pem = |cert_pem: &[u8]| -> Vec<u8> {
-                        [key_pem.as_bytes(), b"\n", cert_pem].concat()
+                    let bundle = |chain: &[u8]| [key_pem.as_bytes(), b"\n", chain].concat();
+                    let default = bundle(response.pem.as_bytes());
+                    let (CertChainPreference::PreferredChain(root)
+                    | CertChainPreference::DualChain(root)) = &config.cert_chain
+                    else {
+                        return Ok(IssuedCert {
+                            pem: default,
+                            alternate: None,
+                        });
                     };
-                    let default_pem = cert_response.pem.as_bytes();
-                    let default_chain = CertChain::from_pem(default_pem);
-                    // The root of a PreferredChain or DualChain preference, unless the default
-                    // chain already ends there.
-                    let wanted_root = match &config.cert_chain {
-                        CertChainPreference::PreferredChain(root)
-                        | CertChainPreference::DualChain(root) => {
-                            Some(root).filter(|root| match &default_chain {
-                                Some(chain) => !chain.ends_at(root),
-                                None => false,
-                            })
-                        }
-                        _ => None,
+                    // No alternate if the default chain ends at the root already. A default
+                    // chain that doesn't parse fails when it is deployed.
+                    let Some(default_chain) = CertChain::from_pem(response.pem.as_bytes())
+                        .filter(|chain| !chain.ends_at(root))
+                    else {
+                        return Ok(IssuedCert {
+                            pem: default,
+                            alternate: None,
+                        });
                     };
-                    let alternate = match (wanted_root, &default_chain) {
-                        (Some(root), Some(default_chain)) => {
-                            Self::fetch_alternate_chain(
-                                account,
-                                &config.client_config,
-                                &cert_response.alternate_urls,
-                                default_chain.leaf(),
-                                root,
-                            )
-                            .await
-                        }
-                        _ => None,
+                    let download = Box::pin(Self::fetch_alternate_chain(
+                        account.clone(),
+                        config.client_config.clone(),
+                        response.alternate_urls,
+                        default_chain.leaf().clone(),
+                        root.clone(),
+                    ));
+                    if let CertChainPreference::DualChain(_) = &config.cert_chain {
+                        // Served next to the default chain, so it can follow the deployment.
+                        return Ok(IssuedCert {
+                            pem: default,
+                            alternate: Some(download),
+                        });
+                    }
+                    // PreferredChain serves the alternate instead, so it is needed now.
+                    let pem = match bounded(download).await {
+                        Some(alternate) => bundle(&alternate.to_pem()),
+                        None => default,
                     };
-                    let (primary, alternate) = match (&config.cert_chain, alternate) {
-                        (CertChainPreference::PreferredChain(_), Some(alternate)) => {
-                            (make_pem(&alternate.to_pem()), None)
-                        }
-                        (CertChainPreference::DualChain(_), Some(alternate)) => {
-                            (make_pem(default_pem), Some(make_pem(&alternate.to_pem())))
-                        }
-                        _ => (make_pem(default_pem), None),
-                    };
-                    return Ok(CertBundle { primary, alternate });
+                    return Ok(IssuedCert {
+                        pem,
+                        alternate: None,
+                    });
                 }
                 OrderStatus::Invalid => return Err(OrderError::BadOrder(order)),
             }
@@ -608,17 +648,17 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     /// throw away the issued certificate and order a new one, which counts
     /// against the CA's rate limits.
     async fn fetch_alternate_chain(
-        account: &Account,
-        client_config: &Arc<ClientConfig>,
-        alternate_urls: &[String],
-        leaf: &RustlsCertificate<'_>,
-        root: &ChainRoot,
+        account: Arc<Account>,
+        client_config: Arc<ClientConfig>,
+        alternate_urls: Vec<String>,
+        leaf: RustlsCertificate<'static>,
+        root: ChainRoot,
     ) -> Option<CertChain> {
         for url in alternate_urls {
             debug!(%url, "fetching alternate chain");
-            match account.certificate(client_config, url).await {
+            match account.certificate(&client_config, &url).await {
                 Ok(pem) => match CertChain::from_pem(pem.as_bytes()) {
-                    Some(chain) if chain.is_alternate_for(leaf, root) => return Some(chain),
+                    Some(chain) if chain.is_alternate_for(&leaf, &root) => return Some(chain),
                     _ => debug!(%url, "alternate is no valid chain to the root for the leaf"),
                 },
                 Err(err) => warn!(%url, %err, "failed to fetch alternate chain"),
@@ -677,9 +717,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         loop {
             // queued early action
             if let Some(early_action) = &mut self.early_action {
-                let result = ready!(early_action.poll(cx));
+                let event = ready!(early_action.poll(cx));
                 self.early_action.take();
-                return Poll::Ready(result);
+                match event {
+                    Some(event) => return Poll::Ready(event),
+                    None => continue,
+                }
             }
 
             // sleep
@@ -704,9 +747,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let result = ready!(load_cert.poll(cx));
                 self.load_cert.take();
                 match result {
-                    Ok(Some(cached)) => {
-                        return Poll::Ready(Self::process_cert(self.get_mut(), cached, true));
-                    }
+                    Ok(Some(pem)) => return Poll::Ready(self.process_cached_cert(&pem)),
                     Ok(None) => {}
                     Err(err) => return Poll::Ready(Err(EventError::CertCacheLoad(err))),
                 }
@@ -741,8 +782,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let result = ready!(order.poll(cx));
                 self.order.take();
                 match result {
-                    Ok(bundle) => {
-                        let event = self.process_cert(bundle, false);
+                    Ok(issued) => {
+                        let event = self.process_new_cert(issued);
                         // An unusable or already due certificate counts as a failed order.
                         let now = OffsetDateTime::now_utc();
                         let due = self.renew_at.is_some_and(|t| time_until(t, now).is_none());
@@ -778,18 +819,18 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                     let config = self.config.clone();
                     let account_key_clone = account_key.clone();
                     self.early_action = Some(Box::pin(async move {
-                        match config
+                        let stored = config
                             .cache
                             .store_account(
                                 &config.contact,
                                 &config.directory_url,
                                 &account_key_clone,
                             )
-                            .await
-                        {
+                            .await;
+                        Some(match stored {
                             Ok(()) => Ok(EventOk::AccountCacheStore),
                             Err(err) => Err(EventError::AccountCacheStore(err)),
-                        }
+                        })
                     }));
                     account_key
                 }
@@ -813,16 +854,101 @@ impl<EC: 'static + Debug, EA: 'static + Debug> Stream for AcmeState<EC, EA> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CertCache;
+    use crate::caches::NoCache;
     use crate::fixture::{
-        self, CROSS_SIGNED_ROOT, Cert, EC_ROOT_CN, INTERMEDIATE_BY_EACH_ROOT, LEAF_NAME,
+        self, CROSS_SIGNED_ROOT, Cert, EC_ROOT_CN, HIERARCHIES, LEAF_NAME, chain,
     };
+    use async_trait::async_trait;
+    use n0_future::StreamExt;
     use rustls::RootCertStore;
     use rustls::crypto::ring;
+    use std::future;
+    use std::sync::Mutex;
+    use tokio::time::Instant;
 
     const MIN: Duration = Duration::from_secs(60);
     const HOUR: Duration = Duration::from_secs(60 * 60);
-    /// Returns a DualChain config for the fixture's ECDSA root that needs no webpki roots.
-    fn dual_chain_config() -> AcmeConfig<Infallible> {
+    /// The error of [`MemCertCache`] when it fails to store an alternate.
+    const STORE_FAILED: &str = "store failed";
+
+    /// The state of the tests, with [`MemCertCache`].
+    type TestState = AcmeState<&'static str, Infallible>;
+
+    /// How [`MemCertCache`] treats alternate chains.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AlternateCache {
+        /// It loads and stores them.
+        Working,
+        /// It never finishes loading one.
+        StallingLoads,
+        /// It fails to store them.
+        FailingStores,
+    }
+
+    /// A cert cache in memory, shared by its clones.
+    #[derive(Debug, Clone)]
+    struct MemCertCache {
+        cert: Arc<Mutex<Option<Vec<u8>>>>,
+        alternate: Arc<Mutex<Option<Vec<u8>>>>,
+        behavior: AlternateCache,
+    }
+
+    impl MemCertCache {
+        /// Creates a cache that holds `cert` and `alternate`.
+        fn new(
+            cert: Option<Vec<u8>>,
+            alternate: Option<Vec<u8>>,
+            behavior: AlternateCache,
+        ) -> Self {
+            Self {
+                cert: Arc::new(Mutex::new(cert)),
+                alternate: Arc::new(Mutex::new(alternate)),
+                behavior,
+            }
+        }
+
+        fn cert(&self) -> Option<Vec<u8>> {
+            self.cert.lock().expect("poisoned").clone()
+        }
+
+        fn alternate(&self) -> Option<Vec<u8>> {
+            self.alternate.lock().expect("poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl CertCache for MemCertCache {
+        type EC = &'static str;
+        async fn load_cert(&self, _: &[String], _: &str) -> Result<Option<Vec<u8>>, Self::EC> {
+            Ok(self.cert())
+        }
+        async fn store_cert(&self, _: &[String], _: &str, cert: &[u8]) -> Result<(), Self::EC> {
+            *self.cert.lock().expect("poisoned") = Some(cert.to_vec());
+            Ok(())
+        }
+        async fn load_alt_cert(&self, _: &[String], _: &str) -> Result<Option<Vec<u8>>, Self::EC> {
+            if self.behavior == AlternateCache::StallingLoads {
+                future::pending::<()>().await;
+            }
+            Ok(self.alternate())
+        }
+        async fn store_alt_cert(
+            &self,
+            _: &[String],
+            _: &str,
+            chain: Option<&[u8]>,
+        ) -> Result<(), Self::EC> {
+            if self.behavior == AlternateCache::FailingStores {
+                return Err(STORE_FAILED);
+            }
+            *self.alternate.lock().expect("poisoned") = chain.map(<[u8]>::to_vec);
+            Ok(())
+        }
+    }
+
+    /// Returns a DualChain state for the fixture's ECDSA root, with `cache`.
+    fn dual_chain_state(cache: &MemCertCache) -> TestState {
         let client_config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
             .with_safe_default_protocol_versions()
             .expect("ring supports the default versions")
@@ -830,42 +956,130 @@ mod tests {
             .with_no_client_auth();
         AcmeConfig::new_with_client_tls_config([LEAF_NAME], Arc::new(client_config))
             .cert_chain(CertChainPreference::dual_chain(EC_ROOT_CN))
+            .cache_compose(cache.clone(), NoCache::<Infallible, Infallible>::new())
+            .state()
     }
 
-    #[tokio::test]
-    async fn dual_chain_installs_only_a_valid_alternate() {
+    /// Starts a state with `cache`, and asserts that it serves the cached certificate.
+    async fn start_cached(cache: &MemCertCache) -> TestState {
+        let mut state = dual_chain_state(cache);
+        let event = state.next().await;
+        assert!(
+            matches!(event, Some(Ok(EventOk::DeployedCachedCert))),
+            "{event:?}"
+        );
+        state
+    }
+
+    /// Serves a new certificate for `primary` with the alternate download `alternate`.
+    ///
+    /// Returns the event of the cache stores, which follow the download.
+    async fn store_new(
+        state: &mut TestState,
+        primary: &[Cert],
+        alternate: impl Future<Output = Option<CertChain>> + Send + 'static,
+    ) -> Option<Event<&'static str, Infallible>> {
+        let event = state.process_new_cert(IssuedCert {
+            pem: fixture::bundle(primary),
+            alternate: Some(Box::pin(alternate)),
+        });
+        assert!(matches!(event, Ok(EventOk::DeployedNewCert)), "{event:?}");
+        state.next().await
+    }
+
+    /// Runs `state` until it waits for the renewal, and asserts that it reports nothing.
+    async fn run_until_renewal_wait(state: &mut TestState) {
+        let event = tokio::time::timeout(ALTERNATE_TIMEOUT + MIN, state.next()).await;
+        assert!(event.is_err(), "unexpected event {event:?}");
+        assert!(state.early_action.is_none());
+    }
+
+    /// A valid cached alternate is served after a restart, see the restart test.
+    #[tokio::test(start_paused = true)]
+    async fn invalid_cached_alternate_is_not_served() {
         let cases = [
-            (CROSS_SIGNED_ROOT.primary, CROSS_SIGNED_ROOT.alternate, true),
-            (
-                INTERMEDIATE_BY_EACH_ROOT.primary,
-                INTERMEDIATE_BY_EACH_ROOT.alternate,
-                true,
-            ),
             // Without the intermediate.
-            (
-                CROSS_SIGNED_ROOT.primary,
-                &[Cert::Leaf, Cert::EcRoot],
-                false,
-            ),
-            // To the wrong root.
-            (
-                INTERMEDIATE_BY_EACH_ROOT.primary,
-                INTERMEDIATE_BY_EACH_ROOT.primary,
-                false,
-            ),
+            chain(&[Cert::Leaf, Cert::EcRoot]).to_pem(),
+            // With a key, which only the certificate's cache holds.
+            fixture::bundle(CROSS_SIGNED_ROOT.alternate),
         ];
-        for (primary, alternate, installed) in cases {
-            let mut state = dual_chain_config().state();
-            let event = state.process_cert(
-                CertBundle {
-                    primary: fixture::bundle(primary),
-                    alternate: Some(fixture::bundle(alternate)),
-                },
-                false,
-            );
-            assert!(matches!(event, Ok(EventOk::DeployedNewCert)), "{event:?}");
-            assert_eq!(state.resolver().serves_alternate_chain(), installed);
+        for alternate in cases {
+            let primary = fixture::bundle(CROSS_SIGNED_ROOT.primary);
+            let cache = MemCertCache::new(Some(primary), Some(alternate), AlternateCache::Working);
+            let mut state = start_cached(&cache).await;
+            run_until_renewal_wait(&mut state).await;
+            assert!(!state.resolver.serves_alternate_chain());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_alternate_cache_does_not_delay_the_certificate() {
+        let cache = MemCertCache::new(
+            Some(fixture::bundle(CROSS_SIGNED_ROOT.primary)),
+            Some(chain(CROSS_SIGNED_ROOT.alternate).to_pem()),
+            AlternateCache::StallingLoads,
+        );
+        let start = Instant::now();
+        let mut state = start_cached(&cache).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        run_until_renewal_wait(&mut state).await;
+        assert!(!state.resolver.serves_alternate_chain());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_alternate_is_served_stored_and_loaded_after_a_restart() {
+        for hierarchy in HIERARCHIES {
+            let cache = MemCertCache::new(None, None, AlternateCache::Working);
+            let mut state = dual_chain_state(&cache);
+            let alternate = chain(hierarchy.alternate);
+            let download = future::ready(Some(alternate.clone()));
+            let event = store_new(&mut state, hierarchy.primary, download).await;
+            assert!(
+                matches!(event, Some(Ok(EventOk::CertCacheStore))),
+                "{event:?}"
+            );
+            assert!(state.resolver.serves_alternate_chain());
+            assert_eq!(cache.cert(), Some(fixture::bundle(hierarchy.primary)));
+            assert_eq!(cache.alternate(), Some(alternate.to_pem()));
+
+            let mut restarted = start_cached(&cache).await;
+            run_until_renewal_wait(&mut restarted).await;
+            assert!(restarted.resolver.serves_alternate_chain(), "{hierarchy:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_alternate_download_is_dropped_after_the_timeout() {
+        let stale = chain(CROSS_SIGNED_ROOT.alternate).to_pem();
+        let cache = MemCertCache::new(None, Some(stale), AlternateCache::Working);
+        let mut state = dual_chain_state(&cache);
+        let start = Instant::now();
+        let event = store_new(&mut state, CROSS_SIGNED_ROOT.primary, future::pending()).await;
+        assert!(
+            matches!(event, Some(Ok(EventOk::CertCacheStore))),
+            "{event:?}"
+        );
+        assert_eq!(start.elapsed(), ALTERNATE_TIMEOUT);
+        assert!(!state.resolver.serves_alternate_chain());
+        let primary = Some(fixture::bundle(CROSS_SIGNED_ROOT.primary));
+        assert_eq!(cache.cert(), primary);
+        assert_eq!(cache.alternate(), None, "the stale alternate is removed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_alternate_store_keeps_serving_the_alternate() {
+        let cache = MemCertCache::new(None, None, AlternateCache::FailingStores);
+        let mut state = dual_chain_state(&cache);
+        let download = future::ready(Some(chain(CROSS_SIGNED_ROOT.alternate)));
+        let event = store_new(&mut state, CROSS_SIGNED_ROOT.primary, download).await;
+        let failed = matches!(
+            event,
+            Some(Err(EventError::AltCertCacheStore(STORE_FAILED)))
+        );
+        assert!(failed, "{event:?}");
+        assert!(state.resolver.serves_alternate_chain());
+        let primary = Some(fixture::bundle(CROSS_SIGNED_ROOT.primary));
+        assert_eq!(cache.cert(), primary);
     }
 
     #[test]

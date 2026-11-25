@@ -35,17 +35,17 @@ pub(crate) struct AlternateChain {
 }
 
 impl AlternateChain {
-    /// Creates the alternate `alternate` for the primary chain `primary`.
+    /// Creates the alternate `chain` for `primary`, which signs with the primary's key.
     ///
     /// The primary's schemes must be exact, while the alternate's may be guessed, see
     /// [`CertChain::likely_required_schemes`]: the alternate goes only to clients that can't
     /// verify the primary.
-    pub(crate) fn new(primary: &CertChain, alternate: CertifiedKey) -> Self {
-        let alternate_chain = CertChain::new(alternate.cert.clone());
+    pub(crate) fn new(primary: &CertifiedKey, chain: CertChain) -> Self {
+        let primary_chain = CertChain::new(primary.cert.clone());
         Self {
-            primary_schemes: primary.required_schemes(&alternate_chain),
-            alternate_schemes: alternate_chain.likely_required_schemes(primary),
-            key: Arc::new(alternate),
+            primary_schemes: primary_chain.required_schemes(&chain),
+            alternate_schemes: chain.likely_required_schemes(&primary_chain),
+            key: Arc::new(CertifiedKey::new(chain.into_certs(), primary.key.clone())),
         }
     }
 
@@ -77,29 +77,29 @@ impl ResolvesServerCertAcme {
             }),
         })
     }
-    /// Replaces the certificate and the alternate chain, and returns whether the alternate is kept.
-    ///
-    /// The alternate must carry the same leaf certificate as `primary`: it is the same
-    /// certificate, chained to a different root. An alternate with another leaf is dropped.
-    /// Both are replaced under one lock, so no handshake sees a new primary with an old
-    /// alternate.
-    pub(crate) fn set_certs(
-        &self,
-        primary: Arc<CertifiedKey>,
-        alternate: Option<AlternateChain>,
-    ) -> bool {
-        let alternate = alternate.filter(|alternate| {
-            let matches = primary.end_entity_cert().ok() == alternate.key.end_entity_cert().ok();
-            if !matches {
-                warn!("alternate chain doesn't match the certificate, not serving it");
-            }
-            matches
-        });
-        let installed = alternate.is_some();
+    /// Serves `cert`, without an alternate chain until [`ResolvesServerCertAcme::set_alternate`].
+    pub(crate) fn set_cert(&self, cert: Arc<CertifiedKey>) {
         let mut inner = self.inner.lock().expect("poisoned");
-        inner.cert = Some(primary);
-        inner.alt_cert = alternate;
-        installed
+        inner.cert = Some(cert);
+        inner.alt_cert = None;
+    }
+    /// Serves `alternate` next to the certificate, and returns whether it does.
+    ///
+    /// The alternate must carry the served certificate's leaf: it is the same certificate,
+    /// chained to a different root. An alternate for another certificate, like one that a newer
+    /// certificate replaced, is dropped.
+    pub(crate) fn set_alternate(&self, alternate: AlternateChain) -> bool {
+        let mut inner = self.inner.lock().expect("poisoned");
+        let matches = match (&inner.cert, alternate.key.end_entity_cert()) {
+            (Some(cert), Ok(leaf)) => cert.end_entity_cert().ok() == Some(leaf),
+            _ => false,
+        };
+        if matches {
+            inner.alt_cert = Some(alternate);
+        } else {
+            warn!("alternate chain doesn't match the certificate, not serving it");
+        }
+        matches
     }
     /// Returns whether an alternate chain is set, which DualChain serves to some clients.
     pub fn serves_alternate_chain(&self) -> bool {
@@ -155,40 +155,40 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{self, CROSS_SIGNED_ROOT, Cert};
+    use crate::fixture::{self, CROSS_SIGNED_ROOT, Cert, chain};
 
     const P256: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
     const P384: SignatureScheme = SignatureScheme::ECDSA_NISTP384_SHA384;
     const RSA: SignatureScheme = SignatureScheme::RSA_PKCS1_SHA256;
 
-    /// Returns the primary of [`CROSS_SIGNED_ROOT`] and the alternate `alternate` for it.
-    fn certs(alternate: &[Cert]) -> (Arc<CertifiedKey>, AlternateChain) {
-        let primary = fixture::certified_key(CROSS_SIGNED_ROOT.primary);
-        let alternate = AlternateChain::new(
-            &CertChain::new(primary.cert.clone()),
-            fixture::certified_key(alternate),
-        );
-        (Arc::new(primary), alternate)
+    /// Returns a resolver that serves the primary of [`CROSS_SIGNED_ROOT`], and that primary.
+    fn resolver() -> (Arc<ResolvesServerCertAcme>, Arc<CertifiedKey>) {
+        let resolver = ResolvesServerCertAcme::new();
+        let primary = Arc::new(fixture::certified_key(CROSS_SIGNED_ROOT.primary));
+        resolver.set_cert(primary.clone());
+        (resolver, primary)
     }
 
     #[test]
-    fn set_certs_keeps_only_an_alternate_for_the_same_leaf() {
-        let resolver = ResolvesServerCertAcme::new();
-        let (primary, alternate) = certs(CROSS_SIGNED_ROOT.alternate);
-        assert!(resolver.set_certs(primary, Some(alternate)));
+    fn set_alternate_needs_the_served_leaf() {
+        let (resolver, primary) = resolver();
+        let alternate = AlternateChain::new(&primary, chain(CROSS_SIGNED_ROOT.alternate));
+        assert!(resolver.set_alternate(alternate));
         assert!(resolver.serves_alternate_chain());
-
-        let (primary, other_leaf) = certs(&[Cert::Intermediate]);
-        assert!(!resolver.set_certs(primary.clone(), Some(other_leaf)));
-        assert!(!resolver.serves_alternate_chain());
-
-        let (_, alternate) = certs(CROSS_SIGNED_ROOT.alternate);
-        resolver.set_certs(primary.clone(), Some(alternate));
+        resolver.set_cert(primary.clone());
         assert!(
-            !resolver.set_certs(primary, None),
-            "a new primary drops the alternate"
+            !resolver.serves_alternate_chain(),
+            "a new certificate drops it"
         );
+
+        let other_leaf = AlternateChain::new(&primary, chain(&[Cert::Intermediate]));
+        assert!(!resolver.set_alternate(other_leaf));
         assert!(!resolver.serves_alternate_chain());
+        let alternate = AlternateChain::new(&primary, chain(CROSS_SIGNED_ROOT.alternate));
+        assert!(
+            !ResolvesServerCertAcme::new().set_alternate(alternate),
+            "no certificate"
+        );
     }
 
     #[test]
@@ -207,12 +207,12 @@ mod tests {
                 false,
             ),
         ];
+        let (_, primary) = resolver();
         for (primary_schemes, alternate_schemes, offered, served) in cases {
-            let (_, alternate) = certs(CROSS_SIGNED_ROOT.alternate);
             let alternate = AlternateChain {
                 primary_schemes,
                 alternate_schemes,
-                ..alternate
+                ..AlternateChain::new(&primary, chain(CROSS_SIGNED_ROOT.alternate))
             };
             assert_eq!(
                 alternate.serves(offered),

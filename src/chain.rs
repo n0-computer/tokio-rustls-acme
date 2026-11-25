@@ -91,6 +91,11 @@ impl CertChain {
         &self.certs[0]
     }
 
+    /// Returns the certificates, leaf first.
+    pub(crate) fn into_certs(self) -> Vec<CertificateDer<'static>> {
+        self.certs
+    }
+
     /// Returns whether the topmost certificate is issued by `root`, so the chain ends there.
     pub(crate) fn ends_at(&self, root: &ChainRoot) -> bool {
         self.certs
