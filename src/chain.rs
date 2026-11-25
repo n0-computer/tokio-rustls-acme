@@ -490,6 +490,33 @@ mod tests {
         );
     }
 
+    /// Let's Encrypt's YE1, Root YE by ISRG Root X2, and ISRG Root X2 by ISRG Root X1.
+    const LETS_ENCRYPT_GEN_Y: &[u8] = include_bytes!("../tests/fixtures/letsencrypt-gen-y.pem");
+
+    #[test]
+    fn lets_encrypt_chains_need_rsa_only_to_isrg_root_x1() {
+        let chain = |count| {
+            let certs = CertChain::from_pem(LETS_ENCRYPT_GEN_Y).expect("the fixture is PEM");
+            CertChain::new(certs.into_certs().into_iter().take(count).collect())
+        };
+        // Like the chains of a leaf by YE1, with YE1 for the leaf.
+        let (default, alternate) = (chain(3), chain(2));
+        assert!(default.ends_at(&ChainRoot::new("ISRG Root X1")));
+        assert!(alternate.ends_at(&ChainRoot::new("ISRG Root X2")));
+        assert_eq!(
+            default.required_schemes(&alternate, &algorithms()),
+            RequiredSchemes::Known(vec![
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA256,
+            ])
+        );
+        // ISRG Root X2's key, which signed Root YE, is in the default chain.
+        assert_eq!(
+            alternate.required_schemes(&default, &algorithms()),
+            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP384_SHA384])
+        );
+    }
+
     #[test]
     fn rsa_pss_scheme_comes_from_its_parameters() {
         let pss_intermediate = Cert::IntermediateByRsaPss.der();
