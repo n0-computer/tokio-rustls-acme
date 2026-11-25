@@ -74,9 +74,7 @@ impl AcmeConfig<Infallible, Infallible> {
     /// the TLS handshake, and key parsing. Use
     /// [`AcmeConfig::new_with_crypto_provider`] to pick a different provider.
     ///
-    /// `domains` are the identifiers to request a certificate for: DNS names, or IP addresses
-    /// (RFC 8738). Let's Encrypt issues IP address certificates only under the `shortlived`
-    /// profile, see [`AcmeConfig::profile`].
+    /// `domains` are DNS names or IP addresses, see [`AcmeConfig::domains`].
     ///
     /// ```rust,no_run
     /// # use tokio_rustls_acme::AcmeConfig;
@@ -196,40 +194,17 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         .into();
         self
     }
-    /// Sets the identifiers to request a certificate for, replacing the current ones.
+    /// Sets the identifiers to request a certificate for, DNS names or IP addresses.
     ///
-    /// Each identifier is a DNS name or an IP address, see [`Identifier`]'s [`FromStr`] impl.
-    /// Invalid identifiers, or none, fail every order before any request to the CA, and the state
-    /// serves no cached certificate for them.
-    ///
-    /// The strings, as given and in order, key the certificate cache. Changing their spelling or
-    /// order misses an existing cache entry and orders a new certificate. Typed identifiers key
-    /// it by their canonical text, so switching to [`AcmeConfig::identifiers`] keeps the entry
-    /// only for strings in canonical text, like `example.com` and `2001:db8::1`.
-    ///
-    /// [`FromStr`]: std::str::FromStr
+    /// Invalid ones fail every order, see [`Identifier::validated`]. The strings, as given, key
+    /// the certificate cache.
     pub fn domains(mut self, domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         self.identifiers = Self::text_identifiers(domains);
         self
     }
-    /// Sets the identifiers to request a certificate for from typed values, replacing the others.
+    /// Sets typed identifiers to request a certificate for, like [`IpAddr`](std::net::IpAddr)s.
     ///
-    /// Takes [`Identifier`]s or [`IpAddr`](std::net::IpAddr)s. Each keeps its type, so an
-    /// [`Identifier::Dns`] must be a valid DNS name, see [`Identifier::validated`]. The
-    /// certificate cache is keyed by their canonical text, like `example.com` for
-    /// `Dns("Example.COM.")`, see [`AcmeConfig::domains`].
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "tls-webpki-roots")]
-    /// # {
-    /// use std::net::{IpAddr, Ipv4Addr};
-    /// use tokio_rustls_acme::AcmeConfig;
-    ///
-    /// let config = AcmeConfig::new(["example.com"])
-    ///     .identifiers([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))])
-    ///     .profile("shortlived");
-    /// # }
-    /// ```
+    /// Each keeps its type. They key the certificate cache by their canonical text.
     pub fn identifiers(
         mut self,
         identifiers: impl IntoIterator<Item = impl Into<Identifier>>,
@@ -266,10 +241,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         .contains(&self.directory_url.as_str())
     }
 
-    /// Returns the validated identifiers.
-    ///
-    /// Fails on an empty list, an invalid identifier, and on two identifiers that the CA would
-    /// validate with the same challenge SNI, see [`InvalidIdentifier::ChallengeNameConflict`].
+    /// Returns the validated identifiers, or why they can't be ordered.
     pub(crate) fn validated_identifiers(&self) -> Result<Identifiers, InvalidIdentifier> {
         if self.identifiers.is_empty() {
             return Err(InvalidIdentifier::NoIdentifiers);
@@ -300,32 +272,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         Ok(Identifiers { order, cache_key })
     }
 
-    /// Requires the ACME profile `profile` for new orders.
+    /// Requires the ACME profile `profile` (draft-ietf-acme-profiles) for new orders.
     ///
-    /// Profiles are defined by the CA, see
-    /// [draft-ietf-acme-profiles](https://datatracker.ietf.org/doc/draft-ietf-acme-profiles/), and
-    /// CAs list their public ones in the directory under `meta.profiles`. If unset, no profile is
-    /// sent and the CA picks its default.
-    ///
-    /// The profile is a requirement: the CA must name it in the order it creates, or the order fails
-    /// with [`OrderError::ProfileMismatch`](crate::OrderError::ProfileMismatch) before it is
-    /// finalized. A CA without profile support names none, so with such a CA every order fails,
-    /// renewals included. A CA that doesn't offer the profile rejects the order.
-    ///
-    /// The profile applies to new orders. A certificate loaded from the cache is served until its
-    /// renewal, even if it was issued under another profile.
-    ///
-    /// Let's Encrypt issues certificates for IP addresses only under the `shortlived` profile
-    /// (about 6 days of validity), so set it when any identifier is an IP address:
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "tls-webpki-roots")]
-    /// # {
-    /// use tokio_rustls_acme::AcmeConfig;
-    ///
-    /// let config = AcmeConfig::new(["192.0.2.1"]).profile("shortlived");
-    /// # }
-    /// ```
+    /// The CA must confirm it in the order, or the order fails with
+    /// [`OrderError::ProfileMismatch`](crate::OrderError::ProfileMismatch), so every order fails
+    /// with a CA without profiles. Let's Encrypt issues IP certificates only under `shortlived`.
     pub fn profile(mut self, profile: impl AsRef<str>) -> Self {
         self.profile = Some(profile.as_ref().into());
         self

@@ -30,10 +30,7 @@ use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 /// First delay of the order backoffs, which double it on each retry.
 const BACKOFF_BASE_DELAY: Duration = Duration::from_secs(1);
 
-/// Longest sleep toward a wall-clock deadline before it is checked again.
-///
-/// The monotonic timer misses clock corrections and host suspend, so a long sleep could pass a
-/// renewal or retry, or the expiry of the certificate.
+/// Longest sleep toward a wall-clock deadline, since the monotonic timer misses host suspend.
 const MAX_SLEEP: Duration = Duration::from_secs(60 * 60);
 
 /// Number of order rounds that can fail to advance the order status before the order fails.
@@ -49,9 +46,6 @@ const MAX_BACKOFF_EXPONENT: u32 = 16;
 const MAX_RETRY_DELAY: Duration = BACKOFF_BASE_DELAY.saturating_mul(1 << MAX_BACKOFF_EXPONENT);
 
 /// Lower bound of the remaining-validity cap on the delay between failed orders.
-///
-/// About the refill time of Let's Encrypt's failed-authorization limit. Near expiry, half the
-/// remaining validity takes precedence, see [`max_retry_delay`].
 const MIN_RETRY_DELAY_CAP: Duration = Duration::from_secs(10 * 60);
 
 /// Part of the remaining validity that caps the delay between failed orders.
@@ -76,9 +70,7 @@ fn sleep_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration
 
 /// Returns when to renew a certificate valid from `not_before` to `not_after`.
 ///
-/// Renews at two thirds of the lifetime, or at half for lifetimes under [`SHORT_LIFETIME`], like
-/// certbot, lego and Let's Encrypt's renewal information. A 6-day certificate thus has 3 days
-/// left to renew.
+/// At two thirds of the lifetime, or at half for lifetimes under [`SHORT_LIFETIME`], like certbot.
 fn renewal_time(not_before: OffsetDateTime, not_after: OffsetDateTime) -> OffsetDateTime {
     let lifetime = not_after - not_before;
     if lifetime < SHORT_LIFETIME {
@@ -90,10 +82,8 @@ fn renewal_time(not_before: OffsetDateTime, not_after: OffsetDateTime) -> Offset
 
 /// Returns the longest delay between failed orders for a certificate that expires at `expiry`.
 ///
-/// Without a certificate, [`MAX_RETRY_DELAY`]. With one, a tenth of the remaining validity, at
-/// least [`MIN_RETRY_DELAY_CAP`] and at most [`MAX_RETRY_DELAY`], so short-lived certificates
-/// retry often enough. Near expiry, at most half the remaining validity, so a retry still happens
-/// before the certificate expires. Once it expired, [`MIN_RETRY_DELAY_CAP`].
+/// A tenth of the remaining validity, within [`MIN_RETRY_DELAY_CAP`] and [`MAX_RETRY_DELAY`], and
+/// at most half of it, so a retry comes before the expiry.
 fn max_retry_delay(expiry: Option<OffsetDateTime>, now: OffsetDateTime) -> Duration {
     let Some(expiry) = expiry else {
         return MAX_RETRY_DELAY;
@@ -172,7 +162,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     backoff_cnt: u32,
     wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
-    /// When to retry after a failed order.
+    /// When to retry after a failed order, on the wall clock like the renewal.
     retry_at: Option<OffsetDateTime>,
     /// Expiry of the deployed certificate.
     cert_expiry: Option<OffsetDateTime>,
@@ -225,8 +215,6 @@ pub enum EventError<EC: Debug, EA: Debug> {
     #[error("order: {0}")]
     Order(OrderError),
     /// The newly issued certificate is unusable, so the deployed one stays.
-    ///
-    /// The order is retried after a backoff.
     #[error("new cert parse: {0}")]
     NewCertParse(CertParseError),
 }
@@ -255,9 +243,7 @@ pub enum OrderError {
     /// The configured identifiers can't be ordered, or an authorization names an invalid one.
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(#[from] InvalidIdentifier),
-    /// The CA did not confirm the configured profile in the order it created.
-    ///
-    /// See [`AcmeConfig::profile`]. The order is not finalized.
+    /// The CA didn't confirm the profile of [`AcmeConfig::profile`] in the order it created.
     #[error("the CA selected profile {selected:?} instead of {requested:?}")]
     ProfileMismatch {
         /// The configured profile.
@@ -379,8 +365,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     pub fn new(config: AcmeConfig<EC, EA>) -> Self {
         let config = Arc::new(config);
         let identifiers = config.validated_identifiers().map(Arc::new);
-        // A config that can't order serves no cached certificate either, so its error shows at
-        // once rather than at the first renewal.
+        // A config that can't order serves no cached certificate either.
         let load_cert = identifiers.as_ref().ok().map(|identifiers| {
             let (config, identifiers) = (config.clone(), identifiers.clone());
             Box::pin(async move {
@@ -537,9 +522,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     ) -> Result<Vec<u8>, OrderError> {
         let has_ip = identifiers.iter().any(|id| matches!(id, Identifier::Ip(_)));
         if has_ip && config.profile.is_none() && config.is_lets_encrypt() {
-            warn!(
-                "ordering IP identifiers without a profile, Let's Encrypt issues IP certificates only under the `shortlived` profile"
-            );
+            warn!("Let's Encrypt issues IP certificates only under the `shortlived` profile");
         }
         let mut params = CertificateParams::default();
         params.subject_alt_names = identifiers
@@ -668,8 +651,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Err(OrderError::TooManyAttemptsAuth(identifier.to_string()))
     }
     /// Delays the next order with an exponential backoff, capped by [`max_retry_delay`].
-    ///
-    /// The retry is due on the wall clock, like the renewal, so suspend doesn't delay it.
     fn back_off(&mut self) {
         let now = OffsetDateTime::now_utc();
         let cap = max_retry_delay(self.cert_expiry, now);

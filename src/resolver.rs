@@ -32,9 +32,6 @@ impl ResolvesServerCertAcme {
         self.inner.lock().expect("poisoned").cert = Some(cert);
     }
     /// Serves `cert` to tls-alpn-01 validation requests for `identifier`.
-    ///
-    /// The key is stored under the SNI the CA sends for the identifier, see
-    /// [`Identifier::tls_alpn_01_server_name`].
     pub(crate) fn set_auth_key(&self, identifier: &Identifier, cert: Arc<CertifiedKey>) {
         let server_name = identifier.tls_alpn_01_server_name();
         self.inner
@@ -72,10 +69,7 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
     }
 }
 
-/// Returns the received SNI `server_name` without a trailing dot.
-///
-/// rustls lowercases the SNI it receives but keeps a trailing dot, which a CA may send. The
-/// result matches [`Identifier::tls_alpn_01_server_name`].
+/// Returns the received SNI `server_name` without the trailing dot that rustls keeps.
 fn challenge_server_name(server_name: &str) -> &str {
     server_name.strip_suffix('.').unwrap_or(server_name)
 }

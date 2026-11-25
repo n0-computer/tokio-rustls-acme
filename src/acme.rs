@@ -141,10 +141,7 @@ impl Account {
         debug!(?body, "response");
         Ok((location, body))
     }
-    /// Creates a new order for `identifiers`.
-    ///
-    /// If `profile` is set, it is sent as the order's certificate profile (see
-    /// [`AcmeConfig::profile`](crate::AcmeConfig::profile)).
+    /// Creates a new order for `identifiers`, with the certificate profile `profile` if set.
     pub(crate) async fn new_order(
         &self,
         client_config: &Arc<ClientConfig>,
@@ -398,11 +395,6 @@ pub enum AuthStatus {
 }
 
 /// An ACME identifier (RFC 8555 section 9.7.7, RFC 8738 for IP addresses).
-///
-/// Parsing a string with [`str::parse`] yields [`Identifier::Ip`] for an IP address and
-/// [`Identifier::Dns`] for a valid DNS name, and rejects everything else, see the [`FromStr`]
-/// impl. IP addresses serialize in their canonical text form (RFC 5952 for IPv6), as RFC 8738
-/// section 3 requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 #[non_exhaustive]
@@ -422,10 +414,7 @@ impl From<IpAddr> for Identifier {
 impl FromStr for Identifier {
     type Err = InvalidIdentifier;
 
-    /// Parses `s` as an IP address, or else as a DNS name, and validates it.
-    ///
-    /// See [`Identifier::validated`] for the rules. Zone IDs such as `fe80::1%eth0` and
-    /// zero-padded IPv4 such as `010.0.0.1` are not IP addresses, and fail as DNS names.
+    /// Parses `s` as an IP address, or else as a DNS name, see [`Identifier::validated`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.parse::<IpAddr>() {
             Ok(ip) => Identifier::Ip(ip),
@@ -442,10 +431,7 @@ pub enum InvalidIdentifier {
     /// The config has no identifiers.
     #[error("no identifiers to order")]
     NoIdentifiers,
-    /// Two identifiers of the order share the challenge name that the CA sends as SNI.
-    ///
-    /// An IP address and its reverse-DNS name, like `192.0.2.1` and `1.2.0.192.in-addr.arpa`,
-    /// need different challenge certificates for the same SNI, so one order can't hold both.
+    /// Two identifiers share a challenge SNI, like `192.0.2.1` and `1.2.0.192.in-addr.arpa`.
     #[error("two identifiers share the challenge name {0:?}")]
     ChallengeNameConflict(String),
     /// The string is neither an IP address nor a valid DNS name.
@@ -477,10 +463,8 @@ impl fmt::Display for Identifier {
 impl Identifier {
     /// Returns the identifier normalized for an order, or why it can't be ordered.
     ///
-    /// DNS names are lowercased and lose one trailing dot. They must be ASCII (internationalized
-    /// names in their punycode form), not wildcards, and valid DNS names to rustls, which rejects
-    /// names that look like IP addresses and accepts underscores for private CAs. IP addresses
-    /// must not be unspecified or IPv4-mapped IPv6.
+    /// DNS names are lowercased, lose one trailing dot, and must be valid ASCII names without a
+    /// wildcard. IP addresses must not be unspecified or IPv4-mapped.
     pub fn validated(self) -> Result<Self, InvalidIdentifier> {
         match self {
             Identifier::Ip(ip) => match ip {
@@ -531,12 +515,7 @@ impl Identifier {
             Identifier::Ip(ip) => SanType::IpAddress(*ip),
         })
     }
-    /// Returns the SNI an ACME server sends when validating this identifier with tls-alpn-01.
-    ///
-    /// For DNS identifiers this is the name itself (RFC 8737 section 3). SNI cannot carry IP
-    /// addresses, so for IP identifiers it is the reverse-DNS name (RFC 8738 section 6), e.g.
-    /// `1.2.0.192.in-addr.arpa` for `192.0.2.1`. The resolver matches it against the received
-    /// SNI, which rustls lowercases and the resolver strips of a trailing dot.
+    /// Returns the SNI the CA sends to validate this identifier, see RFC 8738 section 6 for IPs.
     pub(crate) fn tls_alpn_01_server_name(&self) -> String {
         match self {
             Identifier::Dns(name) => name.to_ascii_lowercase(),
@@ -578,8 +557,7 @@ pub(crate) struct CreatedOrder {
 impl CreatedOrder {
     /// Parses the `newOrder` response `body` of the order at `url`.
     ///
-    /// A `profile` that is not a string counts as none, so a malformed optional field can't fail
-    /// orders that request no profile.
+    /// A `profile` that is not a string counts as none.
     fn from_response(url: String, body: &str) -> Result<Self, AcmeError> {
         let value: serde_json::Value = serde_json::from_str(body).map_err(json_err)?;
         let profile = value
