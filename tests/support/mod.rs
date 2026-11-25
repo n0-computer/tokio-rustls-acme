@@ -413,6 +413,8 @@ pub(crate) struct MockAcmeState {
     pub deactivated_key: Option<[u8; 65]>,
     /// Answers the next finalization with `unauthorized`, then resets.
     pub reject_finalize: bool,
+    /// Value of the authorization's identifier, if not the ordered one.
+    pub authz_value: Option<String>,
     /// Number of requests per `"METHOD /path"`.
     pub hits: HashMap<String, usize>,
     /// Arrival times of the requests per `"METHOD /path"`, on the real clock.
@@ -470,6 +472,7 @@ impl MockAcme {
             account_jwk: None,
             deactivated_key: None,
             reject_finalize: false,
+            authz_value: None,
             hits: HashMap::new(),
             arrivals: HashMap::new(),
             jws_violations: Vec::new(),
@@ -591,7 +594,10 @@ fn handle_acme(
             200,
             &json!({
                 "status": state.authz_status,
-                "identifier": {"type": "dns", "value": state.domain},
+                "identifier": {
+                    "type": "dns",
+                    "value": state.authz_value.as_ref().unwrap_or(&state.domain),
+                },
                 "challenges": [{
                     "type": "tls-alpn-01",
                     "url": format!("{base}/chall/1"),

@@ -55,9 +55,12 @@ impl Drop for PendingChallenge {
 }
 
 /// Starts an order for [`DOMAIN`] and returns once the client triggered the challenge.
-async fn pending_challenge() -> PendingChallenge {
+///
+/// The authorization names the identifier `authz_value`, or [`DOMAIN`] if it is `None`.
+async fn pending_challenge(authz_value: Option<&str>) -> PendingChallenge {
     let mock = MockAcme::start().await;
     mock.state().authz_status = "pending";
+    mock.state().authz_value = authz_value.map(str::to_owned);
     let mut state = AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
         .directory(&mock.directory_url)
         .state();
@@ -172,42 +175,45 @@ fn expected_acme_identifier(mock: &MockAcme) -> Vec<u8> {
 
 #[tokio::test]
 async fn tls_alpn_01_response_conforms_to_rfc_8737() {
-    let challenge = pending_challenge().await;
+    // A CA may spell the identifier of the authorization otherwise.
+    for authz_value in [None, Some("Invariants.Example.COM.")] {
+        let challenge = pending_challenge(authz_value).await;
 
-    let result = handshake(&challenge, DOMAIN, &[ACME_TLS_ALPN], None).await;
+        let result = handshake(&challenge, DOMAIN, &[ACME_TLS_ALPN], None).await;
 
-    assert!(
-        result.handled_as_validation,
-        "the acceptor must end a validation handshake itself"
-    );
-    let (leaf, alpn) = result.client.expect("validation handshake completes");
-    assert_eq!(alpn.as_deref(), Some(ACME_TLS_ALPN));
+        assert!(
+            result.handled_as_validation,
+            "the acceptor must end a validation handshake itself, {authz_value:?}"
+        );
+        let (leaf, alpn) = result.client.expect("validation handshake completes");
+        assert_eq!(alpn.as_deref(), Some(ACME_TLS_ALPN));
 
-    let (_, cert) = X509Certificate::from_der(&leaf).unwrap();
-    assert_eq!(cert.subject(), cert.issuer(), "must be self-issued");
-    cert.verify_signature(None)
-        .expect("must be signed with its own public key");
-    let san = cert.subject_alternative_name().unwrap().expect("has a SAN");
-    assert!(
-        matches!(san.value.general_names.as_slice(), [GeneralName::DNSName(name)] if *name == DOMAIN),
-        "the SAN must hold the validated domain and nothing else: {:?}",
-        san.value.general_names
-    );
-    let oid = Oid::from(ACME_IDENTIFIER_OID).unwrap();
-    let extension = cert
-        .get_extension_unique(&oid)
-        .unwrap()
-        .expect("has an acmeIdentifier extension");
-    assert!(extension.critical, "acmeIdentifier must be critical");
-    // The extension value is a DER OCTET STRING with the 32-byte digest.
-    let mut expected = vec![0x04, 0x20];
-    expected.extend(expected_acme_identifier(&challenge.mock));
-    assert_eq!(extension.value, expected);
+        let (_, cert) = X509Certificate::from_der(&leaf).unwrap();
+        assert_eq!(cert.subject(), cert.issuer(), "must be self-issued");
+        cert.verify_signature(None)
+            .expect("must be signed with its own public key");
+        let san = cert.subject_alternative_name().unwrap().expect("has a SAN");
+        let names = &san.value.general_names;
+        assert!(
+            matches!(names.as_slice(), [GeneralName::DNSName(name)] if *name == DOMAIN),
+            "the SAN must hold the validated domain and nothing else: {names:?}",
+        );
+        let oid = Oid::from(ACME_IDENTIFIER_OID).unwrap();
+        let extension = cert
+            .get_extension_unique(&oid)
+            .unwrap()
+            .expect("has an acmeIdentifier extension");
+        assert!(extension.critical, "acmeIdentifier must be critical");
+        // The extension value is a DER OCTET STRING with the 32-byte digest.
+        let mut expected = vec![0x04, 0x20];
+        expected.extend(expected_acme_identifier(&challenge.mock));
+        assert_eq!(extension.value, expected);
+    }
 }
 
 #[tokio::test]
 async fn challenge_certificate_requires_exact_acme_alpn_and_matching_sni() {
-    let challenge = pending_challenge().await;
+    let challenge = pending_challenge(None).await;
 
     let cases: [(&str, &[&[u8]]); 4] = [
         (DOMAIN, &[]),
@@ -227,7 +233,7 @@ async fn challenge_certificate_requires_exact_acme_alpn_and_matching_sni() {
 
 #[tokio::test]
 async fn validated_order_follows_jws_rules_and_deploys_own_key() {
-    let mut challenge = pending_challenge().await;
+    let mut challenge = pending_challenge(None).await;
     challenge.mock.state().authz_status = "valid";
 
     tokio::time::timeout(LIMIT, async {

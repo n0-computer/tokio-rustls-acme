@@ -229,7 +229,7 @@ pub enum OrderError {
     /// The authorization for the given domain was still pending after the last check.
     #[error("authorization for {0} failed too many times")]
     TooManyAttemptsAuth(String),
-    /// A configured identifier is not a valid IP address or DNS name.
+    /// The configured identifiers can't be ordered, or an authorization names an invalid one.
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(#[from] InvalidIdentifier),
     /// The CA did not confirm the configured profile in the order it created.
@@ -600,7 +600,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let auth = account.auth(&config.client_config, url).await?;
         let (identifier, challenge_url) = match auth.status {
             AuthStatus::Pending => {
-                let identifier = auth.identifier;
+                // A CA may spell it otherwise, like `Example.COM.`, which would miss the SNI.
+                let identifier = auth.identifier.validated()?;
                 info!(%identifier, "trigger challenge");
                 let (challenge, auth_key) =
                     account.tls_alpn_01(config.crypto_provider(), &auth.challenges, &identifier)?;
