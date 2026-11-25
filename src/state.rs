@@ -38,12 +38,16 @@ const MAX_STALLED_ROUNDS: u32 = 10;
 /// Lifetime under which certificates renew at half their lifetime instead of two thirds.
 const SHORT_LIFETIME: TimeDuration = TimeDuration::days(10);
 
-/// Longest delay between failed orders.
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+/// Largest exponent of the backoff between failed orders, which doubles [`BACKOFF_BASE_DELAY`].
+const MAX_BACKOFF_EXPONENT: u32 = 16;
 
-/// Lower bound of the cap on the delay between failed orders while a certificate is deployed.
+/// Longest delay between failed orders, which the backoff reaches at [`MAX_BACKOFF_EXPONENT`].
+const MAX_RETRY_DELAY: Duration = BACKOFF_BASE_DELAY.saturating_mul(1 << MAX_BACKOFF_EXPONENT);
+
+/// Lower bound of the remaining-validity cap on the delay between failed orders.
 ///
-/// About the refill time of Let's Encrypt's failed-authorization limit.
+/// About the refill time of Let's Encrypt's failed-authorization limit. Near expiry, half the
+/// remaining validity takes precedence, see [`max_retry_delay`].
 const MIN_RETRY_DELAY_CAP: Duration = Duration::from_secs(10 * 60);
 
 /// Part of the remaining validity that caps the delay between failed orders.
@@ -82,14 +86,20 @@ fn renewal_time(not_before: OffsetDateTime, not_after: OffsetDateTime) -> Offset
 
 /// Returns the longest delay between failed orders for a certificate that expires at `expiry`.
 ///
-/// A tenth of the remaining validity, at least [`MIN_RETRY_DELAY_CAP`] and at most
-/// [`MAX_RETRY_DELAY`], so short-lived certificates retry often enough before they expire.
+/// Without a certificate, [`MAX_RETRY_DELAY`]. With one, a tenth of the remaining validity, at
+/// least [`MIN_RETRY_DELAY_CAP`] and at most [`MAX_RETRY_DELAY`], so short-lived certificates
+/// retry often enough. Near expiry, at most half the remaining validity, so a retry still happens
+/// before the certificate expires. Once it expired, [`MIN_RETRY_DELAY_CAP`].
 fn max_retry_delay(expiry: Option<OffsetDateTime>, now: OffsetDateTime) -> Duration {
     let Some(expiry) = expiry else {
         return MAX_RETRY_DELAY;
     };
-    let left = time_until(expiry, now).unwrap_or_default();
-    (left / RETRY_DELAY_VALIDITY_DIVISOR).clamp(MIN_RETRY_DELAY_CAP, MAX_RETRY_DELAY)
+    let Some(left) = time_until(expiry, now) else {
+        return MIN_RETRY_DELAY_CAP;
+    };
+    (left / RETRY_DELAY_VALIDITY_DIVISOR)
+        .clamp(MIN_RETRY_DELAY_CAP, MAX_RETRY_DELAY)
+        .min((left / 2).max(BACKOFF_BASE_DELAY))
 }
 
 /// Returns the delay after stalled order round `round`, or `None` once the order should fail.
@@ -121,7 +131,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
     order: Option<BoxFuture<Result<Vec<u8>, OrderFailure>>>,
-    backoff_cnt: usize,
+    backoff_cnt: u32,
     wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
     /// Expiry of the deployed certificate.
@@ -603,7 +613,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         self.wait = Some(after(
             (BACKOFF_BASE_DELAY * (1 << self.backoff_cnt)).min(cap),
         ));
-        self.backoff_cnt = (self.backoff_cnt + 1).min(16);
+        self.backoff_cnt = (self.backoff_cnt + 1).min(MAX_BACKOFF_EXPONENT);
     }
     fn poll_next_infinite(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Event<EC, EA>> {
         loop {
@@ -798,6 +808,7 @@ mod tests {
 
     #[test]
     fn max_retry_delay_follows_the_remaining_validity() {
+        const MINUTE: TimeDuration = TimeDuration::minutes(1);
         const HOUR: TimeDuration = TimeDuration::hours(1);
         let now = OffsetDateTime::UNIX_EPOCH;
         let cases = [
@@ -805,6 +816,12 @@ mod tests {
             (Some(now + 80 * HOUR), Duration::from_secs(8 * 60 * 60)),
             (Some(now + 30 * 24 * HOUR), MAX_RETRY_DELAY),
             (Some(now + HOUR), MIN_RETRY_DELAY_CAP),
+            // Half the remaining validity, so a retry happens before expiry.
+            (Some(now + 4 * MINUTE), Duration::from_secs(2 * 60)),
+            (
+                Some(now + TimeDuration::milliseconds(100)),
+                BACKOFF_BASE_DELAY,
+            ),
             (Some(now - HOUR), MIN_RETRY_DELAY_CAP),
         ];
         for (expiry, expected) in cases {
