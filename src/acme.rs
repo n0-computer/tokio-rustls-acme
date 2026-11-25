@@ -498,10 +498,8 @@ impl Identifier {
     /// Returns whether the subject alternative name `name` certifies this identifier.
     pub(crate) fn is_certified_by(&self, name: &GeneralName<'_>) -> bool {
         match (self, name) {
-            (Identifier::Dns(dns), GeneralName::DNSName(name)) => name
-                .strip_suffix('.')
-                .unwrap_or(name)
-                .eq_ignore_ascii_case(dns),
+            // webpki rejects a SAN with a trailing dot, so it certifies nothing.
+            (Identifier::Dns(dns), GeneralName::DNSName(name)) => name.eq_ignore_ascii_case(dns),
             (Identifier::Ip(IpAddr::V4(ip)), GeneralName::IPAddress(octets)) => {
                 *octets == ip.octets()
             }
@@ -790,7 +788,8 @@ mod tests {
         let v4 = [192, 0, 2, 1];
         let v6 = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
         let cases = [
-            ("example.com", GeneralName::DNSName("Example.COM."), true),
+            ("example.com", GeneralName::DNSName("Example.COM"), true),
+            ("example.com", GeneralName::DNSName("example.com."), false),
             (
                 "example.com",
                 GeneralName::DNSName("www.example.com"),
