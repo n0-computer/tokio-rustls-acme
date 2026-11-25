@@ -52,6 +52,8 @@
 //! well as accepting TLS connections, which are handed over to the caller on success.
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "tls-webpki-roots")]
+//! # {
 //! use std::io;
 //! use std::time::Duration;
 //! use tokio::io::AsyncWriteExt;
@@ -107,6 +109,7 @@
 //! Content-Type: text/plain; charset=utf-8
 //!
 //! Hello Tls!"#;
+//! # }
 //! ```
 //!
 //! `examples/high_level.rs` implements a "Hello Tls!" server similar to the one above, which accepts
@@ -128,8 +131,12 @@
 //! certificate profile, so set it with [`AcmeConfig::profile`]:
 //!
 //! ```rust
-//! # use tokio_rustls_acme::AcmeConfig;
+//! # #[cfg(feature = "tls-webpki-roots")]
+//! # {
+//! use tokio_rustls_acme::AcmeConfig;
+//!
 //! let config = AcmeConfig::new(["192.0.2.1", "2001:db8::1"]).profile("shortlived");
+//! # }
 //! ```
 //!
 //! ## Low-level Rustls API
