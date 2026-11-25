@@ -439,12 +439,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 return Err(EventError::CertCacheStore(err));
             }
             // The primary is stored, so a failed alternate store only costs the
-            // alternate until the next order.
-            if let Some(alternate) = &alternate
-                && let Err(err) = config
-                    .cache
-                    .store_alt_cert(&config.domains, &config.directory_url, alternate)
-                    .await
+            // alternate until the next order. Without an alternate, this removes
+            // one stored for an earlier certificate.
+            if let Err(err) = config
+                .cache
+                .store_alt_cert(&config.domains, &config.directory_url, alternate.as_deref())
+                .await
             {
                 warn!(?err, "failed to store the alternate cert chain");
             }
@@ -524,7 +524,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
 
                         // Use a single chain: prefer an alternate matching `issuer`,
                         // fall back to the default if not found.
-                        CertChainPreference::PreferredChain(issuer) => {
+                        CertChainPreference::PreferredChain(root) => {
+                            let issuer = root.common_name();
                             let default_matches =
                                 chain_root_issuer(&cert_response.pem).as_deref() == Some(issuer);
                             let pem = if default_matches {
@@ -546,7 +547,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         // Serve two chains: the default as primary, and an alternate
                         // matching `issuer` for clients whose signature schemes differ.
                         // If the default chain already matches, there is nothing to add.
-                        CertChainPreference::DualChain(issuer) => {
+                        CertChainPreference::DualChain(root) => {
+                            let issuer = root.common_name();
                             let default_matches =
                                 chain_root_issuer(&cert_response.pem).as_deref() == Some(issuer);
                             let alternate = if default_matches {

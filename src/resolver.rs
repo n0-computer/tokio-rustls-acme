@@ -78,6 +78,10 @@ impl ResolvesServerCertAcme {
         inner.alt_cert = alternate;
         installed
     }
+    /// Returns whether an alternate chain is set, which DualChain serves to some clients.
+    pub fn serves_alternate_chain(&self) -> bool {
+        self.inner.lock().expect("poisoned").alt_cert.is_some()
+    }
     pub(crate) fn set_auth_key(&self, domain: String, cert: Arc<CertifiedKey>) {
         self.inner
             .lock()

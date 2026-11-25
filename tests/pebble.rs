@@ -634,7 +634,7 @@ async fn test_preferred_chain() {
     let alt_root_cn = fetch_root_cn(1).await;
 
     let config =
-        pebble_config(&[domain]).cert_chain(CertChainPreference::PreferredChain(alt_root_cn));
+        pebble_config(&[domain]).cert_chain(CertChainPreference::preferred_chain(alt_root_cn));
     let mut site = Site::bind(config, &[addr]).await;
     site.deploy().await.expect("order failed");
 
@@ -643,6 +643,10 @@ async fn test_preferred_chain() {
         chain.last(),
         Some(&fetch_intermediate(1).await),
         "should serve the alternate chain"
+    );
+    assert!(
+        !site.state.resolver().serves_alternate_chain(),
+        "PreferredChain serves one chain"
     );
 }
 
@@ -657,7 +661,7 @@ async fn test_dual_chain() {
     set_dns_record(domain, addr).await;
     let alt_root_cn = fetch_root_cn(1).await;
 
-    let config = pebble_config(&[domain]).cert_chain(CertChainPreference::DualChain(alt_root_cn));
+    let config = pebble_config(&[domain]).cert_chain(CertChainPreference::dual_chain(alt_root_cn));
     let mut site = Site::bind(config, &[addr]).await;
     site.deploy().await.expect("order failed");
 
@@ -667,9 +671,13 @@ async fn test_dual_chain() {
         Some(&fetch_intermediate(0).await),
         "a client that verifies the default chain should get it"
     );
+    assert!(
+        site.state.resolver().serves_alternate_chain(),
+        "DualChain should install the alternate chain"
+    );
 }
 
-/// A PreferredChain that no offered chain matches falls back to the default.
+/// Falls back to the default chain when no offered chain matches the PreferredChain root.
 #[tokio::test]
 #[ignore]
 async fn test_preferred_chain_falls_back_to_default() {
@@ -679,8 +687,8 @@ async fn test_preferred_chain_falls_back_to_default() {
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 12));
     set_dns_record(domain, addr).await;
 
-    let config = pebble_config(&[domain])
-        .cert_chain(CertChainPreference::PreferredChain("No Such Root".into()));
+    let config =
+        pebble_config(&[domain]).cert_chain(CertChainPreference::preferred_chain("No Such Root"));
     let mut site = Site::bind(config, &[addr]).await;
     site.deploy().await.expect("order failed");
 
@@ -708,7 +716,7 @@ async fn test_dual_chain_cache() {
     let (site, events) = acquire_cert_with_cache(
         domain,
         addr,
-        CertChainPreference::DualChain(alt_root_cn.clone()),
+        CertChainPreference::dual_chain(alt_root_cn.clone()),
         DirCache::new(cache_path.clone()),
     )
     .await;
@@ -716,6 +724,7 @@ async fn test_dual_chain_cache() {
         events.deployed_new && events.cert_cache_store,
         "first run should issue and store a cert, got {events:?}"
     );
+    assert!(site.state.resolver().serves_alternate_chain());
     site.close().await;
 
     let alt_file = std::fs::read_dir(&cache_path)
@@ -735,16 +744,20 @@ async fn test_dual_chain_cache() {
         "the alternate cache file should hold the alternate chain"
     );
 
-    let (_site, events) = acquire_cert_with_cache(
+    let (site, events) = acquire_cert_with_cache(
         domain,
         addr,
-        CertChainPreference::DualChain(alt_root_cn),
+        CertChainPreference::dual_chain(alt_root_cn),
         DirCache::new(cache_path),
     )
     .await;
     assert!(
         events.deployed_cached && !events.deployed_new,
         "second run should deploy the cached cert, got {events:?}"
+    );
+    assert!(
+        site.state.resolver().serves_alternate_chain(),
+        "the reload should install the cached alternate chain"
     );
     let chain = fetch_chain_for(addr, domain).await;
     assert_eq!(chain.last(), Some(&fetch_intermediate(0).await));

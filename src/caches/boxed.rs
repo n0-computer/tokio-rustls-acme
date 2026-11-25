@@ -66,7 +66,7 @@ where
         &self,
         domains: &[String],
         directory_url: &str,
-        cert: &[u8],
+        cert: Option<&[u8]>,
     ) -> Result<(), Self::EC> {
         self.inner
             .store_alt_cert(domains, directory_url, cert)

@@ -31,6 +31,12 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             },
         }
     }
+    async fn remove_if_exist(&self, file: impl AsRef<Path>) -> Result<(), std::io::Error> {
+        match fs::remove_file(self.inner.as_ref().join(file)).await {
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
     async fn write(
         &self,
         file: impl AsRef<Path>,
@@ -95,10 +101,13 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         &self,
         domains: &[String],
         directory_url: &str,
-        cert: &[u8],
+        cert: Option<&[u8]>,
     ) -> Result<(), Self::EC> {
         let file_name = Self::cached_cert_file_name(domains, directory_url) + ALT_CERT_SUFFIX;
-        self.write(file_name, cert).await
+        match cert {
+            Some(cert) => self.write(file_name, cert).await,
+            None => self.remove_if_exist(file_name).await,
+        }
     }
 }
 
@@ -122,5 +131,41 @@ impl<P: AsRef<Path> + Send + Sync> AccountCache for DirCache<P> {
     ) -> Result<(), Self::EA> {
         let file_name = Self::cached_account_file_name(contact, directory_url);
         self.write(file_name, account).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DOMAINS: &[&str] = &["example.com"];
+    const DIRECTORY_URL: &str = "https://acme.example/dir";
+
+    #[tokio::test]
+    async fn store_alt_cert_none_removes_the_alternate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DirCache::new(dir.path());
+        let domains: Vec<String> = DOMAINS.iter().map(|d| d.to_string()).collect();
+        cache
+            .store_alt_cert(&domains, DIRECTORY_URL, Some(b"alt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.load_alt_cert(&domains, DIRECTORY_URL).await.unwrap(),
+            Some(b"alt".to_vec())
+        );
+        cache
+            .store_alt_cert(&domains, DIRECTORY_URL, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.load_alt_cert(&domains, DIRECTORY_URL).await.unwrap(),
+            None
+        );
+        // Removing again finds nothing to remove, which is fine.
+        cache
+            .store_alt_cert(&domains, DIRECTORY_URL, None)
+            .await
+            .unwrap();
     }
 }

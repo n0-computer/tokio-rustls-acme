@@ -10,7 +10,7 @@ use rustls::DEFAULT_VERSIONS;
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, ServerConfig};
 use std::convert::Infallible;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -51,15 +51,75 @@ pub enum CertChainPreference {
     /// Serves the chain whose root issuer common name is the given string.
     ///
     /// Falls back to the default chain if no chain matches, or if fetching the alternates fails.
-    PreferredChain(String),
+    PreferredChain(ChainRoot),
     /// Serves the default chain, and the chain to the given root to clients that only verify it.
     ///
     /// The root is named by its issuer common name. See the type docs for how the chain is
     /// picked per connection.
-    DualChain(String),
+    DualChain(ChainRoot),
+}
+
+/// The root of a certificate chain, named by its common name, like `ISRG Root X2`.
+///
+/// This is the issuer common name of the chain's topmost certificate, which is the root
+/// even when the chain does not include it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainRoot {
+    common_name: String,
+}
+
+impl ChainRoot {
+    /// Creates a chain root from its common name.
+    pub fn new(common_name: impl Into<String>) -> Self {
+        Self {
+            common_name: common_name.into(),
+        }
+    }
+    /// Returns the common name of the root.
+    pub fn common_name(&self) -> &str {
+        &self.common_name
+    }
+}
+
+impl From<&str> for ChainRoot {
+    fn from(common_name: &str) -> Self {
+        Self::new(common_name)
+    }
+}
+
+impl From<String> for ChainRoot {
+    fn from(common_name: String) -> Self {
+        Self::new(common_name)
+    }
+}
+
+impl fmt::Display for ChainRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.common_name)
+    }
 }
 
 impl CertChainPreference {
+    /// Returns a preference for the chain to `root`.
+    ///
+    /// ```rust
+    /// # use tokio_rustls_acme::{AcmeConfig, CertChainPreference};
+    /// let config = AcmeConfig::new(["example.com"])
+    ///     .cert_chain(CertChainPreference::preferred_chain("ISRG Root X2"));
+    /// ```
+    pub fn preferred_chain(root: impl Into<ChainRoot>) -> Self {
+        Self::PreferredChain(root.into())
+    }
+    /// Returns a preference that also serves the chain to `root` to clients that only verify it.
+    ///
+    /// ```rust
+    /// # use tokio_rustls_acme::{AcmeConfig, CertChainPreference};
+    /// let config = AcmeConfig::new(["example.com"])
+    ///     .cert_chain(CertChainPreference::dual_chain("ISRG Root X2"));
+    /// ```
+    pub fn dual_chain(root: impl Into<ChainRoot>) -> Self {
+        Self::DualChain(root.into())
+    }
     /// Returns a preference for Let's Encrypt's chain to ISRG Root X2, which is ECDSA-only.
     ///
     /// For ECDSA certificates, Let's Encrypt's default chain has its intermediate signed by
@@ -67,14 +127,14 @@ impl CertChainPreference {
     /// newer hierarchies (e.g. the 2026 Root YE for the `tlsserver` and `shortlived`
     /// profiles) may not offer an X2 chain, in which case the default chain is used.
     pub fn letsencrypt_x2() -> Self {
-        Self::PreferredChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
+        Self::preferred_chain(LETSENCRYPT_ISRG_ROOT_X2)
     }
     /// Returns a preference that adds Let's Encrypt's ISRG Root X2 chain for clients without RSA.
     ///
     /// The default chain, with the intermediate signed by ISRG Root X1 (RSA), stays the
     /// primary. Same caveats as [`letsencrypt_x2`](Self::letsencrypt_x2).
     pub fn letsencrypt_dual_chain() -> Self {
-        Self::DualChain(LETSENCRYPT_ISRG_ROOT_X2.to_owned())
+        Self::dual_chain(LETSENCRYPT_ISRG_ROOT_X2)
     }
 }
 

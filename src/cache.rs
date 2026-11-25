@@ -42,12 +42,15 @@ pub trait CertCache: Send + Sync {
         Ok(None)
     }
 
-    /// Stores the alternate certificate chain. See [`CertCache::load_alt_cert`].
+    /// Stores the alternate certificate chain, or removes the stored one if `cert` is `None`.
+    ///
+    /// Every new certificate stores its alternate or removes the old one, so a cached
+    /// alternate always belongs to the cached certificate. See [`CertCache::load_alt_cert`].
     async fn store_alt_cert(
         &self,
         _domains: &[String],
         _directory_url: &str,
-        _cert: &[u8],
+        _cert: Option<&[u8]>,
     ) -> Result<(), Self::EC> {
         Ok(())
     }
