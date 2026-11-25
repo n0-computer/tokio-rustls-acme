@@ -292,6 +292,8 @@ async fn test_default_chain() {
     let peer_certs = fetch_chain_for(&pebble, domain).await;
     eprintln!("default chain: received {} certificates", peer_certs.len());
     assert_needs_intermediates(&pebble, &peer_certs, domain).await;
+    assert_eq!(peer_certs.last(), Some(&pebble.intermediate(0).await));
+    assert!(!site.state.resolver().serves_alternate_chain());
 }
 
 /// Verify that DirCache persists certs and a second run loads from cache.

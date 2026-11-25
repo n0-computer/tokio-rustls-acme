@@ -417,7 +417,7 @@ pub(crate) struct MockAcmeState {
     pub deactivated_key: Option<[u8; 65]>,
     /// Answers the next finalization with `unauthorized`, then resets.
     pub reject_finalize: bool,
-    /// Issues the default chain through the Ed25519 root, with the chain to the CA as alternate.
+    /// Issues the default chain through the Ed25519 root, and links alternates to it and the CA.
     pub alternate_chain: bool,
     /// Number of requests per `"METHOD /path"`.
     pub hits: HashMap<String, usize>,
@@ -629,8 +629,12 @@ fn handle_acme(
         }
         "POST /cert/1" if state.alternate_chain => {
             let leaf = state.issued.as_deref().unwrap_or_default();
-            pem_chain(ca.cross_signed_chain(leaf))
-                .header("link", format!("<{base}/cert/1/alt>;rel=\"alternate\""))
+            let links =
+                format!(r#"<{base}/cert/1/other>;rel="alternate", </cert/1/alt>;rel="alternate""#);
+            pem_chain(ca.cross_signed_chain(leaf)).header("link", links)
+        }
+        "POST /cert/1/other" => {
+            pem_chain(ca.cross_signed_chain(state.issued.as_deref().unwrap_or_default()))
         }
         "POST /cert/1" | "POST /cert/1/alt" => {
             pem_chain(ca.chain(state.issued.as_deref().unwrap_or_default()))
@@ -640,7 +644,13 @@ fn handle_acme(
 }
 
 /// Paths that must receive a POST-as-GET request, RFC 8555 section 6.3.
-const POST_AS_GET: [&str; 4] = ["/authz/1", "/order/1", "/cert/1", "/cert/1/alt"];
+const POST_AS_GET: [&str; 5] = [
+    "/authz/1",
+    "/order/1",
+    "/cert/1",
+    "/cert/1/other",
+    "/cert/1/alt",
+];
 
 /// Returns a certificate chain response with `chain`.
 fn pem_chain(chain: String) -> Response {
