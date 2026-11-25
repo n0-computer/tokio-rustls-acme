@@ -272,8 +272,6 @@ fn signature_alg_id(cert: &X509Certificate<'_>) -> Option<AlgorithmIdentifier> {
         alg_id::RSA_PKCS1_SHA512
     } else if *oid == OID_SIG_ED25519 {
         alg_id::ED25519
-    } else if *oid == OID_SIG_ED448 {
-        alg_id::ED448
     } else if *oid == OID_PKCS1_RSASSAPSS {
         match pss_scheme(&RsaSsaPssParams::try_from(algorithm.parameters()?).ok()?)? {
             SignatureScheme::RSA_PSS_SHA256 => alg_id::RSA_PSS_SHA256,
@@ -293,8 +291,6 @@ fn public_key_alg_id(cert: &X509Certificate<'_>) -> Option<AlgorithmIdentifier> 
         Some(alg_id::RSA_ENCRYPTION)
     } else if *oid == OID_SIG_ED25519 {
         Some(alg_id::ED25519)
-    } else if *oid == OID_SIG_ED448 {
-        Some(alg_id::ED448)
     } else if *oid == OID_KEY_TYPE_EC_PUBLIC_KEY {
         let curve = algorithm.parameters()?.as_oid().ok()?;
         if curve == OID_EC_P256 {
