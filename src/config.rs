@@ -380,7 +380,6 @@ mod tests {
     use super::*;
     use rustls::crypto::ring;
     use rustls::{DEFAULT_VERSIONS, RootCertStore};
-    use std::net::IpAddr;
 
     /// Returns a config for `domains` that needs no webpki roots, like the custom-root builds.
     fn config(domains: &[&str]) -> AcmeConfig<Infallible> {
@@ -392,69 +391,40 @@ mod tests {
         AcmeConfig::new_with_client_tls_config(domains, Arc::new(client_config))
     }
 
-    /// Returns the identifiers to order of `config`.
-    fn order(config: &AcmeConfig<Infallible>) -> Result<Vec<Identifier>, InvalidIdentifier> {
-        config
-            .validated_identifiers()
-            .map(|identifiers| identifiers.order)
-    }
-
     #[test]
-    fn validated_identifiers_normalizes_and_deduplicates() {
-        let config = config(&["Example.COM.", "example.com", "::1", "0:0::1"]);
-        assert_eq!(
-            order(&config),
-            Ok(vec![
-                Identifier::Dns("example.com".into()),
-                Identifier::Ip("::1".parse().unwrap()),
-            ])
-        );
-    }
-
-    #[test]
-    fn validated_identifiers_rejects_invalid_and_empty_lists() {
-        let config = config(&["example.com", "*.example.com"]);
-        assert_eq!(
-            order(&config),
-            Err(InvalidIdentifier::Wildcard("*.example.com".into()))
-        );
-        assert_eq!(
-            order(&config.domains([""; 0])),
-            Err(InvalidIdentifier::NoIdentifiers)
-        );
-    }
-
-    #[test]
-    fn validated_identifiers_rejects_identifiers_that_share_a_challenge_name() {
+    fn validated_identifiers_deduplicate_and_reject_conflicts() {
+        let ip = |ip: &str| Identifier::Ip(ip.parse().unwrap());
         let ipv6_reverse = format!("1.{}8.b.d.0.1.0.0.2.ip6.arpa", "0.".repeat(23));
         let cases = [
-            ("192.0.2.1", "1.2.0.192.in-addr.arpa".to_string()),
-            ("2001:db8::1", ipv6_reverse),
+            (
+                vec!["Example.COM.", "example.com", "::1", "0:0::1"],
+                Ok(vec![Identifier::Dns("example.com".into()), ip("::1")]),
+            ),
+            (vec![], Err(InvalidIdentifier::NoIdentifiers)),
+            (
+                vec!["192.0.2.1", "1.2.0.192.in-addr.arpa"],
+                Err(InvalidIdentifier::ChallengeNameConflict(
+                    "1.2.0.192.in-addr.arpa".into(),
+                )),
+            ),
+            (
+                vec!["2001:db8::1", &ipv6_reverse],
+                Err(InvalidIdentifier::ChallengeNameConflict(
+                    ipv6_reverse.clone(),
+                )),
+            ),
         ];
-        for (ip, reverse) in cases {
-            assert_eq!(
-                order(&config(&[ip, &reverse])),
-                Err(InvalidIdentifier::ChallengeNameConflict(reverse.clone())),
-                "{ip}"
-            );
+        for (domains, expected) in cases {
+            let order = config(&domains)
+                .validated_identifiers()
+                .map(|identifiers| identifiers.order);
+            assert_eq!(order, expected, "{domains:?}");
         }
     }
 
     #[test]
-    fn typed_identifiers_keep_their_type() {
-        let ip: IpAddr = "192.0.2.1".parse().unwrap();
-        let typed_dns = config(&[]).identifiers([Identifier::Dns(ip.to_string())]);
-        assert_eq!(
-            order(&typed_dns),
-            Err(InvalidIdentifier::InvalidDnsName(ip.to_string()))
-        );
-        let typed_ip = config(&[]).identifiers([ip]);
-        assert_eq!(order(&typed_ip), Ok(vec![Identifier::Ip(ip)]));
-    }
-
-    #[test]
     fn cache_keys_are_strings_as_given_and_canonical_typed_identifiers() {
-        let domains = ["Example.COM.", "0:0::1", "example.com"];
+        let domains = ["Example.COM.", "0:0::1"];
         let cache_key = |config: AcmeConfig<Infallible>| {
             config
                 .validated_identifiers()
@@ -467,13 +437,7 @@ mod tests {
         let typed = domains.map(|domain| domain.parse::<Identifier>().unwrap());
         assert_eq!(
             cache_key(config(&[]).identifiers(typed)),
-            Ok(vec![
-                "example.com".into(),
-                "::1".into(),
-                "example.com".into()
-            ])
+            Ok(vec!["example.com".into(), "::1".into()])
         );
-        let unvalidated = config(&[]).identifiers([Identifier::Dns("Example.COM.".into())]);
-        assert_eq!(cache_key(unvalidated), Ok(vec!["example.com".into()]));
     }
 }

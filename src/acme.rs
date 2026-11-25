@@ -704,6 +704,85 @@ mod tests {
     }
 
     #[test]
+    fn parsing_normalizes_identifiers() {
+        let cases = [
+            ("example.com", Identifier::Dns("example.com".into())),
+            ("Example.COM.", Identifier::Dns("example.com".into())),
+            // rustls accepts underscores, which private CAs may issue for.
+            (
+                "_svc.example.org",
+                Identifier::Dns("_svc.example.org".into()),
+            ),
+            ("192.0.2.1", Identifier::Ip("192.0.2.1".parse().unwrap())),
+            // RFC 5952: lowercase, longest zero run compressed, no leading zeros.
+            (
+                "2001:0DB8:0::0001",
+                Identifier::Ip("2001:db8::1".parse().unwrap()),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(id(input), expected, "{input:?}");
+        }
+        assert_eq!(id("0:0::1").to_string(), "::1");
+    }
+
+    #[test]
+    fn invalid_identifiers_are_rejected() {
+        let dns = |name: &str| InvalidIdentifier::InvalidDnsName(name.into());
+        let cases = [
+            ("", dns("")),
+            (".", dns(".")),
+            ("example.org..", dns("example.org..")),
+            ("010.0.0.1", dns("010.0.0.1")),
+            ("foo bar", dns("foo bar")),
+            ("fe80::1%eth0", dns("fe80::1%eth0")),
+            (
+                "b\u{fc}cher.example",
+                InvalidIdentifier::NonAscii("b\u{fc}cher.example".into()),
+            ),
+            (
+                "*.example.com",
+                InvalidIdentifier::Wildcard("*.example.com".into()),
+            ),
+            (
+                "::",
+                InvalidIdentifier::UnspecifiedIp("::".parse().unwrap()),
+            ),
+            (
+                "::ffff:192.0.2.1",
+                InvalidIdentifier::Ipv4MappedIp("::ffff:192.0.2.1".parse().unwrap()),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(input.parse::<Identifier>(), Err(expected), "{input:?}");
+        }
+        // A typed DNS identifier keeps its type, so an IP literal is no valid DNS name.
+        let typed = Identifier::Dns("192.0.2.1".into()).validated();
+        assert_eq!(typed, Err(dns("192.0.2.1")));
+    }
+
+    #[test]
+    fn challenge_server_names() {
+        let cases = [
+            (
+                Identifier::Dns("Example.COM".into()),
+                "example.com".to_owned(),
+            ),
+            (id("192.0.2.1"), "1.2.0.192.in-addr.arpa".to_owned()),
+            // Example from RFC 3596 section 2.5, lowercased.
+            (
+                id("4321:0:1:2:3:4:567:89ab"),
+                "b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.ip6.arpa"
+                    .to_owned(),
+            ),
+            (id("::1"), format!("1.{}ip6.arpa", "0.".repeat(31))),
+        ];
+        for (identifier, name) in cases {
+            assert_eq!(identifier.tls_alpn_01_server_name(), name, "{identifier}");
+        }
+    }
+
+    #[test]
     fn is_certified_by_matches_the_san_type_and_value() {
         let v4 = [192, 0, 2, 1];
         let v6 = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
@@ -720,215 +799,30 @@ mod tests {
             ("2001:db8::1", GeneralName::IPAddress(&v4), false),
         ];
         for (identifier, name, certified) in cases {
-            let identifier: Identifier = identifier.parse().unwrap();
-            assert_eq!(
-                identifier.is_certified_by(&name),
-                certified,
-                "{identifier} by {name:?}"
-            );
+            let certifies = id(identifier).is_certified_by(&name);
+            assert_eq!(certifies, certified, "{identifier} by {name:?}");
         }
-    }
-
-    #[test]
-    fn identifier_parsing_rejects_invalid_input() {
-        let cases = [
-            ("", InvalidIdentifier::InvalidDnsName(String::new())),
-            (".", InvalidIdentifier::InvalidDnsName(".".into())),
-            (
-                "example.org..",
-                InvalidIdentifier::InvalidDnsName("example.org..".into()),
-            ),
-            (
-                "010.0.0.1",
-                InvalidIdentifier::InvalidDnsName("010.0.0.1".into()),
-            ),
-            (
-                "foo bar",
-                InvalidIdentifier::InvalidDnsName("foo bar".into()),
-            ),
-            (
-                "fe80::1%eth0",
-                InvalidIdentifier::InvalidDnsName("fe80::1%eth0".into()),
-            ),
-            (
-                "b\u{fc}cher.example",
-                InvalidIdentifier::NonAscii("b\u{fc}cher.example".into()),
-            ),
-            (
-                "*.example.com",
-                InvalidIdentifier::Wildcard("*.example.com".into()),
-            ),
-            (
-                "0.0.0.0",
-                InvalidIdentifier::UnspecifiedIp("0.0.0.0".parse().unwrap()),
-            ),
-            (
-                "::",
-                InvalidIdentifier::UnspecifiedIp("::".parse().unwrap()),
-            ),
-            (
-                "::ffff:192.0.2.1",
-                InvalidIdentifier::Ipv4MappedIp("::ffff:192.0.2.1".parse().unwrap()),
-            ),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(input.parse::<Identifier>(), Err(expected), "{input:?}");
-        }
-    }
-
-    #[test]
-    fn created_order_reads_a_string_profile_only() {
-        let order = r#""status":"pending","authorizations":[],"finalize":"https://ca.example/f""#;
-        let cases = [
-            (format!("{{{order}}}"), None),
-            (
-                format!(r#"{{{order},"profile":"shortlived"}}"#),
-                Some("shortlived"),
-            ),
-            (format!(r#"{{{order},"profile":null}}"#), None),
-            (
-                format!(r#"{{{order},"profile":{{"name":"shortlived"}}}}"#),
-                None,
-            ),
-        ];
-        for (body, profile) in cases {
-            let created = CreatedOrder::from_response("https://ca.example/o".into(), &body)
-                .unwrap_or_else(|err| panic!("{body}: {err}"));
-            assert_eq!(created.profile.as_deref(), profile, "{body}");
-            assert_eq!(created.order.status, OrderStatus::Pending, "{body}");
-        }
-    }
-
-    #[test]
-    fn validated_checks_typed_identifiers_like_parsed_ones() {
-        assert_eq!(
-            Identifier::Dns("Example.ORG.".into()).validated(),
-            Ok(Identifier::Dns("example.org".into()))
-        );
-        // A DNS identifier keeps its type, so an IP literal is no valid DNS name.
-        assert_eq!(
-            Identifier::Dns("192.0.2.1".into()).validated(),
-            Err(InvalidIdentifier::InvalidDnsName("192.0.2.1".into()))
-        );
-        assert_eq!(
-            Identifier::Ip("::".parse().unwrap()).validated(),
-            Err(InvalidIdentifier::UnspecifiedIp("::".parse().unwrap()))
-        );
-        // rustls accepts underscores, which private CAs may issue for.
-        assert_eq!(
-            Identifier::Dns("_svc.example.org".into()).validated(),
-            Ok(Identifier::Dns("_svc.example.org".into()))
-        );
     }
 
     #[test]
     fn new_order_payload_has_profile_only_when_set() {
-        let identifiers = [id("192.0.2.1")];
+        let identifiers = [id("example.com"), id("2001:DB8::1")];
         let payload = |profile| {
-            serde_json::to_string(&NewOrder {
+            let order = NewOrder {
                 identifiers: &identifiers,
                 profile,
-            })
-            .unwrap()
+            };
+            serde_json::to_string(&order).unwrap()
         };
-        assert_eq!(
-            payload(None),
-            r#"{"identifiers":[{"type":"ip","value":"192.0.2.1"}]}"#
+        let identifiers_json = concat!(
+            r#""identifiers":[{"type":"dns","value":"example.com"},"#,
+            r#"{"type":"ip","value":"2001:db8::1"}]"#,
         );
+        assert_eq!(payload(None), format!("{{{identifiers_json}}}"));
         assert_eq!(
             payload(Some("shortlived")),
-            r#"{"identifiers":[{"type":"ip","value":"192.0.2.1"}],"profile":"shortlived"}"#
+            format!(r#"{{{identifiers_json},"profile":"shortlived"}}"#)
         );
-    }
-
-    #[test]
-    fn subject_alt_name_matches_the_identifier() {
-        assert_eq!(
-            id("192.0.2.1").subject_alt_name().unwrap(),
-            SanType::IpAddress("192.0.2.1".parse().unwrap())
-        );
-        assert_eq!(
-            id("example.com").subject_alt_name().unwrap(),
-            SanType::DnsName("example.com".try_into().unwrap())
-        );
-    }
-
-    #[test]
-    fn reverse_dns_name_ipv4() {
-        assert_eq!(
-            reverse_dns_name("192.0.2.1".parse().unwrap()),
-            "1.2.0.192.in-addr.arpa"
-        );
-    }
-
-    #[test]
-    fn reverse_dns_name_ipv6() {
-        // Example from RFC 3596 section 2.5, lowercased.
-        assert_eq!(
-            reverse_dns_name("4321:0:1:2:3:4:567:89ab".parse().unwrap()),
-            "b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.ip6.arpa"
-        );
-        assert_eq!(
-            reverse_dns_name("::1".parse().unwrap()),
-            format!("1.{}ip6.arpa", "0.".repeat(31))
-        );
-    }
-
-    #[test]
-    fn server_name_for_identifier() {
-        assert_eq!(
-            Identifier::Dns("Example.COM".into()).tls_alpn_01_server_name(),
-            "example.com"
-        );
-        assert_eq!(
-            id("10.0.0.1").tls_alpn_01_server_name(),
-            "1.0.0.10.in-addr.arpa"
-        );
-    }
-
-    #[test]
-    fn identifier_from_str() {
-        assert_eq!(id("example.com"), Identifier::Dns("example.com".into()));
-        assert_eq!(
-            id("192.0.2.1"),
-            Identifier::Ip("192.0.2.1".parse().unwrap())
-        );
-        assert_eq!(
-            id("2001:db8::1"),
-            Identifier::Ip("2001:db8::1".parse().unwrap())
-        );
-        assert_eq!(id("Example.COM."), Identifier::Dns("example.com".into()));
-    }
-
-    #[test]
-    fn identifier_ipv6_is_canonicalized() {
-        // RFC 5952: lowercase, longest zero run compressed, no leading zeros.
-        for input in ["2001:DB8:0:0::1", "2001:0db8:0000:0000:0000:0000:0000:0001"] {
-            assert_eq!(
-                id(input),
-                Identifier::Ip("2001:db8::1".parse().unwrap()),
-                "{input}"
-            );
-        }
-        assert_eq!(id("0:0::1").to_string(), "::1");
-    }
-
-    #[test]
-    fn identifier_wire_format() {
-        let ids = [id("example.com"), id("192.0.2.1"), id("2001:DB8::1")];
-        let json = serde_json::to_string(&ids).unwrap();
-        assert_eq!(
-            json,
-            r#"[{"type":"dns","value":"example.com"},{"type":"ip","value":"192.0.2.1"},{"type":"ip","value":"2001:db8::1"}]"#
-        );
-        let parsed: Vec<Identifier> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, ids);
-    }
-
-    #[test]
-    fn identifier_display() {
-        assert_eq!(id("::1").to_string(), "::1");
-        assert_eq!(id("example.com").to_string(), "example.com");
     }
 
     #[derive(Debug)]

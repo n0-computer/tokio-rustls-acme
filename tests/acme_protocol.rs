@@ -281,13 +281,10 @@ async fn validated_order_follows_jws_rules_and_deploys_own_key() {
 /// Fails invalid identifiers before any request to the CA, and without a cached certificate.
 #[tokio::test]
 async fn invalid_identifiers_fail_before_the_cache_and_the_ca() {
-    let cases: [Configure; 6] = [
-        |config| config.domains(["foo bar"]),
-        |config| config.domains(["example.org.."]),
-        |config| config.domains(["b\u{fc}cher.example"]),
+    let cases: [Configure; 3] = [
+        |config| config.identifiers([Identifier::Dns("192.0.2.1".into())]),
         // Both identifiers would need the same challenge SNI.
         |config| config.domains(["192.0.2.1", "1.2.0.192.in-addr.arpa"]),
-        |config| config.identifiers([Identifier::Dns("192.0.2.1".into())]),
         |config| config.domains([""; 0]),
     ];
     let mock = MockAcme::start().await;
@@ -344,66 +341,38 @@ async fn cache_keys_follow_the_builder() {
     }
 }
 
-/// Fails an order whose profile the CA does not confirm, before finalizing it.
+/// Deploys only a certificate whose profile the CA confirms, if one is configured.
 #[tokio::test]
-async fn unconfirmed_profile_fails_the_order() {
+async fn configured_profile_must_be_confirmed() {
+    let malformed = json!({"name": 42});
     let cases = [
-        (None, None),
-        (Some(json!("classic")), Some("classic")),
-        // A malformed profile names none.
-        (Some(json!({"name": 42})), None),
+        (Some("shortlived"), Some(json!("shortlived")), Ok(())),
+        (Some("shortlived"), None, Err(None)),
+        (
+            Some("shortlived"),
+            Some(json!("classic")),
+            Err(Some("classic")),
+        ),
+        (Some("shortlived"), Some(malformed.clone()), Err(None)),
+        (None, Some(malformed), Ok(())),
     ];
-    for (profile, selected) in cases {
+    for (configured, profile, expected) in cases {
         let mock = MockAcme::start().await;
         mock.state().profile = profile.clone();
-        let mut state =
-            AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
-                .directory(&mock.directory_url)
-                .profile("shortlived")
-                .state();
-        match first_order_error(&mut state).await {
-            OrderError::ProfileMismatch {
-                requested,
-                selected: actual,
-            } => {
-                assert_eq!(requested, "shortlived");
-                assert_eq!(actual.as_deref(), selected);
-            }
-            err => panic!("{profile:?}: expected a profile mismatch, got {err:?}"),
+        let mut config = mock_config(&mock).domains([DOMAIN]);
+        if let Some(configured) = configured {
+            config = config.profile(configured);
         }
-        assert_eq!(
-            mock.state().hits("POST /finalize/1"),
-            0,
-            "{profile:?}: the client finalized the order"
-        );
+        match (deploy(config.state()).await, expected) {
+            (Ok(()), Ok(())) => {}
+            (Err(OrderError::ProfileMismatch { selected, .. }), Err(expected)) => {
+                assert_eq!(selected.as_deref(), expected, "{profile:?}");
+                let finalized = mock.state().hits("POST /finalize/1");
+                assert_eq!(finalized, 0, "{profile:?}: the client finalized the order");
+            }
+            (result, _) => panic!("{configured:?} with {profile:?}: {result:?}"),
+        }
     }
-}
-
-/// Deploys a certificate whose profile the CA confirms.
-#[tokio::test]
-async fn confirmed_profile_deploys() {
-    let mock = MockAcme::start().await;
-    mock.state().profile = Some(json!("shortlived"));
-    let state = AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
-        .directory(&mock.directory_url)
-        .profile("shortlived")
-        .state();
-    deploy(state)
-        .await
-        .expect("order with a confirmed profile failed");
-}
-
-/// Ignores a malformed `profile` in the order when no profile is configured.
-#[tokio::test]
-async fn malformed_profile_is_ignored_without_a_configured_profile() {
-    let mock = MockAcme::start().await;
-    mock.state().profile = Some(json!({"name": 42}));
-    let state = AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
-        .directory(&mock.directory_url)
-        .state();
-    deploy(state)
-        .await
-        .expect("order with a malformed profile failed");
 }
 
 /// Returns a config for the CA of `mock`, without identifiers.
@@ -448,22 +417,6 @@ async fn deploy(mut state: AcmeState) -> Result<(), OrderError> {
                 Ok(EventOk::CertCacheStore) => return Ok(()),
                 Ok(_) => {}
                 Err(EventError::Order(err)) => return Err(err),
-                Err(err) => panic!("expected an order error, got {err:?}"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for the order")
-}
-
-/// Drives `state` until its first error, which must be an order error.
-async fn first_order_error(state: &mut AcmeState) -> OrderError {
-    // The account key is stored first, then the order fails.
-    tokio::time::timeout(LIMIT, async {
-        loop {
-            match state.next().await.expect("state stream ended") {
-                Ok(_) => {}
-                Err(EventError::Order(err)) => return err,
                 Err(err) => panic!("expected an order error, got {err:?}"),
             }
         }
