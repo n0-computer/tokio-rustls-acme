@@ -30,8 +30,11 @@ use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 /// First delay of the order backoffs, which double it on each retry.
 const BACKOFF_BASE_DELAY: Duration = Duration::from_secs(1);
 
-/// Longest renewal sleep, because the monotonic timer misses clock corrections and host suspend.
-const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
+/// Longest sleep toward a wall-clock deadline before it is checked again.
+///
+/// The monotonic timer misses clock corrections and host suspend, so a long sleep could pass a
+/// renewal or retry, or the expiry of the certificate.
+const MAX_SLEEP: Duration = Duration::from_secs(60 * 60);
 
 /// Number of order rounds that can fail to advance the order status before the order fails.
 const MAX_STALLED_ROUNDS: u32 = 10;
@@ -66,9 +69,9 @@ fn time_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration>
     (!left.is_zero()).then_some(left)
 }
 
-/// Returns how long to sleep before the next renewal check, or `None` once renewal is due.
-fn renewal_sleep(renew_at: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
-    time_until(renew_at, now).map(|left| left.min(MAX_RENEWAL_SLEEP))
+/// Returns how long to sleep before checking `deadline` again, or `None` once it is reached.
+fn sleep_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
+    time_until(deadline, now).map(|left| left.min(MAX_SLEEP))
 }
 
 /// Returns when to renew a certificate valid from `not_before` to `not_after`.
@@ -169,6 +172,8 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     backoff_cnt: u32,
     wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
+    /// When to retry after a failed order.
+    retry_at: Option<OffsetDateTime>,
     /// Expiry of the deployed certificate.
     cert_expiry: Option<OffsetDateTime>,
 }
@@ -405,6 +410,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             backoff_cnt: 0,
             wait: None,
             renew_at: None,
+            retry_at: None,
             cert_expiry: None,
         }
     }
@@ -662,11 +668,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Err(OrderError::TooManyAttemptsAuth(identifier.to_string()))
     }
     /// Delays the next order with an exponential backoff, capped by [`max_retry_delay`].
+    ///
+    /// The retry is due on the wall clock, like the renewal, so suspend doesn't delay it.
     fn back_off(&mut self) {
-        let cap = max_retry_delay(self.cert_expiry, OffsetDateTime::now_utc());
-        self.wait = Some(after(
-            (BACKOFF_BASE_DELAY * (1 << self.backoff_cnt)).min(cap),
-        ));
+        let now = OffsetDateTime::now_utc();
+        let cap = max_retry_delay(self.cert_expiry, now);
+        let delay = (BACKOFF_BASE_DELAY * (1 << self.backoff_cnt)).min(cap);
+        self.retry_at = Some(now + delay);
         self.backoff_cnt = (self.backoff_cnt + 1).min(MAX_BACKOFF_EXPONENT);
     }
     fn poll_next_infinite(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Event<EC, EA>> {
@@ -684,9 +692,20 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 self.wait.take();
             }
 
+            // wait for the retry of a failed order
+            if let Some(retry_at) = self.retry_at {
+                match sleep_until(retry_at, OffsetDateTime::now_utc()) {
+                    Some(sleep) => {
+                        self.wait = Some(after(sleep));
+                        continue;
+                    }
+                    None => self.retry_at = None,
+                }
+            }
+
             // wait for renewal
             if let Some(renew_at) = self.renew_at {
-                match renewal_sleep(renew_at, OffsetDateTime::now_utc()) {
+                match sleep_until(renew_at, OffsetDateTime::now_utc()) {
                     Some(sleep) => {
                         self.wait = Some(after(sleep));
                         continue;
@@ -825,28 +844,23 @@ mod tests {
     use super::*;
     use rustls::crypto::ring;
     use rustls::{ClientConfig, DEFAULT_VERSIONS, RootCertStore};
-    use tokio::time::Instant;
 
     const SECOND: Duration = Duration::from_secs(1);
     const MIN: Duration = Duration::from_secs(60);
     const HOUR: Duration = Duration::from_secs(60 * 60);
 
     #[test]
-    fn renewal_sleep_is_capped_at_max_renewal_sleep() {
+    fn sleep_until_is_capped_at_max_sleep() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let cases = [
             (now - MIN, None),
             (now, None),
             (now + MIN, Some(MIN)),
-            (now + MAX_RENEWAL_SLEEP, Some(MAX_RENEWAL_SLEEP)),
-            (now + 30 * 24 * HOUR, Some(MAX_RENEWAL_SLEEP)),
+            (now + MAX_SLEEP, Some(MAX_SLEEP)),
+            (now + 30 * 24 * HOUR, Some(MAX_SLEEP)),
         ];
-        for (renew_at, expected) in cases {
-            assert_eq!(
-                renewal_sleep(renew_at, now),
-                expected,
-                "renew at {renew_at}"
-            );
+        for (deadline, expected) in cases {
+            assert_eq!(sleep_until(deadline, now), expected, "deadline {deadline}");
         }
     }
 
@@ -879,8 +893,8 @@ mod tests {
     }
 
     /// The state backs off from its certificate's expiry, also after many failed orders.
-    #[tokio::test(start_paused = true)]
-    async fn back_off_caps_the_delay_by_the_remaining_validity() {
+    #[test]
+    fn back_off_caps_the_delay_by_the_remaining_validity() {
         let client_config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
             .with_protocol_versions(DEFAULT_VERSIONS)
             .expect("ring supports the default versions")
@@ -899,8 +913,8 @@ mod tests {
             state.cert_expiry = expiry;
             state.backoff_cnt = MAX_BACKOFF_EXPONENT;
             state.back_off();
-            let wait = state.wait.as_ref().expect("a backoff");
-            let delay = wait.deadline() - Instant::now();
+            let retry_at = state.retry_at.expect("a backoff");
+            let delay = (retry_at - OffsetDateTime::now_utc()).unsigned_abs();
             // The expiry nears while the test runs.
             assert!(
                 delay <= cap && cap - delay < SECOND,
