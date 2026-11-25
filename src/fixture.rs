@@ -1,6 +1,6 @@
 //! The private PKI of `tests/fixtures/alternate-chains.sh`, for unit tests.
 
-use rustls::crypto::ring;
+use rustls::crypto::{WebPkiSupportedAlgorithms, ring};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 
@@ -76,6 +76,11 @@ pub(crate) fn certified_key(certs: &[Cert]) -> CertifiedKey {
         .load_private_key(key.into())
         .expect("the fixture key is P-256");
     CertifiedKey::new(self::certs(certs), key)
+}
+
+/// Returns the signature verification algorithms of the tests.
+pub(crate) fn algorithms() -> WebPkiSupportedAlgorithms {
+    ring::default_provider().signature_verification_algorithms
 }
 
 /// Returns the DER of `certs`.

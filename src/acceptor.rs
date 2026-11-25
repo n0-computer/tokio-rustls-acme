@@ -263,7 +263,11 @@ mod tests {
         let resolver = ResolvesServerCertAcme::new();
         let primary = Arc::new(fixture::certified_key(hierarchy.primary));
         resolver.set_cert(primary.clone());
-        let alternate = AlternateChain::new(&primary, fixture::chain(hierarchy.alternate));
+        let alternate = AlternateChain::new(
+            &primary,
+            fixture::chain(hierarchy.alternate),
+            &fixture::algorithms(),
+        );
         assert!(resolver.set_alternate(alternate));
         let provider = Arc::new(ring::default_provider());
         let config = server_config(provider.clone(), resolver.clone());

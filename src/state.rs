@@ -74,8 +74,10 @@ fn serve_alternate(
     resolver: &ResolvesServerCertAcme,
     cert: &CertifiedKey,
     chain: CertChain,
+    provider: &CryptoProvider,
 ) -> bool {
-    let served = resolver.set_alternate(AlternateChain::new(cert, chain));
+    let algorithms = &provider.signature_verification_algorithms;
+    let served = resolver.set_alternate(AlternateChain::new(cert, chain, algorithms));
     if served {
         info!("serving an alternate chain to clients that can't verify the default one");
     }
@@ -426,6 +428,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         if let CertChainPreference::DualChain(root) = &self.config.cert_chain {
             let (config, resolver, root) =
                 (self.config.clone(), self.resolver.clone(), root.clone());
+            let provider = self.crypto_provider();
             self.early_action = Some(Box::pin(async move {
                 let load = async {
                     let loaded = config
@@ -439,8 +442,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 };
                 let leaf = cert.end_entity_cert().ok()?;
                 match CertChain::from_pem(&bounded(load).await?) {
-                    Some(chain) if chain.is_alternate_for(leaf, &root) => {
-                        serve_alternate(&resolver, &cert, chain);
+                    Some(chain)
+                        if chain.is_alternate_for(
+                            leaf,
+                            &root,
+                            &provider.signature_verification_algorithms,
+                        ) =>
+                    {
+                        serve_alternate(&resolver, &cert, chain, &provider);
                     }
                     _ => {
                         warn!(%root, "cached alternate is no chain to the root for the certificate")
@@ -460,6 +469,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     fn process_new_cert(&mut self, issued: IssuedCert) -> Event<EC, EA> {
         let cert = self.deploy_cert(&issued.pem, false)?;
         let (config, resolver) = (self.config.clone(), self.resolver.clone());
+        let provider = self.crypto_provider();
         self.early_action = Some(Box::pin(async move {
             // The certificate is served already, so only its cache store waits for the alternate.
             let alternate = match issued.alternate {
@@ -468,7 +478,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             };
             let alternate = alternate.and_then(|chain| {
                 let pem = chain.to_pem();
-                serve_alternate(&resolver, &cert, chain).then_some(pem)
+                serve_alternate(&resolver, &cert, chain, &provider).then_some(pem)
             });
             if let Err(err) = config
                 .cache
@@ -645,11 +655,16 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         leaf: RustlsCertificate<'static>,
         root: ChainRoot,
     ) -> Option<CertChain> {
+        let algorithms = &client_config
+            .crypto_provider()
+            .signature_verification_algorithms;
         for url in alternate_urls {
             debug!(%url, "fetching alternate chain");
             match account.certificate(&client_config, &url).await {
                 Ok(pem) => match CertChain::from_pem(pem.as_bytes()) {
-                    Some(chain) if chain.is_alternate_for(&leaf, &root) => return Some(chain),
+                    Some(chain) if chain.is_alternate_for(&leaf, &root, algorithms) => {
+                        return Some(chain);
+                    }
                     _ => debug!(%url, "alternate is no valid chain to the root for the leaf"),
                 },
                 Err(err) => warn!(%url, %err, "failed to fetch alternate chain"),

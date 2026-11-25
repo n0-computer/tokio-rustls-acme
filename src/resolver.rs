@@ -1,6 +1,7 @@
 use crate::acme::ACME_TLS_ALPN_NAME;
 use crate::chain::{CertChain, RequiredSchemes};
 use rustls::SignatureScheme;
+use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::BTreeMap;
@@ -33,11 +34,17 @@ pub(crate) struct AlternateChain {
 
 impl AlternateChain {
     /// Creates the alternate `chain` for `primary`, which signs with the primary's key.
-    pub(crate) fn new(primary: &CertifiedKey, chain: CertChain) -> Self {
+    ///
+    /// `algorithms` verify the signatures that link the two chains.
+    pub(crate) fn new(
+        primary: &CertifiedKey,
+        chain: CertChain,
+        algorithms: &WebPkiSupportedAlgorithms,
+    ) -> Self {
         let primary_chain = CertChain::new(primary.cert.clone());
         Self {
-            primary_schemes: primary_chain.required_schemes(&chain),
-            alternate_schemes: chain.likely_required_schemes(&primary_chain),
+            primary_schemes: primary_chain.required_schemes(&chain, algorithms),
+            alternate_schemes: chain.likely_required_schemes(&primary_chain, algorithms),
             key: Arc::new(CertifiedKey::new(chain.into_certs(), primary.key.clone())),
         }
     }
@@ -157,7 +164,11 @@ mod tests {
     #[test]
     fn set_alternate_needs_the_served_leaf() {
         let (resolver, primary) = resolver();
-        let alternate = AlternateChain::new(&primary, chain(CROSS_SIGNED_ROOT.alternate));
+        let alternate = AlternateChain::new(
+            &primary,
+            chain(CROSS_SIGNED_ROOT.alternate),
+            &fixture::algorithms(),
+        );
         assert!(resolver.set_alternate(alternate));
         assert!(resolver.serves_alternate_chain());
         resolver.set_cert(primary.clone());
@@ -166,10 +177,18 @@ mod tests {
             "a new certificate drops it"
         );
 
-        let other_leaf = AlternateChain::new(&primary, chain(&[Cert::Intermediate]));
+        let other_leaf = AlternateChain::new(
+            &primary,
+            chain(&[Cert::Intermediate]),
+            &fixture::algorithms(),
+        );
         assert!(!resolver.set_alternate(other_leaf));
         assert!(!resolver.serves_alternate_chain());
-        let alternate = AlternateChain::new(&primary, chain(CROSS_SIGNED_ROOT.alternate));
+        let alternate = AlternateChain::new(
+            &primary,
+            chain(CROSS_SIGNED_ROOT.alternate),
+            &fixture::algorithms(),
+        );
         assert!(
             !ResolvesServerCertAcme::new().set_alternate(alternate),
             "no certificate"
@@ -199,7 +218,11 @@ mod tests {
             let alternate = AlternateChain {
                 primary_schemes,
                 alternate_schemes,
-                ..AlternateChain::new(&primary, chain(CROSS_SIGNED_ROOT.alternate))
+                ..AlternateChain::new(
+                    &primary,
+                    chain(CROSS_SIGNED_ROOT.alternate),
+                    &fixture::algorithms(),
+                )
             };
             assert_eq!(
                 alternate.serves(offered),

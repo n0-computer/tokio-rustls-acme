@@ -1,14 +1,16 @@
 //! Certificate chains a CA offers for one certificate, and the schemes that verifying them takes.
 
 use rustls::SignatureScheme;
-use rustls::pki_types::CertificateDer;
+use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::pki_types::{AlgorithmIdentifier, CertificateDer, alg_id};
 use x509_parser::asn1_rs::{Oid, oid};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::oid_registry::{
-    OID_EC_P256, OID_NIST_EC_P384, OID_NIST_EC_P521, OID_NIST_HASH_SHA256, OID_NIST_HASH_SHA384,
-    OID_NIST_HASH_SHA512, OID_PKCS1_RSAENCRYPTION, OID_PKCS1_RSASSAPSS, OID_PKCS1_SHA256WITHRSA,
-    OID_PKCS1_SHA384WITHRSA, OID_PKCS1_SHA512WITHRSA, OID_SIG_ECDSA_WITH_SHA256,
-    OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ECDSA_WITH_SHA512, OID_SIG_ED448, OID_SIG_ED25519,
+    OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_NIST_EC_P384, OID_NIST_EC_P521,
+    OID_NIST_HASH_SHA256, OID_NIST_HASH_SHA384, OID_NIST_HASH_SHA512, OID_PKCS1_RSAENCRYPTION,
+    OID_PKCS1_RSASSAPSS, OID_PKCS1_SHA256WITHRSA, OID_PKCS1_SHA384WITHRSA, OID_PKCS1_SHA512WITHRSA,
+    OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ECDSA_WITH_SHA512, OID_SIG_ED448,
+    OID_SIG_ED25519,
 };
 use x509_parser::parse_x509_certificate;
 use x509_parser::signature_algorithm::RsaSsaPssParams;
@@ -122,9 +124,14 @@ impl CertChain {
 
     /// Returns whether the chain is a valid alternate to `leaf` that ends at `root`.
     ///
-    /// Each certificate must be issued and signed by the next, a CA certificate valid now. The
-    /// root may be left out.
-    pub(crate) fn is_alternate_for(&self, leaf: &CertificateDer<'_>, root: &ChainRoot) -> bool {
+    /// Each certificate must be issued and signed by the next, a CA certificate valid now, as
+    /// `algorithms` verify. The root may be left out.
+    pub(crate) fn is_alternate_for(
+        &self,
+        leaf: &CertificateDer<'_>,
+        root: &ChainRoot,
+        algorithms: &WebPkiSupportedAlgorithms,
+    ) -> bool {
         if self.leaf() != leaf || !self.ends_at(root) {
             return false;
         }
@@ -141,7 +148,7 @@ impl CertChain {
                 && issuer
                     .key_usage()
                     .is_ok_and(|usage| usage.is_none_or(|usage| usage.value.key_cert_sign()))
-                && cert.verify_signature(Some(issuer.public_key())).is_ok()
+                && signed_by(cert, issuer, algorithms)
         })
     }
 
@@ -149,20 +156,33 @@ impl CertChain {
     ///
     /// An ECDSA scheme depends on the signer's curve, so the topmost signer is looked up in
     /// `other`, the other chain for the leaf. A self-signed top is a trust anchor, not verified.
-    pub(crate) fn required_schemes(&self, other: &CertChain) -> RequiredSchemes {
-        self.schemes(other, UnknownSigner::Unknown)
+    pub(crate) fn required_schemes(
+        &self,
+        other: &CertChain,
+        algorithms: &WebPkiSupportedAlgorithms,
+    ) -> RequiredSchemes {
+        self.schemes(other, UnknownSigner::Unknown, algorithms)
     }
 
     /// Like [`CertChain::required_schemes`], but assumes standard curves for unknown signers.
     ///
     /// Only for the alternate, which goes only to clients that can't verify the primary, so a
     /// wrong guess only affects those.
-    pub(crate) fn likely_required_schemes(&self, other: &CertChain) -> RequiredSchemes {
-        self.schemes(other, UnknownSigner::StandardCurve)
+    pub(crate) fn likely_required_schemes(
+        &self,
+        other: &CertChain,
+        algorithms: &WebPkiSupportedAlgorithms,
+    ) -> RequiredSchemes {
+        self.schemes(other, UnknownSigner::StandardCurve, algorithms)
     }
 
     /// Returns the schemes of this chain, see [`CertChain::required_schemes`].
-    fn schemes(&self, other: &CertChain, unknown_signer: UnknownSigner) -> RequiredSchemes {
+    fn schemes(
+        &self,
+        other: &CertChain,
+        unknown_signer: UnknownSigner,
+        algorithms: &WebPkiSupportedAlgorithms,
+    ) -> RequiredSchemes {
         let Some(certs) = self.parse_all() else {
             return RequiredSchemes::Unknown;
         };
@@ -173,8 +193,7 @@ impl CertChain {
                 Some(issuer) => Some(issuer),
                 None if cert.subject() == cert.issuer() => continue,
                 None => others.iter().find(|issuer| {
-                    issuer.subject() == cert.issuer()
-                        && cert.verify_signature(Some(issuer.public_key())).is_ok()
+                    issuer.subject() == cert.issuer() && signed_by(cert, issuer, algorithms)
                 }),
             };
             let Some(scheme) = signature_scheme(cert, issuer, unknown_signer) else {
@@ -202,6 +221,87 @@ fn parse<'a>(der: &'a CertificateDer<'_>) -> Option<X509Certificate<'a>> {
 /// Returns the common name of the issuer of `cert`.
 fn issuer_name<'a>(cert: &'a X509Certificate<'_>) -> Option<&'a str> {
     cert.issuer().iter_common_name().next()?.as_str().ok()
+}
+
+/// Returns whether the signature on `cert` verifies with the key of `issuer`, as `algorithms` do.
+fn signed_by(
+    cert: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+    algorithms: &WebPkiSupportedAlgorithms,
+) -> bool {
+    let (Some(signature), Some(public_key)) = (signature_alg_id(cert), public_key_alg_id(issuer))
+    else {
+        return false;
+    };
+    algorithms
+        .all
+        .iter()
+        .filter(|algorithm| {
+            algorithm.signature_alg_id() == signature && algorithm.public_key_alg_id() == public_key
+        })
+        .any(|algorithm| {
+            let key = &issuer.public_key().subject_public_key.data;
+            let message = cert.tbs_certificate.as_ref();
+            let verified = algorithm.verify_signature(key, message, &cert.signature_value.data);
+            verified.is_ok()
+        })
+}
+
+/// Returns the algorithm of the signature on `cert`, if rustls can name it.
+fn signature_alg_id(cert: &X509Certificate<'_>) -> Option<AlgorithmIdentifier> {
+    let algorithm = &cert.signature_algorithm;
+    let oid = &algorithm.algorithm;
+    Some(if *oid == OID_SIG_ECDSA_WITH_SHA256 {
+        alg_id::ECDSA_SHA256
+    } else if *oid == OID_SIG_ECDSA_WITH_SHA384 {
+        alg_id::ECDSA_SHA384
+    } else if *oid == OID_SIG_ECDSA_WITH_SHA512 {
+        alg_id::ECDSA_SHA512
+    } else if *oid == OID_PKCS1_SHA256WITHRSA {
+        alg_id::RSA_PKCS1_SHA256
+    } else if *oid == OID_PKCS1_SHA384WITHRSA {
+        alg_id::RSA_PKCS1_SHA384
+    } else if *oid == OID_PKCS1_SHA512WITHRSA {
+        alg_id::RSA_PKCS1_SHA512
+    } else if *oid == OID_SIG_ED25519 {
+        alg_id::ED25519
+    } else if *oid == OID_SIG_ED448 {
+        alg_id::ED448
+    } else if *oid == OID_PKCS1_RSASSAPSS {
+        match pss_scheme(&RsaSsaPssParams::try_from(algorithm.parameters()?).ok()?)? {
+            SignatureScheme::RSA_PSS_SHA256 => alg_id::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384 => alg_id::RSA_PSS_SHA384,
+            _ => alg_id::RSA_PSS_SHA512,
+        }
+    } else {
+        return None;
+    })
+}
+
+/// Returns the algorithm of the public key of `cert`, if rustls can name it.
+fn public_key_alg_id(cert: &X509Certificate<'_>) -> Option<AlgorithmIdentifier> {
+    let algorithm = &cert.public_key().algorithm;
+    let oid = &algorithm.algorithm;
+    if *oid == OID_PKCS1_RSAENCRYPTION {
+        Some(alg_id::RSA_ENCRYPTION)
+    } else if *oid == OID_SIG_ED25519 {
+        Some(alg_id::ED25519)
+    } else if *oid == OID_SIG_ED448 {
+        Some(alg_id::ED448)
+    } else if *oid == OID_KEY_TYPE_EC_PUBLIC_KEY {
+        let curve = algorithm.parameters()?.as_oid().ok()?;
+        if curve == OID_EC_P256 {
+            Some(alg_id::ECDSA_P256)
+        } else if curve == OID_NIST_EC_P384 {
+            Some(alg_id::ECDSA_P384)
+        } else if curve == OID_NIST_EC_P521 {
+            Some(alg_id::ECDSA_P521)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
 /// Returns the TLS scheme of the signature on `cert` by `issuer`, if it can be identified.
@@ -281,7 +381,8 @@ fn pss_scheme(params: &RsaSsaPssParams<'_>) -> Option<SignatureScheme> {
 mod tests {
     use super::*;
     use crate::fixture::{
-        CROSS_SIGNED_ROOT, Cert, EC_ROOT_CN, INTERMEDIATE_BY_EACH_ROOT, RSA_ROOT_CN, chain,
+        CROSS_SIGNED_ROOT, Cert, EC_ROOT_CN, INTERMEDIATE_BY_EACH_ROOT, RSA_ROOT_CN, algorithms,
+        chain,
     };
 
     #[test]
@@ -312,7 +413,7 @@ mod tests {
         ];
         for (certs, root, accepted) in cases {
             assert_eq!(
-                chain(certs).is_alternate_for(&leaf, root),
+                chain(certs).is_alternate_for(&leaf, root, &algorithms()),
                 accepted,
                 "{certs:?} to {root}"
             );
@@ -325,7 +426,7 @@ mod tests {
         let alternate = chain(CROSS_SIGNED_ROOT.alternate);
         // The cross-signature needs RSA, the ECDSA signatures are by P-256 keys.
         assert_eq!(
-            primary.required_schemes(&alternate),
+            primary.required_schemes(&alternate, &algorithms()),
             RequiredSchemes::Known(vec![
                 SignatureScheme::ECDSA_NISTP256_SHA256,
                 SignatureScheme::RSA_PKCS1_SHA256,
@@ -333,17 +434,18 @@ mod tests {
         );
         // The intermediate's signer, the ECDSA root, is only in the other chain.
         assert_eq!(
-            alternate.required_schemes(&primary),
+            alternate.required_schemes(&primary, &algorithms()),
             RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP256_SHA256])
         );
         // Without the other chain, the curve of the topmost signer is unknown.
         assert_eq!(
-            alternate.required_schemes(&chain(&[])),
+            alternate.required_schemes(&chain(&[]), &algorithms()),
             RequiredSchemes::Unknown
         );
         // A self-signed root at the top is a trust anchor, so its signature doesn't count.
         assert_eq!(
-            chain(&[Cert::Leaf, Cert::Intermediate, Cert::EcRoot]).required_schemes(&chain(&[])),
+            chain(&[Cert::Leaf, Cert::Intermediate, Cert::EcRoot])
+                .required_schemes(&chain(&[]), &algorithms()),
             RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP256_SHA256])
         );
     }
@@ -353,7 +455,7 @@ mod tests {
         let primary = chain(INTERMEDIATE_BY_EACH_ROOT.primary);
         let alternate = chain(INTERMEDIATE_BY_EACH_ROOT.alternate);
         assert_eq!(
-            primary.required_schemes(&alternate),
+            primary.required_schemes(&alternate, &algorithms()),
             RequiredSchemes::Known(vec![
                 SignatureScheme::ECDSA_NISTP256_SHA256,
                 SignatureScheme::RSA_PKCS1_SHA256,
@@ -361,17 +463,17 @@ mod tests {
         );
         // The ECDSA root is in neither chain, so its curve is unknown.
         assert_eq!(
-            alternate.required_schemes(&primary),
+            alternate.required_schemes(&primary, &algorithms()),
             RequiredSchemes::Unknown
         );
         assert_eq!(
-            alternate.likely_required_schemes(&primary),
+            alternate.likely_required_schemes(&primary, &algorithms()),
             RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP256_SHA256])
         );
         // A known signer decides, whatever the hash.
         assert_eq!(
             chain(CROSS_SIGNED_ROOT.alternate)
-                .likely_required_schemes(&chain(CROSS_SIGNED_ROOT.primary)),
+                .likely_required_schemes(&chain(CROSS_SIGNED_ROOT.primary), &algorithms()),
             RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP256_SHA256])
         );
     }
