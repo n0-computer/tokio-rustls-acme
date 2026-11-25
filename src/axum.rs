@@ -1,17 +1,21 @@
-use crate::{AcmeAccept, AcmeAcceptor};
+use crate::AcmeAcceptor;
+use crate::acceptor::{DEFAULT_HANDSHAKE_TIMEOUT, Handshake};
 use rustls::ServerConfig;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::Accept;
 
-#[derive(Clone)]
+/// An [`axum_server`] acceptor that answers `tls-alpn-01` requests and times out handshakes.
+#[derive(Clone, Debug)]
 pub struct AxumAcceptor {
     acme_acceptor: AcmeAcceptor,
     config: Arc<ServerConfig>,
+    handshake_timeout: Duration,
 }
 
 impl AxumAcceptor {
@@ -20,7 +24,18 @@ impl AxumAcceptor {
         Self {
             acme_acceptor,
             config,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Sets the time limit for the TLS handshake of each connection.
+    ///
+    /// The limit runs from TCP accept. When it passes, the accept future fails
+    /// with [`io::ErrorKind::TimedOut`]. The default is 10 seconds. The timeout
+    /// cannot be disabled, so set a large value for slow clients.
+    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 }
 
@@ -34,9 +49,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static>
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let acme_accept = self.acme_acceptor.accept(stream);
         Self::Future {
-            config: self.config.clone(),
-            acme_accept,
-            tls_accept: None,
+            handshake: Handshake::new(acme_accept, self.config.clone(), self.handshake_timeout),
             service: Some(service),
         }
     }
@@ -44,10 +57,16 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static>
 
 /// Future that [`AxumAcceptor`] returns for each connection.
 pub struct AxumAccept<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> {
-    config: Arc<ServerConfig>,
-    acme_accept: AcmeAccept<I>,
-    tls_accept: Option<Accept<I>>,
+    handshake: Handshake<I>,
     service: Option<S>,
+}
+
+impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> fmt::Debug
+    for AxumAccept<I, S>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AxumAccept").finish_non_exhaustive()
+    }
 }
 
 impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> Unpin
@@ -61,26 +80,17 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: Send + 'static> Futu
     type Output = io::Result<(tokio_rustls::server::TlsStream<I>, S)>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            if let Some(tls_accept) = &mut self.tls_accept {
-                return match Pin::new(&mut *tls_accept).poll(cx) {
-                    Poll::Ready(Ok(tls)) => Poll::Ready(Ok((tls, self.service.take().unwrap()))),
-                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                    Poll::Pending => Poll::Pending,
-                };
+        let output = match ready!(Pin::new(&mut self.handshake).poll(cx)) {
+            Ok(Some(tls)) => {
+                let service = self
+                    .service
+                    .take()
+                    .expect("AxumAccept polled after completion");
+                Ok((tls, service))
             }
-            return match Pin::new(&mut self.acme_accept).poll(cx) {
-                Poll::Ready(Ok(Some(start_handshake))) => {
-                    let config = self.config.clone();
-                    self.tls_accept = Some(start_handshake.into_stream(config));
-                    continue;
-                }
-                Poll::Ready(Ok(None)) => {
-                    Poll::Ready(Err(io::Error::other("TLS-ALPN-01 validation request")))
-                }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                Poll::Pending => Poll::Pending,
-            };
-        }
+            Ok(None) => Err(io::Error::other("TLS-ALPN-01 validation request")),
+            Err(err) => Err(err),
+        };
+        Poll::Ready(output)
     }
 }

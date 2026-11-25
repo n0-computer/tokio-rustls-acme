@@ -51,10 +51,15 @@
 //! well as accepting TLS connections, which are handed over to the caller on success.
 //!
 //! ```rust,no_run
+//! use std::io;
+//! use std::time::Duration;
 //! use tokio::io::AsyncWriteExt;
 //! use n0_future::StreamExt;
 //! use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 //! use tokio_stream::wrappers::TcpListenerStream;
+//!
+//! /// Pause after an accept error, as in axum's `serve`.
+//! const ACCEPT_ERROR_DELAY: Duration = Duration::from_secs(1);
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -69,12 +74,31 @@
 //!         .incoming(tcp_incoming, Vec::new());
 //!
 //!     while let Some(tls) = tls_incoming.next().await {
-//!         let mut tls = tls.unwrap();
+//!         let mut tls = match tls {
+//!             Ok(tls) => tls,
+//!             Err(err) if is_connection_error(&err) => continue,
+//!             Err(err) => {
+//!                 tracing::error!("TCP accept failed: {err:?}");
+//!                 // Accept fails again at once while no file descriptor is free.
+//!                 tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
+//!                 continue;
+//!             }
+//!         };
 //!         tokio::spawn(async move {
 //!             tls.write_all(HELLO).await.unwrap();
 //!             tls.shutdown().await.unwrap();
 //!         });
 //!     }
+//! }
+//!
+//! /// Returns whether `err` concerns only one connection, so accepting can go on at once.
+//! fn is_connection_error(err: &io::Error) -> bool {
+//!     matches!(
+//!         err.kind(),
+//!         io::ErrorKind::ConnectionRefused
+//!             | io::ErrorKind::ConnectionAborted
+//!             | io::ErrorKind::ConnectionReset
+//!     )
 //! }
 //!
 //! const HELLO: &'static [u8] = br#"HTTP/1.1 200 OK
@@ -138,6 +162,7 @@
 //! [rustls]: https://github.com/ctz/rustls
 //! [aws-lc-rs]: https://github.com/aws/aws-lc-rs
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod acceptor;

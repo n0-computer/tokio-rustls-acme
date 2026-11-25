@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use std::fmt::Debug;
 
 /// A cache wrapper that boxes the errors of the inner cache as `Box<dyn Debug>`.
+#[derive(Debug)]
 pub struct BoxedErrCache<T: Send + Sync> {
     inner: T,
 }

@@ -2,6 +2,7 @@ use crate::{AccountCache, CertCache};
 use async_trait::async_trait;
 
 /// A cache that keeps certificates in one cache and account keys in another.
+#[derive(Debug)]
 pub struct CompositeCache<C: CertCache + Send + Sync, A: AccountCache + Send + Sync> {
     /// Cache that `load_cert` and `store_cert` delegate to.
     pub cert_cache: C,

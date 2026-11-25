@@ -1,15 +1,33 @@
 use crate::AcmeState;
-use crate::acceptor::{AcmeAccept, AcmeAcceptor, server_config};
+use crate::acceptor::{AcmeAcceptor, DEFAULT_HANDSHAKE_TIMEOUT, Handshake, server_config};
 use futures_core::FusedStream;
 use n0_future::{FuturesUnordered, Stream};
 use rustls::ServerConfig;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::{Accept, server::TlsStream};
-use tracing::{error, info};
+use tokio_rustls::server::TlsStream;
+use tracing::{debug, error, info, warn};
+
+/// Logs a failed handshake.
+///
+/// Peers can cause the common failures, so those log at debug.
+fn log_handshake_error(err: &io::Error) {
+    match err.kind() {
+        io::ErrorKind::TimedOut => debug!("TLS handshake timed out"),
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => debug!("peer disconnected during TLS handshake: {err}"),
+        // rustls reports invalid or unacceptable TLS messages as InvalidData.
+        io::ErrorKind::InvalidData => debug!("TLS handshake rejected: {err}"),
+        _ => warn!("TLS handshake failed: {err:?}"),
+    }
+}
 
 /// [`Stream`] of accepted application TLS connections.
 ///
@@ -26,8 +44,24 @@ pub struct Incoming<
     acceptor: AcmeAcceptor,
     rustls_config: Arc<ServerConfig>,
     tcp_incoming: Option<ITCP>,
-    acme_accepting: FuturesUnordered<AcmeAccept<TCP>>,
-    tls_accepting: FuturesUnordered<Accept<TCP>>,
+    handshake_timeout: Duration,
+    handshakes: FuturesUnordered<Handshake<TCP>>,
+}
+
+impl<
+    TCP: AsyncRead + AsyncWrite + Unpin,
+    ETCP,
+    ITCP: Stream<Item = Result<TCP, ETCP>> + Unpin,
+    EC: Debug + 'static,
+    EA: Debug + 'static,
+> fmt::Debug for Incoming<TCP, ETCP, ITCP, EC, EA>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Incoming")
+            .field("state", &self.state)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<
@@ -60,8 +94,8 @@ impl<
             acceptor,
             rustls_config: Arc::new(server_config),
             tcp_incoming: Some(tcp_incoming),
-            acme_accepting: FuturesUnordered::new(),
-            tls_accepting: FuturesUnordered::new(),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            handshakes: FuturesUnordered::new(),
         }
     }
 
@@ -75,6 +109,16 @@ impl<
         let mut server_config = server_config(state.crypto_provider(), state.resolver());
         server_config.alpn_protocols = alpn_protocols;
         Self::new_with_server(tcp_incoming, state, acceptor, server_config)
+    }
+
+    /// Sets the time limit for the TLS handshake of each connection.
+    ///
+    /// The limit runs from TCP accept. When it passes, the stream drops the
+    /// connection. The default is 10 seconds. The timeout cannot be disabled,
+    /// so set a large value for slow clients. It applies to connections accepted later.
+    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 }
 
@@ -101,25 +145,14 @@ impl<
                 Poll::Ready(None) => unreachable!(),
                 Poll::Pending => {}
             }
-            match Pin::new(&mut self.acme_accepting).poll_next(cx) {
-                Poll::Ready(Some(Ok(Some(tls)))) => {
-                    let accept = tls.into_stream(self.rustls_config.clone());
-                    self.tls_accepting.push(accept);
-                }
+            match Pin::new(&mut self.handshakes).poll_next(cx) {
+                Poll::Ready(Some(Ok(Some(tls)))) => return Poll::Ready(Some(Ok(tls))),
                 Poll::Ready(Some(Ok(None))) => {
-                    info!("received TLS-ALPN-01 validation request");
+                    debug!("received TLS-ALPN-01 validation request");
                     continue;
                 }
                 Poll::Ready(Some(Err(err))) => {
-                    error!(?err, "tls accept failed");
-                    continue;
-                }
-                Poll::Ready(None) | Poll::Pending => {}
-            }
-            match Pin::new(&mut self.tls_accepting).poll_next(cx) {
-                Poll::Ready(Some(Ok(tls))) => return Poll::Ready(Some(Ok(tls))),
-                Poll::Ready(Some(Err(err))) => {
-                    error!(?err, "tls accept failed");
+                    log_handshake_error(&err);
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => {}
@@ -133,8 +166,12 @@ impl<
             };
             match Pin::new(tcp_incoming).poll_next(cx) {
                 Poll::Ready(Some(Ok(tcp))) => {
-                    let accept = self.acceptor.accept(tcp);
-                    self.acme_accepting.push(accept);
+                    let handshake = Handshake::new(
+                        self.acceptor.accept(tcp),
+                        self.rustls_config.clone(),
+                        self.handshake_timeout,
+                    );
+                    self.handshakes.push(handshake);
                 }
                 Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
                 Poll::Ready(None) => self.tcp_incoming = None,
@@ -153,8 +190,6 @@ impl<
 > FusedStream for Incoming<TCP, ETCP, ITCP, EC, EA>
 {
     fn is_terminated(&self) -> bool {
-        self.tcp_incoming.is_none()
-            && self.acme_accepting.is_terminated()
-            && self.tls_accepting.is_terminated()
+        self.tcp_incoming.is_none() && self.handshakes.is_terminated()
     }
 }

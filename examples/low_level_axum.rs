@@ -1,3 +1,5 @@
+//! An axum server that serves the ACME certificate through `AxumAcceptor`.
+
 use axum::{Router, routing::get};
 use clap::Parser;
 use rustls::{DEFAULT_VERSIONS, ServerConfig};

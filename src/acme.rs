@@ -51,13 +51,17 @@ static ALG: &EcdsaSigningAlgorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
 
 impl Account {
     /// Generates a new P-256 ECDSA account key in PKCS#8 DER form.
-    pub fn generate_key_pair() -> Vec<u8> {
+    pub(crate) fn generate_key_pair() -> Vec<u8> {
         let rng = SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(ALG, &rng).unwrap();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(ALG, &rng).expect("system RNG failed");
         pkcs8.as_ref().to_vec()
     }
+    /// Returns an error if `key_pair` is not a PKCS#8 key that an account can use.
+    pub(crate) fn check_key_pair(key_pair: &[u8]) -> Result<(), CryptoError> {
+        crate::crypto::ecdsa_key_pair_from_pkcs8(ALG, key_pair).map(drop)
+    }
     /// Registers the account for `key_pair` at the server, or looks up the existing one.
-    pub async fn create_with_keypair<'a, S, I>(
+    pub(crate) async fn create_with_keypair<'a, S, I>(
         client_config: &Arc<ClientConfig>,
         directory: Directory,
         contact: I,
@@ -142,7 +146,7 @@ impl Account {
             headers,
         })
     }
-    pub async fn new_order(
+    pub(crate) async fn new_order(
         &self,
         client_config: &Arc<ClientConfig>,
         domains: Vec<String>,
@@ -162,7 +166,7 @@ impl Account {
         Ok((url, order))
     }
     /// Fetches the authorization object at `url`.
-    pub async fn auth(
+    pub(crate) async fn auth(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -172,7 +176,7 @@ impl Account {
         serde_json::from_str(&response.body).map_err(json_err)
     }
     /// Tells the server that the challenge at `url` is ready for validation.
-    pub async fn challenge(
+    pub(crate) async fn challenge(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -181,7 +185,7 @@ impl Account {
         Ok(())
     }
     /// Fetches the current state of the order at `url`.
-    pub async fn order(
+    pub(crate) async fn order(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -190,7 +194,7 @@ impl Account {
         serde_json::from_str(&response.body).map_err(json_err)
     }
     /// Sends the DER-encoded `csr` to the finalize `url` and returns the updated order.
-    pub async fn finalize(
+    pub(crate) async fn finalize(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -201,7 +205,7 @@ impl Account {
         serde_json::from_str(&response.body).map_err(json_err)
     }
     /// Downloads the PEM certificate chain at `url`, with the URLs of its alternate chains.
-    pub async fn certificate_with_alternate_urls(
+    pub(crate) async fn certificate_with_alternate_urls(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -215,7 +219,7 @@ impl Account {
         })
     }
     /// Downloads the PEM certificate chain at `url`.
-    pub async fn certificate(
+    pub(crate) async fn certificate(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
@@ -223,7 +227,7 @@ impl Account {
         Ok(self.request(client_config, &url, "").await?.body)
     }
     /// Picks the `tls-alpn-01` challenge and builds its validation certificate for `domain`.
-    pub fn tls_alpn_01<'a>(
+    pub(crate) fn tls_alpn_01<'a>(
         &self,
         crypto_provider: &CryptoProvider,
         challenges: &'a [Challenge],
@@ -270,7 +274,7 @@ pub(crate) struct Directory {
 
 impl Directory {
     /// Fetches and parses the directory object at `url`.
-    pub async fn discover(
+    pub(crate) async fn discover(
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<Self, AcmeError> {
@@ -304,7 +308,7 @@ pub(crate) struct ExternalAccountKey {
 
 impl ExternalAccountKey {
     /// Creates a binding key from the CA-issued `kid` and the raw HMAC-SHA256 `key` bytes.
-    pub fn new(kid: String, key: &[u8]) -> Self {
+    pub(crate) fn new(kid: String, key: &[u8]) -> Self {
         Self {
             kid,
             key: hmac::Key::new(hmac::HMAC_SHA256, key),
@@ -312,6 +316,7 @@ impl ExternalAccountKey {
     }
 }
 
+/// The type of a challenge (RFC 8555 section 8).
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 pub enum ChallengeType {
     /// The `http-01` challenge (RFC 8555 section 8.3), not supported by this crate.
@@ -320,8 +325,10 @@ pub enum ChallengeType {
     /// The `dns-01` challenge (RFC 8555 section 8.4), not supported by this crate.
     #[serde(rename = "dns-01")]
     Dns01,
+    /// The `tls-alpn-01` challenge (RFC 8737), which this crate answers.
     #[serde(rename = "tls-alpn-01")]
     TlsAlpn01,
+    /// A challenge type this crate does not know.
     #[serde(other)]
     Unknown,
 }
@@ -362,6 +369,18 @@ pub enum OrderStatus {
     Processing,
 }
 
+impl OrderStatus {
+    /// Returns the position of this status in the RFC 8555 order lifecycle.
+    pub(crate) fn progress(&self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Ready => 1,
+            Self::Processing => 2,
+            Self::Valid { .. } | Self::Invalid => 3,
+        }
+    }
+}
+
 /// An authorization object (RFC 8555 section 7.1.4).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -394,6 +413,7 @@ pub enum AuthStatus {
     Deactivated,
 }
 
+/// An ACME identifier (RFC 8555 section 9.7.7).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 #[non_exhaustive]
@@ -415,6 +435,7 @@ pub struct Challenge {
     /// Random token from the server, part of the key authorization.
     #[serde(default)]
     pub token: String,
+    /// The error of a failed validation.
     pub error: Option<Problem>,
 }
 
@@ -558,6 +579,27 @@ fn parse_link_value(link: &str) -> Option<(&str, impl Iterator<Item = (&str, &st
         Some((name.trim(), value))
     });
     Some((target, params))
+}
+
+impl AcmeError {
+    /// Returns whether a `newAccount` error shows a deactivated or unknown account.
+    ///
+    /// See RFC 8555 section 7.3.6.
+    pub(crate) fn rejects_account(&self) -> bool {
+        let AcmeError::HttpRequest(HttpsRequestError::Non2xxStatus { body, .. }) = self else {
+            return false;
+        };
+        let typ = serde_json::from_str::<Problem>(body)
+            .ok()
+            .and_then(|p| p.typ);
+        matches!(
+            typ.as_deref(),
+            Some(
+                "urn:ietf:params:acme:error:unauthorized"
+                    | "urn:ietf:params:acme:error:accountDoesNotExist"
+            )
+        )
+    }
 }
 
 fn json_err(err: serde_json::Error) -> AcmeError {
@@ -708,6 +750,28 @@ mod tests {
 
         let result = account.tls_alpn_01(&provider, &challenges, "example.com".into());
         assert!(matches!(result, Err(AcmeError::Crypto(_))));
+    }
+
+    #[test]
+    fn rejects_account_on_account_problems_only() {
+        let non_2xx = |body: &str| {
+            AcmeError::HttpRequest(HttpsRequestError::Non2xxStatus {
+                status_code: 403,
+                body: body.to_string(),
+            })
+        };
+        let problem = |typ: &str| format!(r#"{{"type":"urn:ietf:params:acme:error:{typ}"}}"#);
+        let cases = [
+            (problem("unauthorized"), true),
+            (problem("accountDoesNotExist"), true),
+            (problem("rateLimited"), false),
+            ("{}".to_string(), false),
+            ("unauthorized".to_string(), false),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(non_2xx(&body).rejects_account(), expected, "{body}");
+        }
+        assert!(!AcmeError::MissingHeader("location").rejects_account());
     }
 
     #[test]
