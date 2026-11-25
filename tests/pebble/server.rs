@@ -43,7 +43,7 @@ const RETRY_AFTER: Duration = Duration::from_secs(1);
 /// A running Pebble whose validation authority resolves every name to `127.0.0.1`.
 ///
 /// Stops both processes when dropped, and prints their logs if the test panicked.
-pub struct Pebble {
+pub(crate) struct Pebble {
     ports: Ports,
     client_config: Arc<ClientConfig>,
     processes: Vec<Process>,
@@ -52,7 +52,7 @@ pub struct Pebble {
 
 impl Pebble {
     /// Starts Pebble and `challtestsrv` and waits until both accept connections.
-    pub async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let dir = tempfile::tempdir().expect("failed to create Pebble dir");
         let tls = WfeTls::generate(dir.path());
         let mut last_error = None;
@@ -83,7 +83,7 @@ impl Pebble {
     }
 
     /// Returns the port that Pebble connects to for tls-alpn-01 validation.
-    pub fn tls_alpn_port(&self) -> u16 {
+    pub(crate) fn tls_alpn_port(&self) -> u16 {
         self.ports.tls_alpn
     }
 
@@ -93,14 +93,14 @@ impl Pebble {
     }
 
     /// Returns a config for `domains` against this Pebble, without a cache.
-    pub fn config(&self, domains: &[&str]) -> AcmeConfig<io::Error> {
+    pub(crate) fn config(&self, domains: &[&str]) -> AcmeConfig<io::Error> {
         AcmeConfig::new_with_client_tls_config(domains, self.client_config.clone())
             .directory(self.directory_url())
             .cache(NoCache::new())
     }
 
     /// Fetches the roots of the ACME CA as a root store, without intermediates.
-    pub async fn acme_root_store(&self) -> RootCertStore {
+    pub(crate) async fn acme_root_store(&self) -> RootCertStore {
         let client = reqwest::Client::builder()
             .tls_backend_preconfigured(ClientConfig::clone(&self.client_config))
             .build()
