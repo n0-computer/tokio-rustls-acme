@@ -53,8 +53,8 @@ struct Site {
 }
 
 impl Site {
-    /// Starts the state machine and serves its acceptor on the tls-alpn-01 port of `pebble`.
-    async fn bind(config: AcmeConfig<io::Error>, pebble: &Pebble) -> Self {
+    /// Starts the state machine and serves its acceptor on the tls-alpn-01 listener of `pebble`.
+    fn start(config: AcmeConfig<io::Error>, pebble: &Pebble) -> Self {
         let state = config.state();
         let acceptor = state.acceptor();
         let server_config = Arc::new(
@@ -64,12 +64,8 @@ impl Site {
                 .with_no_client_auth()
                 .with_cert_resolver(state.resolver()),
         );
-        let port = pebble.tls_alpn_port();
-        let listener = TcpListener::bind((LOCALHOST, port))
-            .await
-            .unwrap_or_else(|e| panic!("failed to bind {LOCALHOST}:{port}: {e}"));
         let mut server = JoinSet::new();
-        server.spawn(serve(listener, acceptor, server_config));
+        server.spawn(serve(pebble.tls_alpn_listener(), acceptor, server_config));
         Self { state, server }
     }
 
@@ -220,7 +216,7 @@ where
     C: CertCache<EC = io::Error> + AccountCache<EA = io::Error> + Send + Sync + 'static,
 {
     let config = pebble.config(&[domain]).cache(cache);
-    let mut site = Site::bind(config, pebble).await;
+    let mut site = Site::start(config, pebble);
     let mut events = AcmeEvents::default();
 
     tokio::time::timeout(ORDER_TIMEOUT, async {
@@ -274,7 +270,7 @@ async fn test_default_chain() {
     let pebble = Pebble::start().await;
     let domain = "default-chain.example.com";
 
-    let mut site = Site::bind(pebble.config(&[domain]), &pebble).await;
+    let mut site = Site::start(pebble.config(&[domain]), &pebble);
     site.deploy().await.expect("order failed");
 
     let peer_certs = fetch_chain_for(&pebble, domain).await;
@@ -379,7 +375,7 @@ async fn test_automatic_renewal() {
     let pebble = Pebble::start().await;
     let domain = "renewal.example.com";
 
-    let mut site = Site::bind(pebble.config(&[domain]), &pebble).await;
+    let mut site = Site::start(pebble.config(&[domain]), &pebble);
     site.deploy().await.expect("initial order failed");
     site.deploy().await.expect("renewal order failed");
 
@@ -399,7 +395,7 @@ async fn test_multi_domain_san() {
         "multi-3.example.com",
     ];
 
-    let mut site = Site::bind(pebble.config(&domains), &pebble).await;
+    let mut site = Site::start(pebble.config(&domains), &pebble);
     site.deploy().await.expect("order failed");
 
     for domain in domains {

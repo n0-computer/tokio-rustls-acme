@@ -45,6 +45,9 @@ const RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Stops both processes when dropped, and prints their logs if the test panicked.
 pub(crate) struct Pebble {
     ports: Ports,
+    /// The tls-alpn-01 listener, open for Pebble's lifetime so that no other process can take
+    /// its port. Each [`Site`](crate::Site) serves on a clone of it.
+    tls_alpn_listener: TcpListener,
     client_config: Arc<ClientConfig>,
     processes: Vec<Process>,
     _dir: TempDir,
@@ -55,9 +58,15 @@ impl Pebble {
     pub(crate) async fn start() -> Self {
         let dir = tempfile::tempdir().expect("failed to create Pebble dir");
         let tls = WfeTls::generate(dir.path());
+        let tls_alpn_listener =
+            TcpListener::bind((LOCALHOST, 0)).expect("failed to bind the tls-alpn-01 listener");
+        let tls_alpn_port = tls_alpn_listener
+            .local_addr()
+            .expect("failed to read the tls-alpn-01 port")
+            .port();
         let mut last_error = None;
         for _ in 0..START_ATTEMPTS {
-            let ports = Ports::pick().expect("failed to pick free ports");
+            let ports = Ports::pick(tls_alpn_port).expect("failed to pick free ports");
             let mut processes = ports
                 .spawn(dir.path(), &tls)
                 .unwrap_or_else(|err| panic!("failed to start Pebble: {err}"));
@@ -65,6 +74,7 @@ impl Pebble {
                 Ok(()) => {
                     return Self {
                         ports,
+                        tls_alpn_listener,
                         client_config: tls.client_config,
                         processes,
                         _dir: dir,
@@ -85,6 +95,21 @@ impl Pebble {
     /// Returns the port that Pebble connects to for tls-alpn-01 validation.
     pub(crate) fn tls_alpn_port(&self) -> u16 {
         self.ports.tls_alpn
+    }
+
+    /// Returns a clone of the tls-alpn-01 listener for tokio.
+    ///
+    /// The listener stays open in [`Pebble`], so the port is never free for another process,
+    /// also not between two sites that serve it in turn.
+    pub(crate) fn tls_alpn_listener(&self) -> tokio::net::TcpListener {
+        let listener = self
+            .tls_alpn_listener
+            .try_clone()
+            .expect("failed to clone the tls-alpn-01 listener");
+        listener
+            .set_nonblocking(true)
+            .expect("failed to make the tls-alpn-01 listener non-blocking");
+        tokio::net::TcpListener::from_std(listener).expect("failed to register the listener")
     }
 
     /// Returns the URL of the ACME directory.
@@ -154,10 +179,11 @@ struct Ports {
 }
 
 impl Ports {
-    /// Picks distinct free ports.
+    /// Picks distinct free ports, with `tls_alpn` as the tls-alpn-01 port.
     ///
     /// Another process can take a port before Pebble binds it, so callers retry on failure.
-    fn pick() -> io::Result<Self> {
+    /// The tls-alpn-01 port is held by its listener, so it can't be picked again.
+    fn pick(tls_alpn: u16) -> io::Result<Self> {
         // Hold every listener until all ports are picked, so that no port is picked twice.
         let mut held = Vec::new();
         let dns = loop {
@@ -169,7 +195,7 @@ impl Ports {
         Ok(Self {
             acme: take_free_port(&mut held)?,
             management: take_free_port(&mut held)?,
-            tls_alpn: take_free_port(&mut held)?,
+            tls_alpn,
             http: take_free_port(&mut held)?,
             dns,
             challtestsrv_management: take_free_port(&mut held)?,
