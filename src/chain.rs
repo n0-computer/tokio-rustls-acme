@@ -404,6 +404,10 @@ mod tests {
             (&[Cert::Intermediate], &ec, false),
             // Without the intermediate.
             (&[Cert::Leaf, Cert::EcRoot], &ec, false),
+            // Issuers that may not issue certificates.
+            (&[Cert::Leaf, Cert::IntermediateExpired], &ec, false),
+            (&[Cert::Leaf, Cert::IntermediateNotCa], &ec, false),
+            (&[Cert::Leaf, Cert::IntermediateWithoutCertSign], &ec, false),
             // Issued by the name of the next certificate, but not signed by its key.
             (
                 &[Cert::Leaf, Cert::Intermediate, Cert::RsaRoot],
@@ -424,18 +428,18 @@ mod tests {
     fn required_schemes_follow_the_signer_keys() {
         let primary = chain(CROSS_SIGNED_ROOT.primary);
         let alternate = chain(CROSS_SIGNED_ROOT.alternate);
-        // The cross-signature needs RSA, the ECDSA signatures are by P-256 keys.
+        // The cross-signature needs RSA, the ECDSA signatures are by P-384 keys.
         assert_eq!(
             primary.required_schemes(&alternate, &algorithms()),
             RequiredSchemes::Known(vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
                 SignatureScheme::RSA_PKCS1_SHA256,
             ])
         );
         // The intermediate's signer, the ECDSA root, is only in the other chain.
         assert_eq!(
             alternate.required_schemes(&primary, &algorithms()),
-            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP256_SHA256])
+            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP384_SHA384])
         );
         // Without the other chain, the curve of the topmost signer is unknown.
         assert_eq!(
@@ -446,7 +450,7 @@ mod tests {
         assert_eq!(
             chain(&[Cert::Leaf, Cert::Intermediate, Cert::EcRoot])
                 .required_schemes(&chain(&[]), &algorithms()),
-            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP256_SHA256])
+            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP384_SHA384])
         );
     }
 
@@ -457,7 +461,7 @@ mod tests {
         assert_eq!(
             primary.required_schemes(&alternate, &algorithms()),
             RequiredSchemes::Known(vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
                 SignatureScheme::RSA_PKCS1_SHA256,
             ])
         );
@@ -468,13 +472,13 @@ mod tests {
         );
         assert_eq!(
             alternate.likely_required_schemes(&primary, &algorithms()),
-            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP256_SHA256])
+            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP384_SHA384])
         );
         // A known signer decides, whatever the hash.
         assert_eq!(
             chain(CROSS_SIGNED_ROOT.alternate)
                 .likely_required_schemes(&chain(CROSS_SIGNED_ROOT.primary), &algorithms()),
-            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP256_SHA256])
+            RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP384_SHA384])
         );
     }
 

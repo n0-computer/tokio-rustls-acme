@@ -50,6 +50,12 @@ pub(crate) enum Cert {
     IntermediateByRsaPss,
     /// The intermediate's key, issued by the RSA root with RSA PKCS#1 SHA-256.
     IntermediateByRsa,
+    /// The intermediate's key, issued by the ECDSA root, expired.
+    IntermediateExpired,
+    /// The intermediate's key, issued by the ECDSA root, but not as a CA.
+    IntermediateNotCa,
+    /// The intermediate's key, issued by the ECDSA root, but not to sign certificates.
+    IntermediateWithoutCertSign,
 }
 
 impl Cert {
