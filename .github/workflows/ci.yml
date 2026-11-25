@@ -121,16 +121,10 @@ jobs:
         with:
           tool: cargo-make@${{ env.CARGO_MAKE_VERSION }},nextest@${{ env.NEXTEST_VERSION }}
       - run: cargo make check-lib
-      - name: other backend absent from dependency tree
-        if: matrix.absent
+      - if: matrix.absent
         env:
-          ABSENT: ${{ matrix.absent }}
-        run: |
-          tree=$(cargo tree --locked -e normal,build --no-default-features --features "$TEST_FEATURES" --prefix none --format '{p}')
-          if awk '{print $1}' <<<"$tree" | grep -qx "$ABSENT"; then
-            echo "$ABSENT is in the dependency tree for features $TEST_FEATURES"
-            exit 1
-          fi
+          ABSENT_BACKEND: ${{ matrix.absent }}
+        run: cargo make check-backend-absent
       - if: matrix.tests
         run: cargo make test
       - run: cargo make test-doc

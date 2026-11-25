@@ -30,6 +30,17 @@ description = "Check the library alone for TEST_FEATURES, so that dev-dependenci
 command = "cargo"
 args = ["check", "--locked", "--no-default-features", "--features", "${TEST_FEATURES}", "--lib"]
 
+[tasks.check-backend-absent]
+description = "Check that the crate ABSENT_BACKEND is not in the dependency tree for TEST_FEATURES"
+script = '''
+set -eu
+tree=$(cargo tree --locked -e normal,build --no-default-features --features "$TEST_FEATURES" --prefix none --format '{p}')
+if printf '%s\n' "$tree" | awk '{print $1}' | grep -qx "$ABSENT_BACKEND"; then
+    echo "$ABSENT_BACKEND is in the dependency tree for features $TEST_FEATURES"
+    exit 1
+fi
+'''
+
 [tasks.test]
 description = "Run the tests except the doctests and the Pebble tests"
 command = "cargo"
