@@ -1,67 +1,146 @@
+[config]
+skip_core_tasks = true
+default_to_workspace = false
+
 [env]
-# Crate features for the pebble tests. CI runs them once per crypto backend.
-PEBBLE_FEATURES = { value = "tls-webpki-roots,tls-ring", condition = { env_not_set = ["PEBBLE_FEATURES"] } }
+# Fails the build on warnings without RUSTFLAGS, which would invalidate the build cache.
+CARGO_BUILD_WARNINGS = "deny"
+# Crate features for the test tasks. CI sets them per job.
+TEST_FEATURES = { value = "axum,tls-webpki-roots,tls-ring,tls-aws-lc-rs", condition = { env_not_set = ["TEST_FEATURES"] } }
+# Pebble release for the pebble tests. After changing it, run `cargo make pebble-update-checksums`.
+PEBBLE_VERSION = "v2.10.3"
 
-[tasks.pebble-up]
-description = "Start Pebble ACME test server and its DNS server"
+[tasks.default]
+alias = "dev-flow"
+
+[tasks.dev-flow]
+description = "Fast local subset of the CI checks"
+dependencies = ["format-check", "clippy", "test", "test-doc"]
+
+[tasks.format-check]
+command = "cargo"
+args = ["fmt", "--all", "--check"]
+
+[tasks.clippy]
+command = "cargo"
+args = ["clippy", "--locked", "--all-targets", "--all-features"]
+
+[tasks.check-lib]
+description = "Check the library alone for TEST_FEATURES, so that dev-dependencies add no features"
+command = "cargo"
+args = ["check", "--locked", "--no-default-features", "--features", "${TEST_FEATURES}", "--lib"]
+
+[tasks.check-backend-absent]
+description = "Check that the crate ABSENT_BACKEND is not in the dependency tree for TEST_FEATURES"
 script = '''
-docker compose -f docker-compose.pebble.yml up -d
-echo "Waiting for Pebble and challtestsrv to be ready..."
-# challtestsrv answers 404 on /, which is enough to show that it runs.
-for url in https://localhost:14000/dir http://127.0.0.1:8055/; do
-    ready=
-    for i in $(seq 1 30); do
-        if curl -sk -o /dev/null "$url"; then
-            ready=1
-            break
-        fi
-        sleep 1
-    done
-    if [ -z "$ready" ]; then
-        echo "No response from $url"
-        docker compose -f docker-compose.pebble.yml logs
-        exit 1
-    fi
-done
-echo "Pebble and challtestsrv are ready"
+set -eu
+tree=$(cargo tree --locked -e normal,build --no-default-features --features "$TEST_FEATURES" --prefix none --format '{p}')
+if printf '%s\n' "$tree" | awk '{print $1}' | grep -qx "$ABSENT_BACKEND"; then
+    echo "$ABSENT_BACKEND is in the dependency tree for features $TEST_FEATURES"
+    exit 1
+fi
 '''
 
-[tasks.pebble-down]
-description = "Stop Pebble ACME test server and its DNS server"
-script = '''
-docker compose -f docker-compose.pebble.yml down
-rm -f pebble.minica.pem
-'''
-
-[tasks.pebble-cert]
-description = "Extract Pebble minica root cert"
-dependencies = ["pebble-up"]
-script = '''
-docker compose -f docker-compose.pebble.yml cp pebble:/test/certs/pebble.minica.pem ./pebble.minica.pem
-'''
-
-[tasks.pebble-test-run]
-description = "Run Pebble integration tests"
-dependencies = ["pebble-cert"]
-env = { "PEBBLE_MINICA_CERT" = "./pebble.minica.pem" }
+[tasks.test]
+description = "Run the tests except the doctests and the Pebble tests"
 command = "cargo"
 args = [
-    "test",
+    "nextest",
+    "run",
     "--locked",
     "--no-default-features",
     "--features",
-    "${PEBBLE_FEATURES}",
-    "--test",
-    "pebble",
-    "--",
-    "--ignored",
-    "--nocapture",
+    "${TEST_FEATURES}",
+    "--lib",
+    "--bins",
+    "--tests",
 ]
 
-[tasks.test]
-clear = true
-description = "Run Pebble integration tests e2e (start server, test, stop)"
-run_task = { name = ["pebble-test-run"], fork = true, cleanup_task = "pebble-down" }
+[tasks.test-doc]
+description = "Run the doctests"
+command = "cargo"
+args = ["test", "--locked", "--no-default-features", "--features", "${TEST_FEATURES}", "--doc"]
+
+[tasks.test-pebble]
+description = "Run the Pebble integration tests, which are ignored by default"
+dependencies = ["pebble-install"]
+command = "cargo"
+args = [
+    "nextest",
+    "run",
+    "--locked",
+    "--no-default-features",
+    "--features",
+    "${TEST_FEATURES}",
+    "--test",
+    "pebble",
+    "--run-ignored",
+    "only",
+]
+
+[tasks.test-feature-combos]
+description = "Run the tests for each crypto backend alone, as CI does"
+script = '''
+set -eu
+for features in tls-webpki-roots,tls-ring tls-webpki-roots,tls-aws-lc-rs; do
+    TEST_FEATURES=$features cargo make test
+done
+'''
+
+[tasks.pebble-install]
+description = "Download the Pebble and challtestsrv binaries to target/pebble"
+script = '''
+set -eu
+dir=target/pebble
+if [ "$(cat "$dir/version" 2>/dev/null)" = "$PEBBLE_VERSION" ]; then
+    exit 0
+fi
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64) platform=linux-amd64 ;;
+    Linux-aarch64) platform=linux-arm64 ;;
+    Darwin-x86_64) platform=darwin-amd64 ;;
+    Darwin-arm64) platform=darwin-arm64 ;;
+    *) echo "No Pebble release for $(uname -s) $(uname -m)"; exit 1 ;;
+esac
+if command -v sha256sum > /dev/null; then
+    sha256="sha256sum"
+else
+    sha256="shasum -a 256"
+fi
+mkdir -p "$dir"
+for name in pebble pebble-challtestsrv; do
+    archive="$name-$platform.tar.gz"
+    curl -sSfL -o "$dir/$archive" \
+        "https://github.com/letsencrypt/pebble/releases/download/$PEBBLE_VERSION/$archive"
+    grep " $archive\$" test/pebble.sha256 | (cd "$dir" && $sha256 -c -)
+    tar -xzf "$dir/$archive" -C "$dir" --strip-components 3
+    chmod +x "$dir/$name"
+    rm "$dir/$archive"
+done
+echo "$PEBBLE_VERSION" > "$dir/version"
+'''
+
+[tasks.pebble-update-checksums]
+description = "Write the checksums of the Pebble release PEBBLE_VERSION to test/pebble.sha256"
+script = '''
+set -eu
+if command -v sha256sum > /dev/null; then
+    sha256="sha256sum"
+else
+    sha256="shasum -a 256"
+fi
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+for name in pebble pebble-challtestsrv; do
+    for platform in darwin-amd64 darwin-arm64 linux-amd64 linux-arm64; do
+        archive="$name-$platform.tar.gz"
+        curl -sSfL -o "$dir/$archive" \
+            "https://github.com/letsencrypt/pebble/releases/download/$PEBBLE_VERSION/$archive"
+    done
+done
+(cd "$dir" && $sha256 *.tar.gz) > test/pebble.sha256
+cat test/pebble.sha256
+'''
 
 [tasks.check-external-types]
 description = "Run cargo check-external-types on workspace crates"
@@ -72,44 +151,3 @@ toolchain = "${TOOLCHAIN:nightly-2026-03-20}"
 command = "cargo"
 install_crate = false
 args = ["check-external-types", "--all-features"]
-
-[tasks.test-ring]
-description = "Run tests with only the ring crypto provider feature enabled"
-command = "cargo"
-args = [
-    "test",
-    "--locked",
-    "--no-default-features",
-    "--features",
-    "tls-webpki-roots,tls-ring",
-]
-
-[tasks.test-aws-lc-rs]
-description = "Run tests with only the aws-lc-rs crypto provider feature enabled"
-command = "cargo"
-args = [
-    "test",
-    "--locked",
-    "--no-default-features",
-    "--features",
-    "tls-webpki-roots,tls-aws-lc-rs",
-]
-
-[tasks.test-both-providers]
-description = "Run tests with both ring and aws-lc-rs crypto provider features enabled"
-command = "cargo"
-args = [
-    "test",
-    "--locked",
-    "--no-default-features",
-    "--features",
-    "tls-webpki-roots,tls-ring,tls-aws-lc-rs",
-]
-
-[tasks.test-feature-combos]
-description = "Run the full crypto provider feature matrix the CI uses"
-dependencies = [
-    "test-ring",
-    "test-aws-lc-rs",
-    "test-both-providers",
-]
