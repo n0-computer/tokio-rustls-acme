@@ -13,6 +13,7 @@
 //! Run with: `cargo test --test pebble -- --ignored`, or all of the above with `cargo make test`.
 
 use std::{
+    collections::BTreeSet,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
@@ -557,7 +558,7 @@ async fn test_multi_domain_san() {
     }
 }
 
-/// Collects the IP address SANs of a DER certificate.
+/// Collects the IP address SANs of a DER certificate, sorted.
 fn ip_sans(cert: &CertificateDer<'_>) -> Vec<IpAddr> {
     let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
     let san = cert
@@ -575,6 +576,8 @@ fn ip_sans(cert: &CertificateDer<'_>) -> Vec<IpAddr> {
             },
             _ => None,
         })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -716,15 +719,16 @@ async fn test_profile_selects_lifetime() {
     }
 }
 
-/// Requesting a profile the CA doesn't offer fails the order.
+/// Checks that an order for a profile the CA doesn't offer fails with `invalidProfile`.
 ///
-/// Pebble rejects the order before it validates anything, so the test does not listen.
+/// Pebble rejects the order before it validates anything, so the test does not listen. The
+/// identifier is a documentation address, so a regression that validates hits no listener.
 #[tokio::test]
 #[ignore]
 async fn test_unknown_profile_is_rejected() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let config = pebble_config(&["127.0.0.1"]).profile("no-such-profile");
+    let config = pebble_config(&["192.0.2.1"]).profile("no-such-profile");
     let mut site = Site::bind(config, &[]).await;
     let err = site
         .deploy()

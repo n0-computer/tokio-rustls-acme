@@ -20,7 +20,9 @@ use tracing::{info, warn};
 use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
-use crate::acme::{Account, AcmeError, Auth, AuthStatus, Directory, Order, OrderStatus};
+use crate::acme::{
+    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
+};
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
 type Timer = std::pin::Pin<Box<Sleep>>;
@@ -315,17 +317,30 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         )
         .await?;
 
-        let mut params = CertificateParams::new(config.domains.clone()).map_err(rcgen_err)?;
+        let identifiers = config.identifiers();
+        if config.profile.is_none() && identifiers.iter().any(|id| matches!(id, Identifier::Ip(_)))
+        {
+            warn!(
+                "ordering IP identifiers without a profile, Let's Encrypt issues IP certificates only under the `shortlived` profile"
+            );
+        }
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = identifiers
+            .iter()
+            .map(Identifier::subject_alt_name)
+            .collect::<Result<_, _>>()
+            .map_err(rcgen_err)?;
         params.distinguished_name = DistinguishedName::new();
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(rcgen_err)?;
 
         let (order_url, mut order) = account
             .new_order(
                 &config.client_config,
-                config.domains.clone(),
+                &identifiers,
                 config.profile.as_deref(),
             )
             .await?;
+        info!(profile = ?config.profile, "created order");
         loop {
             match order.status {
                 OrderStatus::Pending => {
@@ -380,20 +395,17 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         url: &String,
     ) -> Result<(), OrderError> {
         let auth = account.auth(&config.client_config, url).await?;
-        let (domain, challenge_url) = match auth.status {
+        let (identifier, challenge_url) = match auth.status {
             AuthStatus::Pending => {
-                let domain = auth.identifier.to_string();
-                info!(%domain, "trigger challenge");
-                let (challenge, auth_key) = account.tls_alpn_01(
-                    config.crypto_provider(),
-                    &auth.challenges,
-                    domain.clone(),
-                )?;
-                resolver.set_auth_key(&auth.identifier, Arc::new(auth_key));
+                let identifier = auth.identifier;
+                info!(%identifier, "trigger challenge");
+                let (challenge, auth_key) =
+                    account.tls_alpn_01(config.crypto_provider(), &auth.challenges, &identifier)?;
+                resolver.set_auth_key(&identifier, Arc::new(auth_key));
                 account
                     .challenge(&config.client_config, &challenge.url)
                     .await?;
-                (domain, challenge.url.clone())
+                (identifier, challenge.url.clone())
             }
             AuthStatus::Valid => return Ok(()),
             _ => return Err(OrderError::BadAuth(auth)),
@@ -403,7 +415,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             let auth = account.auth(&config.client_config, url).await?;
             match auth.status {
                 AuthStatus::Pending => {
-                    info!(%domain, "authorization still pending");
+                    info!(%identifier, "authorization still pending");
                     account
                         .challenge(&config.client_config, &challenge_url)
                         .await?
@@ -412,7 +424,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 _ => return Err(OrderError::BadAuth(auth)),
             }
         }
-        Err(OrderError::TooManyAttemptsAuth(domain))
+        Err(OrderError::TooManyAttemptsAuth(identifier.to_string()))
     }
     fn poll_next_infinite(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Event<EC, EA>> {
         loop {

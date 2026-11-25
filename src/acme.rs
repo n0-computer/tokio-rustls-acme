@@ -14,7 +14,7 @@ pub use crate::jose::JoseError;
 use crate::jose::{key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rcgen::{CustomExtension, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, CustomExtension, PKCS_ECDSA_P256_SHA256, SanType};
 use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig,
@@ -135,23 +135,21 @@ impl Account {
         debug!(?body, "response");
         Ok((location, body))
     }
-    /// Creates a new order for `domains`, which may contain DNS names and IP addresses.
+    /// Creates a new order for `identifiers`.
     ///
     /// If `profile` is set, it is sent as the order's certificate profile (see
     /// [`AcmeConfig::profile`](crate::AcmeConfig::profile)).
     pub async fn new_order(
         &self,
         client_config: &Arc<ClientConfig>,
-        domains: Vec<String>,
+        identifiers: &[Identifier],
         profile: Option<&str>,
     ) -> Result<(String, Order), AcmeError> {
-        let identifiers: Vec<Identifier> = domains.into_iter().map(Identifier::from).collect();
-        let mut payload = json!({ "identifiers": identifiers });
-        if let Some(profile) = profile {
-            // draft-ietf-acme-profiles
-            payload["profile"] = profile.into();
-        }
-        let payload = payload.to_string();
+        let payload = serde_json::to_string(&NewOrder {
+            identifiers,
+            profile,
+        })
+        .map_err(json_err)?;
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
             .await?;
@@ -211,7 +209,7 @@ impl Account {
         &self,
         crypto_provider: &CryptoProvider,
         challenges: &'a [Challenge],
-        domain: String,
+        identifier: &Identifier,
     ) -> Result<(&'a Challenge, CertifiedKey), AcmeError> {
         let challenge = challenges
             .iter()
@@ -221,7 +219,8 @@ impl Account {
             Some(challenge) => challenge,
             None => return Err(AcmeError::NoTlsAlpn01Challenge),
         };
-        let mut params = rcgen::CertificateParams::new(vec![domain]).map_err(rcgen_err)?;
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![identifier.subject_alt_name().map_err(rcgen_err)?];
         let key_auth = key_authorization_sha256(&self.key_pair, &challenge.token)?;
         params.custom_extensions = vec![CustomExtension::new_acme_identifier(key_auth.as_ref())];
 
@@ -387,7 +386,7 @@ pub enum AuthStatus {
 /// The parsing follows [`IpAddr`]'s `FromStr`. An IPv4-mapped IPv6 address like
 /// `::ffff:192.0.2.1` stays an IPv6 identifier, which a CA may reject. Strings that do not parse,
 /// like `fe80::1%eth0` with a zone or `010.0.0.1` with a leading zero, become DNS identifiers.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum Identifier {
@@ -419,6 +418,56 @@ impl fmt::Display for Identifier {
             Identifier::Ip(ip) => ip.fmt(f),
         }
     }
+}
+
+impl Identifier {
+    /// Returns the subject alternative name that certifies this identifier.
+    pub(crate) fn subject_alt_name(&self) -> Result<SanType, rcgen::Error> {
+        Ok(match self {
+            Identifier::Dns(name) => SanType::DnsName(name.clone().try_into()?),
+            Identifier::Ip(ip) => SanType::IpAddress(*ip),
+        })
+    }
+    /// Returns the SNI an ACME server sends when validating this identifier with tls-alpn-01.
+    ///
+    /// For DNS identifiers this is the name itself (RFC 8737 section 3). SNI cannot carry IP
+    /// addresses, so for IP identifiers it is the reverse-DNS name (RFC 8738 section 6), e.g.
+    /// `1.2.0.192.in-addr.arpa` for `192.0.2.1`. The resolver matches it against the received
+    /// SNI, which rustls lowercases and the resolver strips of a trailing dot.
+    pub(crate) fn tls_alpn_01_server_name(&self) -> String {
+        match self {
+            Identifier::Dns(name) => name.to_ascii_lowercase(),
+            Identifier::Ip(ip) => reverse_dns_name(*ip),
+        }
+    }
+}
+
+/// Returns the reverse-DNS name of `ip` (RFC 1035 section 3.5, RFC 3596 section 2.5).
+fn reverse_dns_name(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, d] = v4.octets();
+            format!("{d}.{c}.{b}.{a}.in-addr.arpa")
+        }
+        IpAddr::V6(v6) => {
+            let nibbles: String = v6
+                .octets()
+                .iter()
+                .rev()
+                .map(|byte| format!("{:x}.{:x}.", byte & 0xf, byte >> 4))
+                .collect();
+            nibbles + "ip6.arpa"
+        }
+    }
+}
+
+/// The payload of a `newOrder` request (RFC 8555 section 7.4).
+#[derive(Debug, Serialize)]
+struct NewOrder<'a> {
+    identifiers: &'a [Identifier],
+    /// The certificate profile (draft-ietf-acme-profiles), left out when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'a str>,
 }
 
 /// A challenge object (RFC 8555 section 8).
@@ -511,6 +560,73 @@ mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::crypto::KeyProvider;
+    use rustls::sign::SigningKey;
+
+    #[test]
+    fn new_order_payload_has_profile_only_when_set() {
+        let identifiers = [Identifier::from("192.0.2.1")];
+        let payload = |profile| {
+            serde_json::to_string(&NewOrder {
+                identifiers: &identifiers,
+                profile,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            payload(None),
+            r#"{"identifiers":[{"type":"ip","value":"192.0.2.1"}]}"#
+        );
+        assert_eq!(
+            payload(Some("shortlived")),
+            r#"{"identifiers":[{"type":"ip","value":"192.0.2.1"}],"profile":"shortlived"}"#
+        );
+    }
+
+    #[test]
+    fn subject_alt_name_matches_the_identifier() {
+        assert_eq!(
+            Identifier::from("192.0.2.1").subject_alt_name().unwrap(),
+            SanType::IpAddress("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(
+            Identifier::from("example.com").subject_alt_name().unwrap(),
+            SanType::DnsName("example.com".try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn reverse_dns_name_ipv4() {
+        assert_eq!(
+            reverse_dns_name("192.0.2.1".parse().unwrap()),
+            "1.2.0.192.in-addr.arpa"
+        );
+    }
+
+    #[test]
+    fn reverse_dns_name_ipv6() {
+        // Example from RFC 3596 section 2.5, lowercased.
+        assert_eq!(
+            reverse_dns_name("4321:0:1:2:3:4:567:89ab".parse().unwrap()),
+            "b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.ip6.arpa"
+        );
+        assert_eq!(
+            reverse_dns_name("::1".parse().unwrap()),
+            format!("1.{}ip6.arpa", "0.".repeat(31))
+        );
+    }
+
+    #[test]
+    fn server_name_for_identifier() {
+        assert_eq!(
+            Identifier::from("Example.COM").tls_alpn_01_server_name(),
+            "example.com"
+        );
+        assert_eq!(
+            Identifier::from("10.0.0.1").tls_alpn_01_server_name(),
+            "1.0.0.10.in-addr.arpa"
+        );
+    }
 
     #[test]
     fn identifier_from_str() {
@@ -568,9 +684,6 @@ mod tests {
         assert_eq!(Identifier::from("example.com").to_string(), "example.com");
     }
 
-    use rustls::crypto::KeyProvider;
-    use rustls::sign::SigningKey;
-
     #[derive(Debug)]
     struct RejectingKeyProvider;
 
@@ -608,7 +721,7 @@ mod tests {
             error: None,
         }];
 
-        let result = account.tls_alpn_01(&provider, &challenges, "example.com".into());
+        let result = account.tls_alpn_01(&provider, &challenges, &Identifier::from("example.com"));
         assert!(matches!(result, Err(AcmeError::Crypto(_))));
     }
 

@@ -1,5 +1,6 @@
 use crate::acme::{
-    ExternalAccountKey, LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY,
+    ExternalAccountKey, Identifier, LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+    LETS_ENCRYPT_STAGING_DIRECTORY,
 };
 use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
@@ -160,14 +161,26 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     /// Sets the identifiers to request a certificate for, replacing the current ones.
     ///
     /// Each identifier is a DNS name or an IP address.
-    pub fn domains(mut self, contact: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
-        self.domains = contact.into_iter().map(|s| s.as_ref().into()).collect();
+    pub fn domains(mut self, domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        self.domains = domains.into_iter().map(|s| s.as_ref().into()).collect();
         self
     }
     /// Adds an identifier (DNS name or IP address) to request a certificate for.
-    pub fn domains_push(mut self, contact: impl AsRef<str>) -> Self {
-        self.domains.push(contact.as_ref().into());
+    pub fn domains_push(mut self, domain: impl AsRef<str>) -> Self {
+        self.domains.push(domain.as_ref().into());
         self
+    }
+
+    /// Returns the configured identifiers, parsed and without duplicates.
+    pub(crate) fn identifiers(&self) -> Vec<Identifier> {
+        let mut identifiers = Vec::new();
+        for domain in &self.domains {
+            let identifier = Identifier::from(domain.as_str());
+            if !identifiers.contains(&identifier) {
+                identifiers.push(identifier);
+            }
+        }
+        identifiers
     }
 
     /// Requests certificates with the given ACME profile.

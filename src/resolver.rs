@@ -2,7 +2,6 @@ use crate::acme::{ACME_TLS_ALPN_NAME, Identifier};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::BTreeMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::debug;
@@ -30,7 +29,7 @@ impl ResolvesServerCertAcme {
         })
     }
     pub(crate) fn set_cert(&self, cert: Arc<CertifiedKey>) {
-        self.inner.lock().unwrap().cert = Some(cert);
+        self.inner.lock().expect("poisoned").cert = Some(cert);
     }
     /// Serves `cert` to tls-alpn-01 validation requests for `identifier`.
     ///
@@ -40,7 +39,7 @@ impl ResolvesServerCertAcme {
         let server_name = identifier.tls_alpn_01_server_name();
         self.inner
             .lock()
-            .unwrap()
+            .expect("poisoned")
             .auth_keys
             .insert(server_name, cert);
     }
@@ -62,57 +61,23 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
                 Some(server_name) => self
                     .inner
                     .lock()
-                    .unwrap()
+                    .expect("poisoned")
                     .auth_keys
                     .get(challenge_server_name(server_name))
                     .cloned(),
             }
         } else {
-            self.inner.lock().unwrap().cert.clone()
+            self.inner.lock().expect("poisoned").cert.clone()
         }
     }
 }
 
-impl Identifier {
-    /// Returns the SNI an ACME server sends when validating this identifier with tls-alpn-01.
-    ///
-    /// For DNS identifiers this is the name itself (RFC 8737 section 3). SNI cannot carry IP
-    /// addresses, so for IP identifiers it is the reverse-DNS name (RFC 8738 section 6), e.g.
-    /// `1.2.0.192.in-addr.arpa` for `192.0.2.1`. rustls lowercases the received SNI and
-    /// [`challenge_server_name`] strips a trailing dot, so we produce that form.
-    fn tls_alpn_01_server_name(&self) -> String {
-        match self {
-            Identifier::Dns(name) => name.to_ascii_lowercase(),
-            Identifier::Ip(ip) => reverse_dns_name(*ip),
-        }
-    }
-}
-
-/// Returns the received SNI `server_name` in the form [`Identifier::tls_alpn_01_server_name`]
-/// produces.
+/// Returns the received SNI `server_name` without a trailing dot.
 ///
-/// rustls lowercases the SNI it receives but keeps a trailing dot, which a CA may send.
+/// rustls lowercases the SNI it receives but keeps a trailing dot, which a CA may send. The
+/// result matches [`Identifier::tls_alpn_01_server_name`].
 fn challenge_server_name(server_name: &str) -> &str {
     server_name.strip_suffix('.').unwrap_or(server_name)
-}
-
-/// Returns the reverse-DNS name of `ip` (RFC 1035 section 3.5, RFC 3596 section 2.5).
-fn reverse_dns_name(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, c, d] = v4.octets();
-            format!("{d}.{c}.{b}.{a}.in-addr.arpa")
-        }
-        IpAddr::V6(v6) => {
-            let nibbles: String = v6
-                .octets()
-                .iter()
-                .rev()
-                .map(|byte| format!("{:x}.{:x}.", byte & 0xf, byte >> 4))
-                .collect();
-            nibbles + "ip6.arpa"
-        }
-    }
 }
 
 #[cfg(test)]
@@ -124,27 +89,6 @@ mod tests {
     use rustls::{ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme};
 
     #[test]
-    fn reverse_dns_name_ipv4() {
-        assert_eq!(
-            reverse_dns_name("192.0.2.1".parse().unwrap()),
-            "1.2.0.192.in-addr.arpa"
-        );
-    }
-
-    #[test]
-    fn reverse_dns_name_ipv6() {
-        // Example from RFC 3596 section 2.5, lowercased.
-        assert_eq!(
-            reverse_dns_name("4321:0:1:2:3:4:567:89ab".parse().unwrap()),
-            "b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.ip6.arpa"
-        );
-        assert_eq!(
-            reverse_dns_name("::1".parse().unwrap()),
-            format!("1.{}ip6.arpa", "0.".repeat(31))
-        );
-    }
-
-    #[test]
     fn challenge_server_name_strips_one_trailing_dot() {
         // The rustls client strips the dot before sending, so a handshake cannot test this.
         assert_eq!(
@@ -152,18 +96,6 @@ mod tests {
             "1.2.0.192.in-addr.arpa"
         );
         assert_eq!(challenge_server_name("example.org"), "example.org");
-    }
-
-    #[test]
-    fn server_name_for_identifier() {
-        assert_eq!(
-            Identifier::from("Example.COM").tls_alpn_01_server_name(),
-            "example.com"
-        );
-        assert_eq!(
-            Identifier::from("10.0.0.1").tls_alpn_01_server_name(),
-            "1.0.0.10.in-addr.arpa"
-        );
     }
 
     /// Accepts any server certificate, so the handshake only depends on the resolver.
@@ -282,11 +214,24 @@ mod tests {
         let resolver = ResolvesServerCertAcme::new();
         let (key, der) = certified_key("example.org");
         resolver.set_auth_key(&Identifier::from("example.org"), key);
-        let served = validation_handshake(resolver.clone(), "example.org")
-            .await
-            .unwrap();
+        let served = validation_handshake(resolver, "example.org").await.unwrap();
         assert_eq!(served, der);
-        // Unknown names are not served a challenge certificate.
+    }
+
+    #[tokio::test]
+    async fn resolves_mixed_case_dns_identifier() {
+        let resolver = ResolvesServerCertAcme::new();
+        let (key, der) = certified_key("example.org");
+        resolver.set_auth_key(&Identifier::from("Example.ORG"), key);
+        let served = validation_handshake(resolver, "EXAMPLE.org").await.unwrap();
+        assert_eq!(served, der);
+    }
+
+    #[tokio::test]
+    async fn serves_no_challenge_certificate_for_unknown_names() {
+        let resolver = ResolvesServerCertAcme::new();
+        let (key, _) = certified_key("example.org");
+        resolver.set_auth_key(&Identifier::from("example.org"), key);
         assert!(validation_handshake(resolver, "other.org").await.is_err());
     }
 }

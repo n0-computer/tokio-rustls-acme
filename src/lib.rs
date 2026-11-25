@@ -98,8 +98,9 @@
 //!
 //! Identifiers that parse as IP addresses are requested as IP identifiers (RFC 8738) and
 //! validated with tls-alpn-01 like domains, so the server must be reachable on port 443 of
-//! each address. Let's Encrypt only issues IP address certificates under the `shortlived`
-//! certificate profile, so set it with [AcmeConfig::profile]:
+//! each address. Public CAs only issue for public addresses, not for loopback, private or
+//! link-local ones. Let's Encrypt only issues IP address certificates under the `shortlived`
+//! certificate profile, so set it with [`AcmeConfig::profile`]:
 //!
 //! ```rust
 //! # use tokio_rustls_acme::AcmeConfig;
