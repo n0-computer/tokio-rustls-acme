@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tracing::debug;
+use x509_parser::extensions::GeneralName;
 
 /// Directory URL of the Let's Encrypt staging environment.
 pub const LETS_ENCRYPT_STAGING_DIRECTORY: &str =
@@ -507,6 +508,22 @@ impl Identifier {
         }
         Ok(normalized)
     }
+    /// Returns whether the subject alternative name `name` certifies this identifier.
+    pub(crate) fn is_certified_by(&self, name: &GeneralName<'_>) -> bool {
+        match (self, name) {
+            (Identifier::Dns(dns), GeneralName::DNSName(name)) => name
+                .strip_suffix('.')
+                .unwrap_or(name)
+                .eq_ignore_ascii_case(dns),
+            (Identifier::Ip(IpAddr::V4(ip)), GeneralName::IPAddress(octets)) => {
+                *octets == ip.octets()
+            }
+            (Identifier::Ip(IpAddr::V6(ip)), GeneralName::IPAddress(octets)) => {
+                *octets == ip.octets()
+            }
+            _ => false,
+        }
+    }
     /// Returns the subject alternative name that certifies this identifier.
     pub(crate) fn subject_alt_name(&self) -> Result<SanType, rcgen::Error> {
         Ok(match self {
@@ -706,6 +723,32 @@ mod tests {
     fn id(s: &str) -> Identifier {
         s.parse()
             .unwrap_or_else(|err| panic!("{s:?} should parse: {err}"))
+    }
+
+    #[test]
+    fn is_certified_by_matches_the_san_type_and_value() {
+        let v4 = [192, 0, 2, 1];
+        let v6 = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
+        let cases = [
+            ("example.com", GeneralName::DNSName("Example.COM."), true),
+            (
+                "example.com",
+                GeneralName::DNSName("www.example.com"),
+                false,
+            ),
+            ("192.0.2.1", GeneralName::IPAddress(&v4), true),
+            ("192.0.2.1", GeneralName::DNSName("192.0.2.1"), false),
+            ("2001:db8::1", GeneralName::IPAddress(&v6), true),
+            ("2001:db8::1", GeneralName::IPAddress(&v4), false),
+        ];
+        for (identifier, name, certified) in cases {
+            let identifier: Identifier = identifier.parse().unwrap();
+            assert_eq!(
+                identifier.is_certified_by(&name),
+                certified,
+                "{identifier} by {name:?}"
+            );
+        }
     }
 
     #[test]

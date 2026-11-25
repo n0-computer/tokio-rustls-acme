@@ -103,6 +103,22 @@ fn max_retry_delay(expiry: Option<OffsetDateTime>, now: OffsetDateTime) -> Durat
         .min((left / 2).max(BACKOFF_BASE_DELAY))
 }
 
+/// Returns the first of `identifiers` that the leaf of `cert` doesn't certify in its SANs.
+fn uncertified_identifier<'a>(
+    cert: &CertifiedKey,
+    identifiers: &'a [Identifier],
+) -> Option<&'a Identifier> {
+    let leaf = cert.end_entity_cert().ok();
+    let leaf = leaf.and_then(|leaf| parse_x509_certificate(leaf).ok());
+    let san = leaf
+        .as_ref()
+        .and_then(|(_, leaf)| leaf.subject_alternative_name().ok().flatten());
+    let names = san.map_or(&[][..], |san| &san.value.general_names[..]);
+    identifiers
+        .iter()
+        .find(|identifier| !names.iter().any(|name| identifier.is_certified_by(name)))
+}
+
 /// Returns the delay after stalled order round `round`, or `None` once the order should fail.
 fn stall_delay(round: u32) -> Option<Duration> {
     (round < MAX_STALLED_ROUNDS).then(|| BACKOFF_BASE_DELAY * (1 << round))
@@ -203,7 +219,9 @@ pub enum EventError<EC: Debug, EA: Debug> {
     /// If the CA rejects the account, later orders use a new account key kept in memory only.
     #[error("order: {0}")]
     Order(OrderError),
-    /// The newly issued certificate could not be parsed.
+    /// The newly issued certificate is unusable, so the deployed one stays.
+    ///
+    /// The order is retried after a backoff.
     #[error("new cert parse: {0}")]
     NewCertParse(CertParseError),
 }
@@ -247,7 +265,7 @@ pub enum OrderError {
     ProcessingTimeout(Order),
 }
 
-/// An error from parsing a PEM bundle of private key and certificate chain.
+/// Why a PEM bundle of private key and certificate chain can't be served.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum CertParseError {
@@ -270,6 +288,9 @@ pub enum CertParseError {
     /// The newly issued certificate has already expired.
     #[error("certificate has already expired")]
     Expired,
+    /// The newly issued certificate doesn't certify an ordered identifier in its SANs.
+    #[error("certificate does not certify {0}")]
+    MissingIdentifier(Identifier),
 }
 
 fn rcgen_err(err: rcgen::Error) -> OrderError {
@@ -435,6 +456,16 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         if !cached && not_after <= OffsetDateTime::now_utc() {
             warn!(%not_after, "the CA issued an expired certificate, keeping the deployed one");
             return Err(EventError::NewCertParse(CertParseError::Expired));
+        }
+        // Without one, clients that connect by it would fail after a successful deployment.
+        if let CertSource::Order(identifiers) = &source
+            && let Some(missing) = uncertified_identifier(&cert, &identifiers.order)
+        {
+            warn!(%missing, "the CA left an ordered identifier out, keeping the deployed one");
+            let missing = missing.clone();
+            return Err(EventError::NewCertParse(CertParseError::MissingIdentifier(
+                missing,
+            )));
         }
         self.resolver.set_cert(Arc::new(cert));
         self.renew_at = Some(renewal_time(not_before, not_after));
