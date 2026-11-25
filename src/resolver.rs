@@ -1,5 +1,6 @@
 use crate::acme::ACME_TLS_ALPN_NAME;
-use crate::chain::RequiredSchemes;
+use crate::chain::{CertChain, RequiredSchemes};
+use rustls::SignatureScheme;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::BTreeMap;
@@ -7,25 +8,62 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::{debug, warn};
 
-/// Cert resolver that serves the issued certificate to application traffic
-/// and per-domain validation certificates to `tls-alpn-01` clients.
+/// Cert resolver for the issued certificate and the `tls-alpn-01` validation certificates.
+///
+/// It serves the issued certificate to application traffic, and the validation certificate of each
+/// domain to `tls-alpn-01` clients. With
+/// [`CertChainPreference::DualChain`](crate::CertChainPreference::DualChain), the resolver only
+/// serves the primary chain. rustls filters the ClientHello's signature schemes by the cipher
+/// suites before it calls a resolver, which hides schemes that clients can verify in certificates.
+/// So [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream) picks the alternate from the
+/// unfiltered ClientHello, as [`Incoming`](crate::Incoming) and the Axum acceptor do. A
+/// `ServerConfig` that uses this resolver on its own serves the primary to every client.
 #[derive(Debug)]
 pub struct ResolvesServerCertAcme {
     inner: Mutex<Inner>,
 }
 
-/// A certificate chain with its key, and the schemes needed to verify the chain.
+/// An alternate chain for DualChain mode, with the schemes that verifying each chain takes.
 #[derive(Debug)]
-pub(crate) struct ServedCert {
+pub(crate) struct AlternateChain {
+    /// The alternate chain with the primary's key.
     pub(crate) key: Arc<CertifiedKey>,
-    pub(crate) schemes: RequiredSchemes,
+    /// The schemes a client needs to verify the primary chain.
+    pub(crate) primary_schemes: RequiredSchemes,
+    /// The schemes a client needs to verify the alternate chain.
+    pub(crate) alternate_schemes: RequiredSchemes,
+}
+
+impl AlternateChain {
+    /// Creates the alternate `alternate` for the primary chain `primary`.
+    ///
+    /// The primary's schemes must be exact, while the alternate's may be guessed, see
+    /// [`CertChain::likely_required_schemes`]: the alternate goes only to clients that can't
+    /// verify the primary.
+    pub(crate) fn new(primary: &CertChain, alternate: CertifiedKey) -> Self {
+        let alternate_chain = CertChain::new(alternate.cert.clone());
+        Self {
+            primary_schemes: primary.required_schemes(&alternate_chain),
+            alternate_schemes: alternate_chain.likely_required_schemes(primary),
+            key: Arc::new(alternate),
+        }
+    }
+
+    /// Returns whether a client offering `offered` should get this alternate.
+    ///
+    /// That is when the client can't verify the primary chain but can verify the alternate. If
+    /// either is unknown, the client gets the primary.
+    fn serves(&self, offered: &[SignatureScheme]) -> bool {
+        self.primary_schemes.supported_by(offered) == Some(false)
+            && self.alternate_schemes.supported_by(offered) == Some(true)
+    }
 }
 
 #[derive(Debug)]
 struct Inner {
-    cert: Option<ServedCert>,
+    cert: Option<Arc<CertifiedKey>>,
     /// Alternate chain for DualChain mode, for clients that can only verify this one.
-    alt_cert: Option<ServedCert>,
+    alt_cert: Option<AlternateChain>,
     auth_keys: BTreeMap<String, Arc<CertifiedKey>>,
 }
 
@@ -45,9 +83,13 @@ impl ResolvesServerCertAcme {
     /// certificate, chained to a different root. An alternate with another leaf is dropped.
     /// Both are replaced under one lock, so no handshake sees a new primary with an old
     /// alternate.
-    pub(crate) fn set_certs(&self, primary: ServedCert, alternate: Option<ServedCert>) -> bool {
-        let alternate = alternate.filter(|alt| {
-            let matches = primary.key.end_entity_cert().ok() == alt.key.end_entity_cert().ok();
+    pub(crate) fn set_certs(
+        &self,
+        primary: Arc<CertifiedKey>,
+        alternate: Option<AlternateChain>,
+    ) -> bool {
+        let alternate = alternate.filter(|alternate| {
+            let matches = primary.end_entity_cert().ok() == alternate.key.end_entity_cert().ok();
             if !matches {
                 warn!("alternate chain doesn't match the certificate, not serving it");
             }
@@ -62,6 +104,14 @@ impl ResolvesServerCertAcme {
     /// Returns whether an alternate chain is set, which DualChain serves to some clients.
     pub fn serves_alternate_chain(&self) -> bool {
         self.inner.lock().expect("poisoned").alt_cert.is_some()
+    }
+    /// Returns the alternate chain for a client that offers the signature schemes `offered`.
+    ///
+    /// Returns `None` if the client should get the primary, see [`AlternateChain::serves`].
+    pub(crate) fn alternate_for(&self, offered: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        let inner = self.inner.lock().expect("poisoned");
+        let alternate = inner.alt_cert.as_ref()?;
+        alternate.serves(offered).then(|| alternate.key.clone())
     }
     pub(crate) fn set_auth_key(&self, domain: String, cert: Arc<CertifiedKey>) {
         self.inner
@@ -97,22 +147,7 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
                 }
             }
         } else {
-            let inner = self.inner.lock().expect("poisoned");
-            let offered = client_hello.signature_schemes();
-
-            // In DualChain mode: if the client can't verify the primary chain
-            // but can verify the alternate, serve the alternate. Verifying a
-            // chain takes every signature scheme in it, so a client that
-            // supports only some of the primary's schemes can't use it. If
-            // either chain has an unknown scheme, keep the primary.
-            if let (Some(primary), Some(alt)) = (&inner.cert, &inner.alt_cert)
-                && primary.schemes.supported_by(offered) == Some(false)
-                && alt.schemes.supported_by(offered) == Some(true)
-            {
-                return Some(alt.key.clone());
-            }
-
-            inner.cert.as_ref().map(|c| c.key.clone())
+            self.inner.lock().expect("poisoned").cert.clone()
         }
     }
 }
@@ -120,253 +155,70 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CertCache;
-    use crate::caches::TestCache;
-    use rustls::SignatureScheme;
-    use rustls::crypto::{CryptoProvider, ring};
-    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
-    use rustls::{ClientConfig, RootCertStore, ServerConfig};
-    use std::convert::Infallible;
-    use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use crate::fixture::{self, CROSS_SIGNED_ROOT, Cert};
 
-    const SERVER_NAME: &str = "test.example.com";
-    /// Buffer size of the in-memory connection between client and server.
-    const DUPLEX_BUFFER: usize = 4096;
-    /// The scheme of the test CA's P-256 signatures, which ring clients advertise.
     const P256: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+    const P384: SignatureScheme = SignatureScheme::ECDSA_NISTP384_SHA384;
+    const RSA: SignatureScheme = SignatureScheme::RSA_PKCS1_SHA256;
 
-    /// Returns a certificate from `cache` as a key and its chain.
-    async fn make_cert(
-        cache: &TestCache<Infallible, Infallible>,
-    ) -> (Arc<CertifiedKey>, Vec<CertificateDer<'static>>) {
-        let pem_bytes = cache
-            .load_cert(&[SERVER_NAME.to_string()], "")
-            .await
-            .unwrap()
-            .unwrap();
-        let mut pems = pem::parse_many(&pem_bytes).unwrap();
-        let pk_der: PrivatePkcs8KeyDer = pems.remove(0).into_contents().into();
-        let pk = ring::default_provider()
-            .key_provider
-            .load_private_key(pk_der.into())
-            .unwrap();
-        let cert_chain: Vec<CertificateDer<'static>> = pems
-            .into_iter()
-            .map(|p| CertificateDer::from(p.into_contents()))
-            .collect();
-        (
-            Arc::new(CertifiedKey::new(cert_chain.clone(), pk)),
-            cert_chain,
-        )
+    /// Returns the primary of [`CROSS_SIGNED_ROOT`] and the alternate `alternate` for it.
+    fn certs(alternate: &[Cert]) -> (Arc<CertifiedKey>, AlternateChain) {
+        let primary = fixture::certified_key(CROSS_SIGNED_ROOT.primary);
+        let alternate = AlternateChain::new(
+            &CertChain::new(primary.cert.clone()),
+            fixture::certified_key(alternate),
+        );
+        (Arc::new(primary), alternate)
     }
 
-    /// Returns `primary` with another chain, the leaf alone, which the test CA verifies directly.
-    fn alternate_of(
-        primary: &Arc<CertifiedKey>,
-    ) -> (Arc<CertifiedKey>, Vec<CertificateDer<'static>>) {
-        let chain = vec![primary.cert[0].clone()];
-        let key = Arc::new(CertifiedKey::new(chain.clone(), primary.key.clone()));
-        (key, chain)
+    #[test]
+    fn set_certs_keeps_only_an_alternate_for_the_same_leaf() {
+        let resolver = ResolvesServerCertAcme::new();
+        let (primary, alternate) = certs(CROSS_SIGNED_ROOT.alternate);
+        assert!(resolver.set_certs(primary, Some(alternate)));
+        assert!(resolver.serves_alternate_chain());
+
+        let (primary, other_leaf) = certs(&[Cert::Intermediate]);
+        assert!(!resolver.set_certs(primary.clone(), Some(other_leaf)));
+        assert!(!resolver.serves_alternate_chain());
+
+        let (_, alternate) = certs(CROSS_SIGNED_ROOT.alternate);
+        resolver.set_certs(primary.clone(), Some(alternate));
+        assert!(
+            !resolver.set_certs(primary, None),
+            "a new primary drops the alternate"
+        );
+        assert!(!resolver.serves_alternate_chain());
     }
 
-    /// Returns a served certificate with `schemes`.
-    fn served(key: Arc<CertifiedKey>, schemes: RequiredSchemes) -> ServedCert {
-        ServedCert { key, schemes }
-    }
-
-    /// Returns a root store with the certificates in `ca_pem`.
-    fn make_root_store(ca_pem: &str) -> RootCertStore {
-        let mut root_store = RootCertStore::empty();
-        for p in pem::parse_many(ca_pem).unwrap() {
-            root_store
-                .add(CertificateDer::from(p.into_contents()))
-                .unwrap();
+    #[test]
+    fn alternate_goes_to_clients_that_can_verify_only_it() {
+        let known = |schemes: &[SignatureScheme]| RequiredSchemes::Known(schemes.to_vec());
+        let cases = [
+            (known(&[P256, RSA]), known(&[P256]), &[P256][..], true),
+            (known(&[P256, RSA]), known(&[P256]), &[P256, RSA], false),
+            // The client can verify neither chain.
+            (known(&[P256, RSA]), known(&[P384]), &[P256], false),
+            (RequiredSchemes::Unknown, known(&[P256]), &[P256], false),
+            (
+                known(&[P256, RSA]),
+                RequiredSchemes::Unknown,
+                &[P256],
+                false,
+            ),
+        ];
+        for (primary_schemes, alternate_schemes, offered, served) in cases {
+            let (_, alternate) = certs(CROSS_SIGNED_ROOT.alternate);
+            let alternate = AlternateChain {
+                primary_schemes,
+                alternate_schemes,
+                ..alternate
+            };
+            assert_eq!(
+                alternate.serves(offered),
+                served,
+                "{alternate:?} for {offered:?}"
+            );
         }
-        root_store
-    }
-
-    /// Runs a TLS handshake with a ring client and returns the chain the server sent.
-    async fn do_handshake(
-        resolver: Arc<ResolvesServerCertAcme>,
-        root_store: RootCertStore,
-    ) -> Vec<CertificateDer<'static>> {
-        do_handshake_with(resolver, root_store, Arc::new(ring::default_provider())).await
-    }
-
-    /// Runs a TLS handshake with `client_provider` and returns the chain the server sent.
-    async fn do_handshake_with(
-        resolver: Arc<ResolvesServerCertAcme>,
-        root_store: RootCertStore,
-        client_provider: Arc<CryptoProvider>,
-    ) -> Vec<CertificateDer<'static>> {
-        // Explicit provider: with both ring (dev-dependency) and aws-lc-rs
-        // enabled, rustls can't pick a process default.
-        let server_config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let client_config = ClientConfig::builder_with_provider(client_provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(client_config));
-
-        let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUFFER);
-        let server_name = ServerName::try_from(SERVER_NAME).unwrap().to_owned();
-        let (client_result, server_result) = tokio::join!(
-            connector.connect(server_name, client_io),
-            acceptor.accept(server_io),
-        );
-        server_result.expect("TLS server handshake failed");
-        let client_tls = client_result.expect("TLS client handshake failed");
-        client_tls.get_ref().1.peer_certificates().unwrap().to_vec()
-    }
-
-    /// Serves the alternate to a client that lacks a scheme of the primary.
-    ///
-    /// The primary requires ED448, which ring clients don't advertise.
-    #[tokio::test]
-    async fn dual_chain_fallback_to_alt() {
-        let cache = TestCache::<Infallible, Infallible>::new();
-        let (primary_key, _) = make_cert(&cache).await;
-        let (alt_key, alt_chain) = alternate_of(&primary_key);
-
-        let resolver = ResolvesServerCertAcme::new();
-        let installed = resolver.set_certs(
-            served(
-                primary_key,
-                RequiredSchemes::Known(vec![SignatureScheme::ED448]),
-            ),
-            Some(served(alt_key, RequiredSchemes::Known(vec![P256]))),
-        );
-        assert!(installed);
-
-        let peer_certs = do_handshake(resolver, make_root_store(cache.ca_pem())).await;
-        assert_eq!(peer_certs, alt_chain);
-    }
-
-    /// Serves the primary to a client that supports its schemes, even with an alternate set.
-    #[tokio::test]
-    async fn dual_chain_serves_primary_when_supported() {
-        let cache = TestCache::<Infallible, Infallible>::new();
-        let (primary_key, primary_chain) = make_cert(&cache).await;
-        let (alt_key, _) = alternate_of(&primary_key);
-
-        let resolver = ResolvesServerCertAcme::new();
-        resolver.set_certs(
-            served(primary_key, RequiredSchemes::Known(vec![P256])),
-            Some(served(alt_key, RequiredSchemes::Known(vec![P256]))),
-        );
-
-        let peer_certs = do_handshake(resolver, make_root_store(cache.ca_pem())).await;
-        assert_eq!(peer_certs, primary_chain);
-    }
-
-    /// Serves the alternate to a client without RSA when the primary needs RSA.
-    ///
-    /// This is the Let's Encrypt case DualChain exists for: the default chain
-    /// needs an RSA signature, the alternate only ECDSA P-384. The client
-    /// still advertises P-384, which must not count as supporting the primary.
-    #[tokio::test]
-    async fn dual_chain_client_without_rsa_gets_alt() {
-        let cache = TestCache::<Infallible, Infallible>::new();
-        let (primary_key, _) = make_cert(&cache).await;
-        let (alt_key, alt_chain) = alternate_of(&primary_key);
-
-        let resolver = ResolvesServerCertAcme::new();
-        resolver.set_certs(
-            served(
-                primary_key,
-                RequiredSchemes::Known(vec![
-                    SignatureScheme::ECDSA_NISTP384_SHA384,
-                    SignatureScheme::RSA_PKCS1_SHA256,
-                ]),
-            ),
-            Some(served(
-                alt_key,
-                RequiredSchemes::Known(vec![SignatureScheme::ECDSA_NISTP384_SHA384]),
-            )),
-        );
-
-        let mut provider = ring::default_provider();
-        let mapping: Vec<_> = provider
-            .signature_verification_algorithms
-            .mapping
-            .iter()
-            .filter(|(scheme, _)| {
-                !matches!(
-                    scheme,
-                    SignatureScheme::RSA_PKCS1_SHA256
-                        | SignatureScheme::RSA_PKCS1_SHA384
-                        | SignatureScheme::RSA_PKCS1_SHA512
-                        | SignatureScheme::RSA_PSS_SHA256
-                        | SignatureScheme::RSA_PSS_SHA384
-                        | SignatureScheme::RSA_PSS_SHA512
-                )
-            })
-            .cloned()
-            .collect();
-        provider.signature_verification_algorithms.mapping = Box::leak(mapping.into_boxed_slice());
-
-        let root_store = make_root_store(cache.ca_pem());
-        let peer_certs = do_handshake_with(resolver, root_store, Arc::new(provider)).await;
-        assert_eq!(peer_certs, alt_chain);
-    }
-
-    /// Serves the primary if its schemes are unknown, since the client may verify it.
-    #[tokio::test]
-    async fn dual_chain_unknown_primary_schemes_serve_primary() {
-        let cache = TestCache::<Infallible, Infallible>::new();
-        let (primary_key, primary_chain) = make_cert(&cache).await;
-        let (alt_key, _) = alternate_of(&primary_key);
-
-        let resolver = ResolvesServerCertAcme::new();
-        resolver.set_certs(
-            served(primary_key, RequiredSchemes::Unknown),
-            Some(served(alt_key, RequiredSchemes::Known(vec![P256]))),
-        );
-
-        let peer_certs = do_handshake(resolver, make_root_store(cache.ca_pem())).await;
-        assert_eq!(peer_certs, primary_chain);
-    }
-
-    /// Serves the primary when no alternate is set.
-    #[tokio::test]
-    async fn single_chain_serves_primary() {
-        let cache = TestCache::<Infallible, Infallible>::new();
-        let (primary_key, primary_chain) = make_cert(&cache).await;
-
-        let resolver = ResolvesServerCertAcme::new();
-        assert!(!resolver.set_certs(
-            served(primary_key, RequiredSchemes::Known(vec![P256])),
-            None
-        ));
-
-        let peer_certs = do_handshake(resolver, make_root_store(cache.ca_pem())).await;
-        assert_eq!(peer_certs, primary_chain);
-    }
-
-    /// Drops an alternate whose leaf differs from the primary's.
-    #[tokio::test]
-    async fn alt_with_other_leaf_is_rejected() {
-        let cache = TestCache::<Infallible, Infallible>::new();
-        let (primary_key, primary_chain) = make_cert(&cache).await;
-        let (other_key, _) = make_cert(&cache).await;
-
-        let resolver = ResolvesServerCertAcme::new();
-        let installed = resolver.set_certs(
-            served(
-                primary_key,
-                RequiredSchemes::Known(vec![SignatureScheme::ED448]),
-            ),
-            Some(served(other_key, RequiredSchemes::Known(vec![P256]))),
-        );
-        assert!(!installed);
-
-        let peer_certs = do_handshake(resolver, make_root_store(cache.ca_pem())).await;
-        assert_eq!(peer_certs, primary_chain);
     }
 }

@@ -31,7 +31,11 @@ const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
 ///
 /// [`DualChain`](CertChainPreference::DualChain) picks the chain per connection from the
 /// signature schemes in the client's TLS ClientHello. The alternate is served to clients that
-/// can't verify every signature in the default chain but can verify the alternate. This helps
+/// can't verify every signature in the default chain but can verify the alternate. The choice is
+/// made by [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream), which
+/// [`AcmeState::incoming`](crate::AcmeState::incoming) and the Axum acceptor use. A
+/// `ServerConfig` that uses [`AcmeState::resolver`](crate::AcmeState::resolver) elsewhere serves
+/// the default chain to every client. This helps
 /// clients that leave out algorithms they can't verify, e.g. rustls clients built without RSA
 /// support. A client that advertises a scheme it can't actually verify, or that doesn't trust
 /// the alternate's root, gains nothing. The choice uses the `signature_algorithms` extension

@@ -381,26 +381,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn supported_by_needs_every_scheme() {
-        let offered = [
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ED25519,
-        ];
-        let known = |schemes: &[SignatureScheme]| RequiredSchemes::Known(schemes.to_vec());
-        assert_eq!(
-            known(&[SignatureScheme::ECDSA_NISTP256_SHA256]).supported_by(&offered),
-            Some(true)
-        );
-        assert_eq!(
-            known(&[
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA256
-            ])
-            .supported_by(&offered),
-            Some(false)
-        );
-        assert_eq!(RequiredSchemes::Unknown.supported_by(&offered), None);
-    }
 }

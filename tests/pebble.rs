@@ -275,7 +275,7 @@ async fn serve(listener: TcpListener, acceptor: AcmeAcceptor, server_config: Arc
             match acceptor.accept(tcp).await {
                 Ok(None) => eprintln!("served tls-alpn-01 challenge to {peer}"),
                 Ok(Some(start)) => {
-                    if let Err(err) = start.into_stream(server_config).await {
+                    if let Err(err) = acceptor.into_stream(start, server_config).await {
                         eprintln!("TLS handshake with {peer} failed: {err}");
                     }
                 }

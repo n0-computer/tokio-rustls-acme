@@ -1,6 +1,8 @@
 //! The private PKI of `tests/fixtures/alternate-chains.sh`, for unit tests.
 
-use rustls::pki_types::CertificateDer;
+use rustls::crypto::ring;
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::sign::CertifiedKey;
 
 use crate::chain::CertChain;
 
@@ -15,6 +17,9 @@ pub(crate) const EC_ROOT_CN: &str = "ec";
 
 /// The common name of the RSA root.
 pub(crate) const RSA_ROOT_CN: &str = "rsa";
+
+/// The two hierarchies, see [`CROSS_SIGNED_ROOT`] and [`INTERMEDIATE_BY_EACH_ROOT`].
+pub(crate) const HIERARCHIES: [Hierarchy; 2] = [CROSS_SIGNED_ROOT, INTERMEDIATE_BY_EACH_ROOT];
 
 /// The ECDSA root cross-signed by the RSA root, like ISRG Root X2 by ISRG Root X1.
 pub(crate) const CROSS_SIGNED_ROOT: Hierarchy = Hierarchy {
@@ -61,6 +66,16 @@ pub(crate) struct Hierarchy {
     pub(crate) primary: &'static [Cert],
     /// The chain to the ECDSA root.
     pub(crate) alternate: &'static [Cert],
+}
+
+/// Returns `certs` with the leaf's key.
+pub(crate) fn certified_key(certs: &[Cert]) -> CertifiedKey {
+    let key = PrivatePkcs8KeyDer::from(blocks()[0].contents().to_vec());
+    let key = ring::default_provider()
+        .key_provider
+        .load_private_key(key.into())
+        .expect("the fixture key is P-256");
+    CertifiedKey::new(self::certs(certs), key)
 }
 
 /// Returns the DER of `certs`.

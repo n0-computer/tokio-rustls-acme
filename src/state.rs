@@ -23,9 +23,9 @@ use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
     Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
 };
-use crate::chain::{CertChain, RequiredSchemes};
+use crate::chain::CertChain;
 use crate::config::{CertChainPreference, ChainRoot};
-use crate::resolver::ServedCert;
+use crate::resolver::AlternateChain;
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
 /// First delay of the order backoffs, which double it on each retry.
@@ -277,6 +277,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         crate::axum::AxumAcceptor::new(self.acceptor(), rustls_config)
     }
     /// Returns the certificate resolver populated by this state machine.
+    ///
+    /// A [`ServerConfig`](rustls::ServerConfig) with this resolver serves the alternate chain of
+    /// [`CertChainPreference::DualChain`] only through [`AcmeAcceptor::into_stream`],
+    /// [`AcmeState::incoming`] or the Axum acceptor. Elsewhere, and if the config wraps this
+    /// resolver in another one, every client gets the primary chain, see
+    /// [`ResolvesServerCertAcme`].
     pub fn resolver(&self) -> Arc<ResolvesServerCertAcme> {
         self.resolver.clone()
     }
@@ -409,27 +415,16 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             .alternate
             .as_deref()
             .and_then(|pem| self.alternate_chain(&provider, pem, &primary_chain));
-        let primary_schemes = match &alternate {
-            Some(alternate) => {
-                primary_chain.required_schemes(&CertChain::new(alternate.cert.clone()))
-            }
-            None => RequiredSchemes::Unknown,
-        };
-        let alternate = alternate.map(|alternate| ServedCert {
-            schemes: CertChain::new(alternate.cert.clone()).likely_required_schemes(&primary_chain),
-            key: Arc::new(alternate),
-        });
+        let alternate = alternate.map(|alternate| AlternateChain::new(&primary_chain, alternate));
         let (not_before, not_after) = (parsed.not_before, parsed.not_after);
         // The deployed certificate may still be valid, so keep it and the cache.
         if !cached && not_after <= OffsetDateTime::now_utc() {
             warn!(%not_after, "the CA issued an expired certificate, keeping the deployed one");
             return Err(EventError::NewCertParse(CertParseError::Expired));
         }
-        let primary = ServedCert {
-            key: Arc::new(parsed.certified_key),
-            schemes: primary_schemes,
-        };
-        let alternate_installed = self.resolver.set_certs(primary, alternate);
+        let alternate_installed = self
+            .resolver
+            .set_certs(Arc::new(parsed.certified_key), alternate);
         if alternate_installed {
             info!("serving an alternate chain to clients that can't verify the default one");
         }
