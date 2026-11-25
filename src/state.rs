@@ -4,6 +4,7 @@ use std::fmt::{self, Debug};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -38,7 +39,7 @@ const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
 /// Number of order rounds that can fail to advance the order status before the order fails.
 const MAX_STALLED_ROUNDS: u32 = 10;
 
-/// Limit for looking up an alternate chain, in the cache or at the CA.
+/// Limit for each step with an alternate chain: the download, and loading or storing it.
 ///
 /// The alternate is optional, so a slow cache or CA must not hold up the state machine.
 const ALTERNATE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -479,13 +480,19 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let cert = self.deploy_cert(&issued.pem, false)?;
         let config = self.config.clone();
         let pem = issued.pem;
+        // The alternate action runs after this one, and caches the alternate only if it stored.
+        let cert_stored = Arc::new(AtomicBool::new(false));
+        let stored_flag = cert_stored.clone();
         self.early_actions.push_back(Box::pin(async move {
             let stored = config
                 .cache
                 .store_cert(&config.domains, &config.directory_url, &pem)
                 .await;
             Some(match stored {
-                Ok(()) => Ok(EventOk::CertCacheStore),
+                Ok(()) => {
+                    stored_flag.store(true, Ordering::Relaxed);
+                    Ok(EventOk::CertCacheStore)
+                }
                 Err(err) => Err(EventError::CertCacheStore(err)),
             })
         }));
@@ -497,15 +504,28 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                     let pem = chain.to_pem();
                     serve_alternate(&resolver, &cert, chain, &provider).then_some(pem)
                 });
+                // The cached alternate must stay the one of the cached certificate.
+                if !cert_stored.load(Ordering::Relaxed) {
+                    return alternate
+                        .is_none()
+                        .then_some(Err(EventError::AltCertUnavailable));
+                }
                 // Without an alternate, this removes the one of an earlier certificate.
-                let stored = config
-                    .cache
-                    .store_alt_cert(&config.domains, &config.directory_url, alternate.as_deref())
-                    .await;
-                match (stored, alternate) {
-                    (Err(err), _) => Some(Err(EventError::AltCertCacheStore(err))),
-                    (Ok(()), None) => Some(Err(EventError::AltCertUnavailable)),
-                    (Ok(()), Some(_)) => None,
+                let store = config.cache.store_alt_cert(
+                    &config.domains,
+                    &config.directory_url,
+                    alternate.as_deref(),
+                );
+                match (timeout(ALTERNATE_TIMEOUT, store).await, alternate) {
+                    (Ok(Err(err)), _) => Some(Err(EventError::AltCertCacheStore(err))),
+                    (Err(_), alternate) => {
+                        warn!("storing the alternate chain timed out");
+                        alternate
+                            .is_none()
+                            .then_some(Err(EventError::AltCertUnavailable))
+                    }
+                    (Ok(Ok(())), None) => Some(Err(EventError::AltCertUnavailable)),
+                    (Ok(Ok(())), Some(_)) => None,
                 }
             }));
         }
@@ -894,17 +914,21 @@ mod tests {
     /// The state of the tests, with [`MemCertCache`].
     type TestState = AcmeState<&'static str, Infallible>;
 
-    /// How [`MemCertCache`] treats alternate chains.
+    /// How [`MemCertCache`] treats certificates and alternate chains.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum AlternateCache {
-        /// It loads and stores them.
+    enum CacheBehavior {
+        /// It loads and stores both.
         Working,
-        /// It never finishes loading one.
+        /// It never finishes loading an alternate.
         StallingLoads,
-        /// It fails to load them.
+        /// It fails to load alternates.
         FailingLoads,
-        /// It fails to store them.
+        /// It never finishes storing an alternate.
+        StallingStores,
+        /// It fails to store alternates.
         FailingStores,
+        /// It fails to store certificates.
+        FailingCertStores,
     }
 
     /// A cert cache in memory, shared by its clones.
@@ -912,16 +936,12 @@ mod tests {
     struct MemCertCache {
         cert: Arc<Mutex<Option<Vec<u8>>>>,
         alternate: Arc<Mutex<Option<Vec<u8>>>>,
-        behavior: AlternateCache,
+        behavior: CacheBehavior,
     }
 
     impl MemCertCache {
         /// Creates a cache that holds `cert` and `alternate`.
-        fn new(
-            cert: Option<Vec<u8>>,
-            alternate: Option<Vec<u8>>,
-            behavior: AlternateCache,
-        ) -> Self {
+        fn new(cert: Option<Vec<u8>>, alternate: Option<Vec<u8>>, behavior: CacheBehavior) -> Self {
             Self {
                 cert: Arc::new(Mutex::new(cert)),
                 alternate: Arc::new(Mutex::new(alternate)),
@@ -945,13 +965,16 @@ mod tests {
             Ok(self.cert())
         }
         async fn store_cert(&self, _: &[String], _: &str, cert: &[u8]) -> Result<(), Self::EC> {
+            if self.behavior == CacheBehavior::FailingCertStores {
+                return Err(STORE_FAILED);
+            }
             *self.cert.lock().expect("poisoned") = Some(cert.to_vec());
             Ok(())
         }
         async fn load_alt_cert(&self, _: &[String], _: &str) -> Result<Option<Vec<u8>>, Self::EC> {
             match self.behavior {
-                AlternateCache::StallingLoads => future::pending().await,
-                AlternateCache::FailingLoads => Err(LOAD_FAILED),
+                CacheBehavior::StallingLoads => future::pending().await,
+                CacheBehavior::FailingLoads => Err(LOAD_FAILED),
                 _ => Ok(self.alternate()),
             }
         }
@@ -961,8 +984,10 @@ mod tests {
             _: &str,
             chain: Option<&[u8]>,
         ) -> Result<(), Self::EC> {
-            if self.behavior == AlternateCache::FailingStores {
-                return Err(STORE_FAILED);
+            match self.behavior {
+                CacheBehavior::StallingStores => future::pending().await,
+                CacheBehavior::FailingStores => return Err(STORE_FAILED),
+                _ => {}
             }
             *self.alternate.lock().expect("poisoned") = chain.map(<[u8]>::to_vec);
             Ok(())
@@ -1033,7 +1058,7 @@ mod tests {
         ];
         for alternate in cases {
             let primary = fixture::bundle(CROSS_SIGNED_ROOT.primary);
-            let cache = MemCertCache::new(Some(primary), Some(alternate), AlternateCache::Working);
+            let cache = MemCertCache::new(Some(primary), Some(alternate), CacheBehavior::Working);
             let mut state = start_cached(&cache).await;
             run_until_renewal_wait(&mut state).await;
             assert!(!state.resolver.serves_alternate_chain());
@@ -1045,7 +1070,7 @@ mod tests {
         let cache = MemCertCache::new(
             Some(fixture::bundle(CROSS_SIGNED_ROOT.primary)),
             Some(chain(CROSS_SIGNED_ROOT.alternate).to_pem()),
-            AlternateCache::StallingLoads,
+            CacheBehavior::StallingLoads,
         );
         let start = Instant::now();
         let mut state = start_cached(&cache).await;
@@ -1057,7 +1082,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failed_alternate_cache_load_is_reported() {
         let primary = fixture::bundle(CROSS_SIGNED_ROOT.primary);
-        let cache = MemCertCache::new(Some(primary), None, AlternateCache::FailingLoads);
+        let cache = MemCertCache::new(Some(primary), None, CacheBehavior::FailingLoads);
         let mut state = start_cached(&cache).await;
         let event = state.next().await;
         let failed = matches!(event, Some(Err(EventError::AltCertCacheLoad(LOAD_FAILED))));
@@ -1067,7 +1092,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn new_alternate_is_served_stored_and_loaded_after_a_restart() {
         for hierarchy in HIERARCHIES {
-            let cache = MemCertCache::new(None, None, AlternateCache::Working);
+            let cache = MemCertCache::new(None, None, CacheBehavior::Working);
             let mut state = dual_chain_state(&cache);
             let alternate = chain(hierarchy.alternate);
             let download = future::ready(Some(alternate.clone()));
@@ -1086,7 +1111,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stalled_alternate_download_is_reported_after_the_timeout() {
         let stale = chain(CROSS_SIGNED_ROOT.alternate).to_pem();
-        let cache = MemCertCache::new(None, Some(stale), AlternateCache::Working);
+        let cache = MemCertCache::new(None, Some(stale), CacheBehavior::Working);
         let mut state = dual_chain_state(&cache);
         let start = Instant::now();
         let event = store_new(&mut state, CROSS_SIGNED_ROOT.primary, future::pending()).await;
@@ -1103,7 +1128,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn previous_alternate_is_served_until_a_new_one_arrives() {
-        let cache = MemCertCache::new(None, None, AlternateCache::Working);
+        let cache = MemCertCache::new(None, None, CacheBehavior::Working);
         let mut state = dual_chain_state(&cache);
         let download = future::ready(Some(chain(CROSS_SIGNED_ROOT.alternate)));
         store_new(&mut state, CROSS_SIGNED_ROOT.primary, download).await;
@@ -1117,7 +1142,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_alternate_store_keeps_serving_the_alternate() {
-        let cache = MemCertCache::new(None, None, AlternateCache::FailingStores);
+        let cache = MemCertCache::new(None, None, CacheBehavior::FailingStores);
         let mut state = dual_chain_state(&cache);
         let download = future::ready(Some(chain(CROSS_SIGNED_ROOT.alternate)));
         let event = store_new(&mut state, CROSS_SIGNED_ROOT.primary, download).await;
@@ -1129,6 +1154,36 @@ mod tests {
         assert!(state.resolver.serves_alternate_chain());
         let primary = Some(fixture::bundle(CROSS_SIGNED_ROOT.primary));
         assert_eq!(cache.cert(), primary);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_certificate_store_keeps_the_cached_alternate() {
+        let cached = Some(chain(CROSS_SIGNED_ROOT.alternate).to_pem());
+        let cache = MemCertCache::new(None, cached.clone(), CacheBehavior::FailingCertStores);
+        let mut state = dual_chain_state(&cache);
+        let event = state.process_new_cert(IssuedCert {
+            pem: fixture::bundle(CROSS_SIGNED_ROOT.primary),
+            alternate: Some(Box::pin(future::ready(None))),
+        });
+        assert!(matches!(event, Ok(EventOk::DeployedNewCert)), "{event:?}");
+        let event = state.next().await;
+        let failed = matches!(event, Some(Err(EventError::CertCacheStore(STORE_FAILED))));
+        assert!(failed, "{event:?}");
+        let event = state.next().await;
+        let unavailable = matches!(event, Some(Err(EventError::AltCertUnavailable)));
+        assert!(unavailable, "{event:?}");
+        assert_eq!(cache.alternate(), cached);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_alternate_store_does_not_hold_up_the_state() {
+        let cache = MemCertCache::new(None, None, CacheBehavior::StallingStores);
+        let mut state = dual_chain_state(&cache);
+        let download = future::ready(Some(chain(CROSS_SIGNED_ROOT.alternate)));
+        let event = store_new(&mut state, CROSS_SIGNED_ROOT.primary, download).await;
+        assert!(event.is_none(), "{event:?}");
+        assert!(state.early_actions.is_empty());
+        assert!(state.resolver.serves_alternate_chain());
     }
 
     #[test]
