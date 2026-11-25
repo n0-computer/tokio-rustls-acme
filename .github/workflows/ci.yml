@@ -55,51 +55,33 @@ jobs:
             toolchain: "x86_64-unknown-linux-gnu"
             name: "Linux GNU"
           - os: [self-hosted, macOS, ARM64]
-            toolchain: "x86_64-apple-darwin"
+            toolchain: "aarch64-apple-darwin"
             name: "macOS"
           - os: [self-hosted, windows, x64]
             toolchain: "x86_64-pc-windows-msvc"
             name: "Windows MSVC"
+          - os: [self-hosted, windows, x64]
+            toolchain: "x86_64-pc-windows-gnu"
+            name: "Windows GNU"
         channel:
           - "stable"
     env:
       RUSTC_WRAPPER: "sccache"
+      # Builds the matrix target, like `--target`. Without it the Windows GNU
+      # job would build the MSVC host target.
+      CARGO_BUILD_TARGET: ${{ matrix.target.toolchain }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        if: runner.os != 'Windows'
         with:
           toolchain: ${{ matrix.channel }}
           targets: ${{ matrix.target.toolchain }}
-      # dtolnay/rust-toolchain needs bash, which is broken on the self-hosted Windows runners.
-      - name: Install Rust (Windows)
-        if: runner.os == 'Windows'
-        env:
-          RUST_TOOLCHAIN: ${{ matrix.channel }}
-          RUST_TARGET: ${{ matrix.target.toolchain }}
-        run: |
-          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $env:RUST_TARGET
-          rustup default $env:RUST_TOOLCHAIN
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        if: runner.os != 'Windows'
         with:
           tool: cargo-make@${{ env.CARGO_MAKE_VERSION }},nextest@${{ env.NEXTEST_VERSION }}
-      # taiki-e/install-action needs bash too. The runners are shared, so install into RUNNER_TEMP.
-      - name: Install cargo-make and nextest (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          $bin = Join-Path $env:RUNNER_TEMP "bin"
-          New-Item -ItemType Directory -Force -Path $bin | Out-Null
-          $nextest = Join-Path $env:RUNNER_TEMP "nextest.zip"
-          Invoke-WebRequest -OutFile $nextest "https://get.nexte.st/$env:NEXTEST_VERSION/windows"
-          Expand-Archive -Path $nextest -DestinationPath $bin -Force
-          $make = Join-Path $env:RUNNER_TEMP "cargo-make.zip"
-          Invoke-WebRequest -OutFile $make "https://github.com/sagiegurari/cargo-make/releases/download/$env:CARGO_MAKE_VERSION/cargo-make-v$env:CARGO_MAKE_VERSION-x86_64-pc-windows-msvc.zip"
-          Expand-Archive -Path $make -DestinationPath $bin -Force
-          Add-Content -Path $env:GITHUB_PATH -Value $bin
       - run: cargo make test
 
   # Checks that each feature set builds without the features that dev-dependencies add and
