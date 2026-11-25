@@ -136,8 +136,7 @@ impl Pebble {
         root_store
     }
 
-    /// Returns the subject common name of root `index`, 0 for the default chain and 1 for the
-    /// alternate.
+    /// Returns the common name of root `index`, 0 of the default chain and 1 of the alternate.
     pub(crate) async fn root_cn(&self, index: usize) -> String {
         let root = self.management_cert(&format!("roots/{index}")).await;
         let (_, root) = x509_parser::parse_x509_certificate(&root).expect("failed to parse root");
@@ -148,11 +147,7 @@ impl Pebble {
             .to_owned()
     }
 
-    /// Returns the intermediate of chain `index`, 0 for the default chain and 1 for the
-    /// alternate.
-    ///
-    /// Every chain has the same intermediate key, signed by a different root, so the DER
-    /// identifies the chain.
+    /// Returns the intermediate of chain `index`, which identifies the chain.
     pub(crate) async fn intermediate(&self, index: usize) -> CertificateDer<'static> {
         self.management_cert(&format!("intermediates/{index}"))
             .await

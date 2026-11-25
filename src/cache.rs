@@ -26,18 +26,12 @@ pub trait CertCache: Send + Sync {
         cert: &[u8],
     ) -> Result<(), Self::EC>;
 
-    /// Loads the alternate chain stored by [`CertCache::store_alt_cert`].
+    /// Loads the alternate chain of [`CertChainPreference::DualChain`], see `store_alt_cert`.
     ///
-    /// Used with [`CertChainPreference::DualChain`](crate::CertChainPreference::DualChain),
-    /// which serves an alternate chain next to the default one (RFC 8555 section 7.4.2). The
-    /// alternate is PEM certificates, leaf first, without a private key: it uses the key
-    /// stored by [`CertCache::store_cert`]. One that isn't a chain for the cached certificate
-    /// to the preferred root is ignored.
+    /// The default implementation stores nothing, so a restart serves no alternate until the
+    /// next renewal. A cache that wraps another must forward both methods.
     ///
-    /// The default implementation stores nothing, so the alternate is fetched again with the
-    /// next order. A cache that wraps another cache must forward this method and
-    /// [`CertCache::store_alt_cert`], or DualChain serves no alternate after a restart until the
-    /// next renewal.
+    /// [`CertChainPreference::DualChain`]: crate::CertChainPreference::DualChain
     async fn load_alt_cert(
         &self,
         _domains: &[String],
@@ -48,9 +42,7 @@ pub trait CertCache: Send + Sync {
 
     /// Stores the alternate chain `chain`, or removes the stored one if it is `None`.
     ///
-    /// `chain` holds PEM certificates only, see [`CertCache::load_alt_cert`]. It is stored
-    /// after its certificate. Every new certificate stores its alternate or `None`, so the
-    /// alternate of an earlier certificate doesn't stay.
+    /// `chain` is PEM certificates, leaf first, without a key: it uses the certificate's key.
     async fn store_alt_cert(
         &self,
         _domains: &[String],

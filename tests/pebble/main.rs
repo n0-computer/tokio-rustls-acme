@@ -221,8 +221,7 @@ struct AcmeEvents {
     cached_cert_parse_error: bool,
 }
 
-/// Runs a [`Site`] with `cert_chain` and `cache` until it deploys a certificate, collecting
-/// events.
+/// Runs a [`Site`] with `cert_chain` and `cache` until it deploys a certificate.
 async fn acquire_cert_with_cache<C>(
     pebble: &Pebble,
     domain: &str,

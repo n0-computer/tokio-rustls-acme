@@ -315,11 +315,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     }
     /// Returns the certificate resolver populated by this state machine.
     ///
-    /// A [`ServerConfig`](rustls::ServerConfig) with this resolver serves the alternate chain of
-    /// [`CertChainPreference::DualChain`] only through [`AcmeAcceptor::into_stream`],
-    /// [`AcmeState::incoming`] or the Axum acceptor. Elsewhere, and if the config wraps this
-    /// resolver in another one, every client gets the primary chain, see
-    /// [`ResolvesServerCertAcme`].
+    /// It serves the alternate chain of [`CertChainPreference::DualChain`] only through
+    /// [`AcmeAcceptor::into_stream`], see [`ResolvesServerCertAcme`].
     pub fn resolver(&self) -> Arc<ResolvesServerCertAcme> {
         self.resolver.clone()
     }
@@ -637,15 +634,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             }
         }
     }
-    /// Fetches the first alternate chain for the leaf `leaf` that ends at `root`.
+    /// Fetches the first alternate chain for `leaf` that is valid and ends at `root`.
     ///
-    /// Returns `None` if no alternate is a valid chain for `leaf` to `root`, see
-    /// [`CertChain::is_alternate_for`]. Serving a broken alternate would lose the issued
-    /// certificate for the clients that get it.
-    ///
-    /// Download errors are logged and skipped, not returned. By now the order
-    /// is valid and the default chain is in hand. Failing the order would
-    /// throw away the issued certificate and order a new one, which counts
+    /// Download errors are logged, not returned: the order is valid, and a new one would count
     /// against the CA's rate limits.
     async fn fetch_alternate_chain(
         account: Arc<Account>,

@@ -10,14 +10,11 @@ use tracing::{debug, warn};
 
 /// Cert resolver for the issued certificate and the `tls-alpn-01` validation certificates.
 ///
-/// It serves the issued certificate to application traffic, and the validation certificate of each
-/// domain to `tls-alpn-01` clients. With
-/// [`CertChainPreference::DualChain`](crate::CertChainPreference::DualChain), the resolver only
-/// serves the primary chain. rustls filters the ClientHello's signature schemes by the cipher
-/// suites before it calls a resolver, which hides schemes that clients can verify in certificates.
-/// So [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream) picks the alternate from the
-/// unfiltered ClientHello, as [`Incoming`](crate::Incoming) and the Axum acceptor do. A
-/// `ServerConfig` that uses this resolver on its own serves the primary to every client.
+/// It serves only the default chain of [`CertChainPreference::DualChain`]: rustls hides some of
+/// the client's signature schemes from resolvers, so
+/// [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream) picks the alternate.
+///
+/// [`CertChainPreference::DualChain`]: crate::CertChainPreference::DualChain
 #[derive(Debug)]
 pub struct ResolvesServerCertAcme {
     inner: Mutex<Inner>,
@@ -36,10 +33,6 @@ pub(crate) struct AlternateChain {
 
 impl AlternateChain {
     /// Creates the alternate `chain` for `primary`, which signs with the primary's key.
-    ///
-    /// The primary's schemes must be exact, while the alternate's may be guessed, see
-    /// [`CertChain::likely_required_schemes`]: the alternate goes only to clients that can't
-    /// verify the primary.
     pub(crate) fn new(primary: &CertifiedKey, chain: CertChain) -> Self {
         let primary_chain = CertChain::new(primary.cert.clone());
         Self {
@@ -49,10 +42,7 @@ impl AlternateChain {
         }
     }
 
-    /// Returns whether a client offering `offered` should get this alternate.
-    ///
-    /// That is when the client can't verify the primary chain but can verify the alternate. If
-    /// either is unknown, the client gets the primary.
+    /// Returns whether a client offering `offered` can verify only this alternate.
     fn serves(&self, offered: &[SignatureScheme]) -> bool {
         self.primary_schemes.supported_by(offered) == Some(false)
             && self.alternate_schemes.supported_by(offered) == Some(true)
@@ -83,11 +73,7 @@ impl ResolvesServerCertAcme {
         inner.cert = Some(cert);
         inner.alt_cert = None;
     }
-    /// Serves `alternate` next to the certificate, and returns whether it does.
-    ///
-    /// The alternate must carry the served certificate's leaf: it is the same certificate,
-    /// chained to a different root. An alternate for another certificate, like one that a newer
-    /// certificate replaced, is dropped.
+    /// Serves `alternate` next to the certificate if it has the same leaf, and returns whether.
     pub(crate) fn set_alternate(&self, alternate: AlternateChain) -> bool {
         let mut inner = self.inner.lock().expect("poisoned");
         let matches = match (&inner.cert, alternate.key.end_entity_cert()) {
@@ -105,9 +91,7 @@ impl ResolvesServerCertAcme {
     pub fn serves_alternate_chain(&self) -> bool {
         self.inner.lock().expect("poisoned").alt_cert.is_some()
     }
-    /// Returns the alternate chain for a client that offers the signature schemes `offered`.
-    ///
-    /// Returns `None` if the client should get the primary, see [`AlternateChain::serves`].
+    /// Returns the alternate chain for a client that offers `offered`, if it needs it.
     pub(crate) fn alternate_for(&self, offered: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
         let inner = self.inner.lock().expect("poisoned");
         let alternate = inner.alt_cert.as_ref()?;

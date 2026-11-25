@@ -61,28 +61,22 @@ impl AcmeAcceptor {
     /// traffic, which the caller must complete. It resolves to `None` for a
     /// `tls-alpn-01` validation request, which the acceptor answers itself.
     ///
-    /// Complete application handshakes with [`AcmeAcceptor::into_stream`], which serves the
-    /// alternate chain of [`CertChainPreference::DualChain`] to the clients that need it.
+    /// Complete application handshakes with [`AcmeAcceptor::into_stream`].
     ///
     /// Neither the returned future nor [`AcmeAcceptor::into_stream`] has a
     /// timeout. Wrap both stages in one [`tokio::time::timeout`], or a
     /// stalled peer holds the connection open. A timeout does not limit how
     /// many handshakes peers can open.
-    ///
-    /// [`CertChainPreference::DualChain`]: crate::CertChainPreference::DualChain
     pub fn accept<IO: AsyncRead + AsyncWrite + Unpin>(&self, io: IO) -> AcmeAccept<IO> {
         AcmeAccept::new(io, self.clone())
     }
 
     /// Completes the application handshake `handshake` with `config`.
     ///
-    /// Use this instead of [`StartHandshake::into_stream`]. If `config` serves the certificates of
-    /// this acceptor's state, see [`AcmeState::resolver`], and the client needs the alternate
-    /// chain of [`CertChainPreference::DualChain`], the handshake serves that chain. The choice
-    /// uses the client's signature schemes before rustls filters them by cipher suite. Any other
-    /// `config` is used as is.
+    /// Use this instead of [`StartHandshake::into_stream`], so a client gets the alternate chain
+    /// of [`CertChainPreference::DualChain`] if it needs it. That requires `config` to use the
+    /// state's resolver, not a wrapper.
     ///
-    /// [`AcmeState::resolver`]: crate::AcmeState::resolver
     /// [`CertChainPreference::DualChain`]: crate::CertChainPreference::DualChain
     pub fn into_stream<IO: AsyncRead + AsyncWrite + Unpin>(
         &self,

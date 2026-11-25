@@ -106,9 +106,8 @@ impl CertChain {
 
     /// Returns whether the chain is a valid alternate to `leaf` that ends at `root`.
     ///
-    /// The chain must start with `leaf` and end at `root`, and every certificate must be issued
-    /// and signed by the next, which must be a CA certificate that may sign certificates and is
-    /// valid now. The root itself may be left out, so its signature is not checked.
+    /// Each certificate must be issued and signed by the next, a CA certificate valid now. The
+    /// root may be left out.
     pub(crate) fn is_alternate_for(&self, leaf: &CertificateDer<'_>, root: &ChainRoot) -> bool {
         if self.leaf() != leaf || !self.ends_at(root) {
             return false;
@@ -132,21 +131,16 @@ impl CertChain {
 
     /// Returns the schemes a client needs to verify this chain.
     ///
-    /// The scheme of an ECDSA signature depends on the curve of the signer's key, so the topmost
-    /// certificate's signer is looked up in `other`, the other chain for the same leaf, when this
-    /// chain doesn't include it. If neither has it, the schemes are unknown. A self-signed root at
-    /// the top is a trust anchor, whose signature clients don't verify.
+    /// An ECDSA scheme depends on the signer's curve, so the topmost signer is looked up in
+    /// `other`, the other chain for the leaf. A self-signed top is a trust anchor, not verified.
     pub(crate) fn required_schemes(&self, other: &CertChain) -> RequiredSchemes {
         self.schemes(other, UnknownSigner::Unknown)
     }
 
     /// Like [`CertChain::required_schemes`], but assumes standard curves for unknown signers.
     ///
-    /// An unknown signer is one that neither chain holds. The signer of an alternate's topmost
-    /// certificate can be one, as with Let's Encrypt's E5 to E9 intermediates, signed by ISRG Root
-    /// X1 for the default chain and by ISRG Root X2 for the alternate. Use this only for the
-    /// alternate: it is served only to clients that can't verify the primary, so a wrong guess
-    /// can't break a client that the primary serves.
+    /// Only for the alternate, which goes only to clients that can't verify the primary, so a
+    /// wrong guess can't break a client.
     pub(crate) fn likely_required_schemes(&self, other: &CertChain) -> RequiredSchemes {
         self.schemes(other, UnknownSigner::StandardCurve)
     }
@@ -196,9 +190,7 @@ fn issuer_name<'a>(cert: &'a X509Certificate<'_>) -> Option<&'a str> {
 
 /// Returns the TLS scheme of the signature on `cert` by `issuer`, if it can be identified.
 ///
-/// RSA PKCS#1, Ed25519 and Ed448 signatures identify their scheme. RSA-PSS needs the parameters
-/// that TLS allows, and an RSA key if the issuer is known. ECDSA needs the curve of the issuer's
-/// key, or `unknown_signer` decides.
+/// ECDSA needs the curve of the issuer's key, or `unknown_signer` decides.
 fn signature_scheme(
     cert: &X509Certificate<'_>,
     issuer: Option<&X509Certificate<'_>>,
