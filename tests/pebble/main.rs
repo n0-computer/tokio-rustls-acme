@@ -521,7 +521,7 @@ async fn test_dual_chain_cache() {
     let cache_path: PathBuf = cache_dir.path().into();
     let preference = CertChainPreference::dual_chain(pebble.root_cn(1).await);
 
-    let (site, events) = acquire_cert_with_cache(
+    let (mut site, events) = acquire_cert_with_cache(
         &pebble,
         domain,
         preference.clone(),
@@ -532,6 +532,8 @@ async fn test_dual_chain_cache() {
         events.deployed_new && events.cert_cache_store,
         "first run should issue and store a cert, got {events:?}"
     );
+    // The alternate follows the certificate.
+    site.run_idle().await;
     assert!(site.state.resolver().serves_alternate_chain());
     site.close().await;
 

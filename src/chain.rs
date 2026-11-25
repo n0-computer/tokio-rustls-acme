@@ -3,6 +3,7 @@
 use rustls::SignatureScheme;
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{AlgorithmIdentifier, CertificateDer, alg_id};
+use time::OffsetDateTime;
 use x509_parser::asn1_rs::{Oid, oid};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::oid_registry::{
@@ -107,6 +108,12 @@ impl CertChain {
     /// Returns the leaf certificate.
     pub(crate) fn leaf(&self) -> &CertificateDer<'static> {
         &self.certs[0]
+    }
+
+    /// Returns when the leaf expires, if it parses.
+    pub(crate) fn leaf_expiry(&self) -> Option<OffsetDateTime> {
+        let leaf = parse(self.leaf())?;
+        Some(leaf.validity().not_after.to_datetime())
     }
 
     /// Returns the certificates, leaf first.

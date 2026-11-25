@@ -5,8 +5,9 @@ use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use time::OffsetDateTime;
 use tracing::{debug, warn};
 
 /// Cert resolver for the issued certificate and the `tls-alpn-01` validation certificates.
@@ -19,6 +20,8 @@ use tracing::{debug, warn};
 #[derive(Debug)]
 pub struct ResolvesServerCertAcme {
     inner: Mutex<Inner>,
+    /// Whether an alternate chain was ever set, so that handshakes without one skip the lock.
+    has_alternate: AtomicBool,
 }
 
 /// An alternate chain for DualChain mode, with the schemes that verifying each chain takes.
@@ -26,6 +29,8 @@ pub struct ResolvesServerCertAcme {
 pub(crate) struct AlternateChain {
     /// The alternate chain with the primary's key.
     pub(crate) key: Arc<CertifiedKey>,
+    /// When the leaf expires.
+    expiry: OffsetDateTime,
     /// The schemes a client needs to verify the primary chain.
     pub(crate) primary_schemes: RequiredSchemes,
     /// The schemes a client needs to verify the alternate chain.
@@ -45,8 +50,25 @@ impl AlternateChain {
         Self {
             primary_schemes: primary_chain.required_schemes(&chain, algorithms),
             alternate_schemes: chain.likely_required_schemes(&primary_chain, algorithms),
+            // A leaf that doesn't parse can't be served.
+            expiry: chain.leaf_expiry().unwrap_or(OffsetDateTime::UNIX_EPOCH),
             key: Arc::new(CertifiedKey::new(chain.into_certs(), primary.key.clone())),
         }
+    }
+
+    /// Returns whether any client can get this alternate, one that offers its schemes only.
+    pub(crate) fn is_selectable(&self) -> bool {
+        match &self.alternate_schemes {
+            RequiredSchemes::Known(schemes) => {
+                self.primary_schemes.supported_by(schemes) == Some(false)
+            }
+            RequiredSchemes::Unknown => false,
+        }
+    }
+
+    /// Returns whether the leaf has expired at `now`.
+    fn is_expired(&self, now: OffsetDateTime) -> bool {
+        self.expiry <= now
     }
 
     /// Returns whether a client offering `offered` can verify only this alternate.
@@ -72,13 +94,15 @@ impl ResolvesServerCertAcme {
                 alt_cert: None,
                 auth_keys: Default::default(),
             }),
+            has_alternate: AtomicBool::new(false),
         })
     }
-    /// Serves `cert`, without an alternate chain until [`ResolvesServerCertAcme::set_alternate`].
+    /// Serves `cert`.
+    ///
+    /// The alternate of the previous certificate stays until one for `cert` replaces it, or it
+    /// expires, so that clients that need it keep getting a valid chain.
     pub(crate) fn set_cert(&self, cert: Arc<CertifiedKey>) {
-        let mut inner = self.inner.lock().expect("poisoned");
-        inner.cert = Some(cert);
-        inner.alt_cert = None;
+        self.inner.lock().expect("poisoned").cert = Some(cert);
     }
     /// Serves `alternate` next to the certificate if it has the same leaf, and returns whether.
     pub(crate) fn set_alternate(&self, alternate: AlternateChain) -> bool {
@@ -89,6 +113,7 @@ impl ResolvesServerCertAcme {
         };
         if matches {
             inner.alt_cert = Some(alternate);
+            self.has_alternate.store(true, Ordering::Relaxed);
         } else {
             warn!("alternate chain doesn't match the certificate, not serving it");
         }
@@ -96,13 +121,23 @@ impl ResolvesServerCertAcme {
     }
     /// Returns whether an alternate chain is set, which DualChain serves to some clients.
     pub fn serves_alternate_chain(&self) -> bool {
-        self.inner.lock().expect("poisoned").alt_cert.is_some()
+        let inner = self.inner.lock().expect("poisoned");
+        let now = OffsetDateTime::now_utc();
+        inner
+            .alt_cert
+            .as_ref()
+            .is_some_and(|alternate| !alternate.is_expired(now))
     }
     /// Returns the alternate chain for a client that offers `offered`, if it needs it.
     pub(crate) fn alternate_for(&self, offered: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        if !self.has_alternate.load(Ordering::Relaxed) {
+            return None;
+        }
         let inner = self.inner.lock().expect("poisoned");
         let alternate = inner.alt_cert.as_ref()?;
-        alternate.serves(offered).then(|| alternate.key.clone())
+        let now = OffsetDateTime::now_utc();
+        let serves = alternate.serves(offered) && !alternate.is_expired(now);
+        serves.then(|| alternate.key.clone())
     }
     pub(crate) fn set_auth_key(&self, domain: String, cert: Arc<CertifiedKey>) {
         self.inner
@@ -161,38 +196,41 @@ mod tests {
         (resolver, primary)
     }
 
+    /// Returns the alternate `certs` of `primary`.
+    fn alternate(primary: &CertifiedKey, certs: &[Cert]) -> AlternateChain {
+        AlternateChain::new(primary, chain(certs), &fixture::algorithms())
+    }
+
     #[test]
     fn set_alternate_needs_the_served_leaf() {
         let (resolver, primary) = resolver();
-        let alternate = AlternateChain::new(
-            &primary,
-            chain(CROSS_SIGNED_ROOT.alternate),
-            &fixture::algorithms(),
-        );
-        assert!(resolver.set_alternate(alternate));
-        assert!(resolver.serves_alternate_chain());
-        resolver.set_cert(primary.clone());
-        assert!(
-            !resolver.serves_alternate_chain(),
-            "a new certificate drops it"
-        );
-
-        let other_leaf = AlternateChain::new(
-            &primary,
-            chain(&[Cert::Intermediate]),
-            &fixture::algorithms(),
-        );
-        assert!(!resolver.set_alternate(other_leaf));
+        assert!(!resolver.set_alternate(alternate(&primary, &[Cert::Intermediate])));
         assert!(!resolver.serves_alternate_chain());
-        let alternate = AlternateChain::new(
-            &primary,
-            chain(CROSS_SIGNED_ROOT.alternate),
-            &fixture::algorithms(),
+        assert!(resolver.set_alternate(alternate(&primary, CROSS_SIGNED_ROOT.alternate)));
+        assert!(resolver.serves_alternate_chain());
+        let unserved = ResolvesServerCertAcme::new();
+        let alternate = alternate(&primary, CROSS_SIGNED_ROOT.alternate);
+        assert!(!unserved.set_alternate(alternate), "no certificate");
+    }
+
+    #[test]
+    fn previous_alternate_stays_until_it_expires() {
+        let (resolver, primary) = resolver();
+        resolver.set_alternate(alternate(&primary, CROSS_SIGNED_ROOT.alternate));
+        // A newer certificate, until its own alternate arrives.
+        resolver.set_cert(Arc::new(fixture::certified_key(&[Cert::Intermediate])));
+        assert_eq!(
+            resolver.alternate_for(&[P384]).map(|key| key.cert.clone()),
+            Some(fixture::certs(CROSS_SIGNED_ROOT.alternate))
         );
-        assert!(
-            !ResolvesServerCertAcme::new().set_alternate(alternate),
-            "no certificate"
-        );
+        let expired = AlternateChain {
+            expiry: OffsetDateTime::now_utc(),
+            ..alternate(&primary, CROSS_SIGNED_ROOT.alternate)
+        };
+        resolver.set_cert(primary);
+        resolver.set_alternate(expired);
+        assert!(resolver.alternate_for(&[P384]).is_none());
+        assert!(!resolver.serves_alternate_chain());
     }
 
     #[test]
@@ -218,11 +256,7 @@ mod tests {
             let alternate = AlternateChain {
                 primary_schemes,
                 alternate_schemes,
-                ..AlternateChain::new(
-                    &primary,
-                    chain(CROSS_SIGNED_ROOT.alternate),
-                    &fixture::algorithms(),
-                )
+                ..alternate(&primary, CROSS_SIGNED_ROOT.alternate)
             };
             assert_eq!(
                 alternate.serves(offered),
