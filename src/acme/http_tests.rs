@@ -92,7 +92,7 @@ async fn stalled_response_times_out() {
             if support::read_request(&mut stream).await.is_err() {
                 return;
             }
-            if let Some(tx) = received_tx.lock().unwrap().take() {
+            if let Some(tx) = received_tx.lock().expect("poisoned").take() {
                 let _ = tx.send(());
             }
             std::future::pending::<()>().await;

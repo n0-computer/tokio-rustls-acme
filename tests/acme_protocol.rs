@@ -10,13 +10,10 @@ use std::{convert::TryFrom, sync::Arc, time::Duration};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use n0_future::StreamExt;
 use rustls::{
-    ClientConfig, DEFAULT_VERSIONS, DigitallySignedStruct, RootCertStore, ServerConfig,
-    SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::CryptoProvider,
-    pki_types::{CertificateDer, ServerName, UnixTime},
+    ClientConfig, DEFAULT_VERSIONS, RootCertStore, ServerConfig,
+    pki_types::{CertificateDer, ServerName},
 };
-use support::MockAcme;
+use support::{ACME_IDENTIFIER_OID, ACME_TLS_ALPN, AcceptAnyCert, MockAcme};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 use tokio_rustls_acme::{AcmeAcceptor, AcmeConfig, EventOk, ResolvesServerCertAcme};
@@ -25,81 +22,7 @@ use x509_parser::{
 };
 
 const DOMAIN: &str = "invariants.example.com";
-const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
-/// OID of the `acmeIdentifier` extension, RFC 8737 section 6.1.
-const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
 const LIMIT: Duration = Duration::from_secs(30);
-
-/// Accepts any certificate, but still checks the handshake signature.
-///
-/// It reads the public key with x509-parser because webpki rejects the
-/// critical `acmeIdentifier` extension.
-#[derive(Debug)]
-struct AcceptAnyCert(Arc<CryptoProvider>);
-
-impl AcceptAnyCert {
-    fn verify_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        let (_, cert) = X509Certificate::from_der(cert)
-            .map_err(|err| rustls::Error::General(format!("unparsable certificate: {err}")))?;
-        let public_key = &cert.public_key().subject_public_key.data;
-        let valid = self
-            .0
-            .signature_verification_algorithms
-            .mapping
-            .iter()
-            .filter(|(scheme, _)| *scheme == dss.scheme)
-            .flat_map(|(_, algorithms)| algorithms.iter())
-            .any(|algorithm| {
-                algorithm
-                    .verify_signature(public_key, message, dss.signature())
-                    .is_ok()
-            });
-        match valid {
-            true => Ok(HandshakeSignatureValid::assertion()),
-            false => Err(rustls::Error::General("bad handshake signature".into())),
-        }
-    }
-}
-
-impl ServerCertVerifier for AcceptAnyCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.verify_signature(message, cert, dss)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.verify_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
 
 /// An ACME order that waits for the CA to validate its tls-alpn-01 challenge.
 struct PendingChallenge {

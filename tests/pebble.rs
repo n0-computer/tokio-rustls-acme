@@ -201,8 +201,10 @@ impl Site {
     /// # Panics
     ///
     /// Panics on other errors and after [`ORDER_TIMEOUT`].
-    // The crate returns `OrderError` by value in its events too.
-    #[allow(clippy::result_large_err)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the crate returns `OrderError` by value in its events too"
+    )]
     async fn deploy(&mut self) -> Result<(), OrderError> {
         tokio::time::timeout(ORDER_TIMEOUT, async {
             loop {
@@ -586,8 +588,10 @@ fn ip_sans(cert: &CertificateDer<'_>) -> Vec<IpAddr> {
 /// Serves tls-alpn-01 on each address of `ips`, and after deployment connects to each of them
 /// with the address as server name. Returns the chain served on the first address, or the
 /// error of the order.
-// The crate returns `OrderError` by value in its events too.
-#[allow(clippy::result_large_err)]
+#[allow(
+    clippy::result_large_err,
+    reason = "the crate returns `OrderError` by value in its events too"
+)]
 async fn acquire_ip_cert(
     ips: &[IpAddr],
     profile: Option<&str>,

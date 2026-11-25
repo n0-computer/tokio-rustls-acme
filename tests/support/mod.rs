@@ -1,7 +1,9 @@
 //! In-process HTTP(S) and scripted ACME servers on `127.0.0.1` for tests.
 
-// Each test binary uses a different subset of these helpers.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test binary uses a different subset of these helpers"
+)]
 
 use std::{
     collections::{HashMap, HashSet},
@@ -10,7 +12,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -19,9 +21,11 @@ use rcgen::{
     PKCS_ECDSA_P256_SHA256, PublicKeyData, SignatureAlgorithm,
 };
 use rustls::{
-    ClientConfig, DEFAULT_VERSIONS, RootCertStore, ServerConfig,
+    ClientConfig, DEFAULT_VERSIONS, DigitallySignedStruct, RootCertStore, ServerConfig,
+    SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::CryptoProvider,
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -31,14 +35,25 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::TlsAcceptor;
-use x509_parser::{certification_request::X509CertificationRequest, prelude::FromDer};
+use x509_parser::{
+    certificate::X509Certificate, certification_request::X509CertificationRequest, prelude::FromDer,
+};
+
+/// ALPN protocol of the tls-alpn-01 challenge, RFC 8737 section 6.2.
+pub(crate) const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+
+/// How often `wait_for_hits` checks the request count.
+const HIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// OID of the `acmeIdentifier` extension, RFC 8737 section 6.1.
+pub(crate) const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
 
 /// Returns the provider all tests use for TLS, whatever the crate features select.
-pub fn provider() -> Arc<CryptoProvider> {
+pub(crate) fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
+pub(crate) fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
     Arc::new(
         ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(DEFAULT_VERSIONS)
@@ -49,17 +64,88 @@ pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
 }
 
 /// Builds a client config for tests that never reach an ACME server.
-pub fn client_config_without_roots() -> Arc<ClientConfig> {
+pub(crate) fn client_config_without_roots() -> Arc<ClientConfig> {
     client_config(RootCertStore::empty())
 }
 
+/// Accepts any certificate, but still checks the handshake signature.
+///
+/// It reads the public key with x509-parser because webpki rejects the
+/// critical `acmeIdentifier` extension.
+#[derive(Debug)]
+pub(crate) struct AcceptAnyCert(pub(crate) Arc<CryptoProvider>);
+
+impl AcceptAnyCert {
+    fn verify_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let (_, cert) = X509Certificate::from_der(cert)
+            .map_err(|err| rustls::Error::General(format!("unparsable certificate: {err}")))?;
+        let public_key = &cert.public_key().subject_public_key.data;
+        let valid = self
+            .0
+            .signature_verification_algorithms
+            .mapping
+            .iter()
+            .filter(|(scheme, _)| *scheme == dss.scheme)
+            .flat_map(|(_, algorithms)| algorithms.iter())
+            .any(|algorithm| {
+                algorithm
+                    .verify_signature(public_key, message, dss.signature())
+                    .is_ok()
+            });
+        match valid {
+            true => Ok(HandshakeSignatureValid::assertion()),
+            false => Err(rustls::Error::General("bad handshake signature".into())),
+        }
+    }
+}
+
+impl ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.verify_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.verify_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// A TLS identity for `127.0.0.1` and a client config that trusts it.
-pub struct LocalTls {
+pub(crate) struct LocalTls {
     pub acceptor: TlsAcceptor,
     pub client_config: Arc<ClientConfig>,
 }
 
-pub fn local_tls() -> LocalTls {
+pub(crate) fn local_tls() -> LocalTls {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate key");
     let cert = CertificateParams::new(vec!["127.0.0.1".to_string()])
         .expect("valid params")
@@ -81,13 +167,13 @@ pub fn local_tls() -> LocalTls {
 }
 
 /// A byte stream of an accepted connection, with or without TLS.
-pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
 type ConnFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 #[derive(Debug, Clone)]
-pub struct Request {
+pub(crate) struct Request {
     pub method: String,
     pub path: String,
     pub content_type: Option<String>,
@@ -95,14 +181,14 @@ pub struct Request {
 }
 
 #[derive(Debug, Clone)]
-pub struct Response {
+pub(crate) struct Response {
     pub status: u16,
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
 }
 
 impl Response {
-    pub fn new(status: u16) -> Self {
+    pub(crate) fn new(status: u16) -> Self {
         Self {
             status,
             headers: Vec::new(),
@@ -110,25 +196,25 @@ impl Response {
         }
     }
 
-    pub fn json(status: u16, body: &Value) -> Self {
+    pub(crate) fn json(status: u16, body: &Value) -> Self {
         Self::new(status)
             .header("content-type", "application/json")
             .body(body.to_string())
     }
 
-    pub fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+    pub(crate) fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
         self.headers.push((name, value.into()));
         self
     }
 
-    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+    pub(crate) fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
         self
     }
 }
 
 /// A server on `127.0.0.1` that stops when dropped.
-pub struct Server {
+pub(crate) struct Server {
     pub addr: SocketAddr,
     task: JoinHandle<()>,
 }
@@ -140,14 +226,14 @@ impl Drop for Server {
 }
 
 impl Server {
-    pub async fn bind() -> (TcpListener, SocketAddr) {
+    pub(crate) async fn bind() -> (TcpListener, SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         (listener, addr)
     }
 
     /// Serves one request per connection with `handler`.
-    pub fn start(
+    pub(crate) fn start(
         listener: TcpListener,
         tls: Option<TlsAcceptor>,
         handler: impl Fn(Request) -> Response + Send + Sync + 'static,
@@ -165,7 +251,7 @@ impl Server {
         })
     }
 
-    pub fn start_raw(
+    pub(crate) fn start_raw(
         listener: TcpListener,
         tls: Option<TlsAcceptor>,
         serve: impl Fn(Box<dyn Io>) -> ConnFuture + Send + Sync + 'static,
@@ -201,7 +287,7 @@ impl Server {
 }
 
 /// Reads one HTTP/1.1 request, with its body if it has a `content-length`.
-pub async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Request> {
+pub(crate) async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Request> {
     let mut buf = Vec::new();
     let head_end = loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -269,7 +355,7 @@ async fn write_response(
 }
 
 /// Decodes a flattened JWS into its protected header and payload.
-pub fn decode_jws(body: &[u8]) -> Option<(Value, Vec<u8>)> {
+pub(crate) fn decode_jws(body: &[u8]) -> Option<(Value, Vec<u8>)> {
     let jws: Value = serde_json::from_slice(body).ok()?;
     let protected = URL_SAFE_NO_PAD
         .decode(jws.get("protected")?.as_str()?)
@@ -278,28 +364,57 @@ pub fn decode_jws(body: &[u8]) -> Option<(Value, Vec<u8>)> {
     Some((serde_json::from_slice(&protected).ok()?, payload))
 }
 
+/// Returns the uncompressed public point of the P-256 key in `jwk`.
+pub(crate) fn jwk_public_point(jwk: &Value) -> [u8; 65] {
+    let coordinate = |name: &str| {
+        let value = jwk[name].as_str().expect("JWK coordinate");
+        URL_SAFE_NO_PAD.decode(value).expect("base64url coordinate")
+    };
+    [vec![0x04], coordinate("x"), coordinate("y")]
+        .concat()
+        .try_into()
+        .expect("P-256 point")
+}
+
+fn unauthorized() -> Response {
+    Response::json(
+        403,
+        &json!({"type": "urn:ietf:params:acme:error:unauthorized"}),
+    )
+    .header("content-type", "application/problem+json")
+}
+
 /// How the mock ACME server reports the order status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderScript {
+pub(crate) enum OrderScript {
     /// Follows RFC 8555: pending, ready, then valid after finalization.
     Normal,
     /// Reports `pending` forever, even when all authorizations are valid.
     AlwaysPending,
+    /// Reports `ready`, but answers each finalization with `pending`.
+    RevertsOnFinalize,
 }
 
 /// The mutable part of [`MockAcme`], open to the tests.
-pub struct MockAcmeState {
+pub(crate) struct MockAcmeState {
     pub authz_status: &'static str,
     pub order_script: OrderScript,
-    pub issue_expired: bool,
+    /// Validity of the certificates that the server issues.
+    pub issue_validity: Validity,
     /// Token of the tls-alpn-01 challenge.
     pub token: String,
     /// Domain of the most recent order.
     pub domain: String,
     /// JWK of the most recent `newAccount` request.
     pub account_jwk: Option<Value>,
+    /// Public point of an account key whose `newAccount` requests fail with `unauthorized`.
+    pub deactivated_key: Option<[u8; 65]>,
+    /// Answers the next finalization with `unauthorized`, then resets.
+    pub reject_finalize: bool,
     /// Number of requests per `"METHOD /path"`.
     pub hits: HashMap<String, usize>,
+    /// Arrival times of the requests per `"METHOD /path"`, on the real clock.
+    pub arrivals: HashMap<String, Vec<Instant>>,
     /// JWS requests that break the RFC 8555 section 6 rules.
     pub jws_violations: Vec<String>,
     issued: Option<String>,
@@ -309,8 +424,13 @@ pub struct MockAcmeState {
 }
 
 impl MockAcmeState {
-    pub fn hits(&self, route: &str) -> usize {
+    pub(crate) fn hits(&self, route: &str) -> usize {
         self.hits.get(route).copied().unwrap_or(0)
+    }
+
+    /// Returns the arrival times of the requests to `route`, oldest first.
+    pub(crate) fn arrivals(&self, route: &str) -> &[Instant] {
+        self.arrivals.get(route).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -318,7 +438,7 @@ impl MockAcmeState {
 ///
 /// It serves one account and one order at a time. It does not verify JWS
 /// signatures.
-pub struct MockAcme {
+pub(crate) struct MockAcme {
     pub directory_url: String,
     /// Client config that trusts the API endpoint of this server.
     pub client_config: Arc<ClientConfig>,
@@ -329,7 +449,7 @@ pub struct MockAcme {
 }
 
 impl MockAcme {
-    pub async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let tls = local_tls();
         let (listener, addr) = Server::bind().await;
         let base = format!("https://{addr}");
@@ -341,11 +461,14 @@ impl MockAcme {
         let state = Arc::new(Mutex::new(MockAcmeState {
             authz_status: "valid",
             order_script: OrderScript::Normal,
-            issue_expired: false,
+            issue_validity: Validity::Fresh,
             token: "bW9jay1hY21lLXRva2Vu".to_string(),
             domain: String::new(),
             account_jwk: None,
+            deactivated_key: None,
+            reject_finalize: false,
             hits: HashMap::new(),
+            arrivals: HashMap::new(),
             jws_violations: Vec::new(),
             issued: None,
             nonce_counter: 0,
@@ -366,14 +489,14 @@ impl MockAcme {
         }
     }
 
-    pub fn state(&self) -> std::sync::MutexGuard<'_, MockAcmeState> {
+    pub(crate) fn state(&self) -> std::sync::MutexGuard<'_, MockAcmeState> {
         self.state.lock().expect("poisoned")
     }
 
-    pub async fn wait_for_hits(&self, route: &str, count: usize, limit: Duration) {
+    pub(crate) async fn wait_for_hits(&self, route: &str, count: usize, limit: Duration) {
         let reached = tokio::time::timeout(limit, async {
             while self.state().hits(route) < count {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(HIT_POLL_INTERVAL).await;
             }
         })
         .await;
@@ -393,6 +516,11 @@ fn handle_acme(
     let mut state = state.lock().expect("poisoned");
     let route = format!("{} {}", request.method, request.path);
     *state.hits.entry(route.clone()).or_default() += 1;
+    state
+        .arrivals
+        .entry(route.clone())
+        .or_default()
+        .push(Instant::now());
 
     let mut payload = Vec::new();
     if request.method == "POST" {
@@ -434,6 +562,12 @@ fn handle_acme(
             state.issued_nonces.insert(nonce.clone());
             Response::new(200).header("replay-nonce", nonce)
         }
+        "POST /acct"
+            if state.deactivated_key.is_some()
+                && state.account_jwk.as_ref().map(jwk_public_point) == state.deactivated_key =>
+        {
+            unauthorized()
+        }
         "POST /acct" => Response::json(201, &json!({"status": "valid"}))
             .header("location", format!("{base}/acct/1")),
         "POST /order" => {
@@ -461,12 +595,21 @@ fn handle_acme(
             }),
         ),
         "POST /chall/1" => Response::json(200, &json!({})),
+        "POST /finalize/1" if state.reject_finalize => {
+            state.reject_finalize = false;
+            unauthorized()
+        }
+        "POST /finalize/1" if state.order_script == OrderScript::RevertsOnFinalize => {
+            let mut order = order_json(base, &state);
+            order["status"] = json!("pending");
+            Response::json(200, &order)
+        }
         "POST /finalize/1" => {
             let csr: Value = serde_json::from_slice(&payload).unwrap_or_default();
             let csr = URL_SAFE_NO_PAD
                 .decode(csr["csr"].as_str().unwrap_or_default())
                 .unwrap_or_default();
-            state.issued = Some(ca.issue_for_csr(&csr, &state.domain, state.issue_expired));
+            state.issued = Some(ca.issue_for_csr(&csr, &state.domain, state.issue_validity));
             Response::json(200, &order_json(base, &state))
         }
         "POST /cert/1" => {
@@ -523,6 +666,7 @@ fn order_json(base: &str, state: &MockAcmeState) -> Value {
     });
     let status = match state.order_script {
         OrderScript::AlwaysPending => "pending",
+        OrderScript::RevertsOnFinalize => "ready",
         OrderScript::Normal if state.issued.is_some() => {
             order["certificate"] = json!(format!("{base}/cert/1"));
             "valid"
@@ -534,7 +678,18 @@ fn order_json(base: &str, state: &MockAcmeState) -> Value {
     order
 }
 
-pub struct MockCa {
+/// The validity period of a certificate that [`MockCa`] issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Validity {
+    /// Valid from one day ago for 90 days.
+    Fresh,
+    /// Valid for one more day out of 90, so past the renewal time of the client.
+    Due,
+    /// Expired one day ago.
+    Expired,
+}
+
+pub(crate) struct MockCa {
     issuer: Issuer<'static, KeyPair>,
     cert_pem: String,
     pub cert_der: CertificateDer<'static>,
@@ -554,7 +709,7 @@ impl PublicKeyData for CsrPublicKey {
 }
 
 impl MockCa {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut params = CertificateParams::default();
         let mut name = DistinguishedName::new();
         name.push(DnType::CommonName, "Mock ACME CA");
@@ -569,7 +724,7 @@ impl MockCa {
         }
     }
 
-    pub fn issue_for_csr(&self, csr_der: &[u8], domain: &str, expired: bool) -> String {
+    pub(crate) fn issue_for_csr(&self, csr_der: &[u8], domain: &str, validity: Validity) -> String {
         let (_, csr) = X509CertificationRequest::from_der(csr_der).expect("parse CSR");
         let public_key = csr
             .certification_request_info
@@ -577,17 +732,25 @@ impl MockCa {
             .subject_public_key
             .data
             .to_vec();
-        self.issue(&CsrPublicKey(public_key), domain, expired)
+        self.issue(&CsrPublicKey(public_key), domain, validity)
     }
 
-    fn issue(&self, public_key: &impl PublicKeyData, domain: &str, expired: bool) -> String {
+    /// Issues a new key and chain for `domain` as cache PEM.
+    pub(crate) fn issue_with_key(&self, domain: &str, validity: Validity) -> Vec<u8> {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let chain = self.issue(&key, domain, validity);
+        format!("{}\n{chain}", key.serialize_pem()).into_bytes()
+    }
+
+    fn issue(&self, public_key: &impl PublicKeyData, domain: &str, validity: Validity) -> String {
         let mut params = CertificateParams::new(vec![domain.to_string()]).expect("valid domain");
         params.distinguished_name = DistinguishedName::new();
         let now = OffsetDateTime::now_utc();
         let day = time::Duration::days(1);
-        (params.not_before, params.not_after) = match expired {
-            true => (now - 2 * day, now - day),
-            false => (now - day, now + 90 * day),
+        (params.not_before, params.not_after) = match validity {
+            Validity::Fresh => (now - day, now + 90 * day),
+            Validity::Due => (now - 89 * day, now + day),
+            Validity::Expired => (now - 2 * day, now - day),
         };
         let leaf = params
             .signed_by(public_key, &self.issuer)

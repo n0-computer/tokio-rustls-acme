@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
@@ -25,18 +25,52 @@ use crate::acme::{
 };
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
-type Timer = std::pin::Pin<Box<Sleep>>;
+/// First delay of the order backoffs, which double it on each retry.
+const BACKOFF_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Longest renewal sleep, because the monotonic timer misses clock corrections and host suspend.
+const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
+
+/// Number of order rounds that can fail to advance the order status before the order fails.
+const MAX_STALLED_ROUNDS: u32 = 10;
+
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-pub(crate) fn after(d: std::time::Duration) -> Timer {
+pub(crate) fn after(d: Duration) -> Pin<Box<Sleep>> {
     Box::pin(tokio::time::sleep(d))
+}
+
+/// Returns the time left from `now` until `deadline`, or `None` once it is reached.
+fn time_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
+    let left: Duration = (deadline - now).try_into().ok()?;
+    (!left.is_zero()).then_some(left)
+}
+
+/// Returns how long to sleep before the next renewal check, or `None` once renewal is due.
+fn renewal_sleep(renew_at: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
+    time_until(renew_at, now).map(|left| left.min(MAX_RENEWAL_SLEEP))
+}
+
+/// Returns the delay after stalled order round `round`, or `None` once the order should fail.
+fn stall_delay(round: u32) -> Option<Duration> {
+    (round < MAX_STALLED_ROUNDS).then(|| BACKOFF_BASE_DELAY * (1 << round))
+}
+
+/// A failed order.
+struct OrderFailure {
+    error: OrderError,
+    /// Whether the CA rejected the account key at `newAccount`.
+    account_rejected: bool,
 }
 
 /// Drives ACME orders and renewals, surfacing lifecycle events as a [`Stream`].
 ///
 /// Owns the [`ResolvesServerCertAcme`] populated as new certificates are
 /// issued. Construct one from [`AcmeConfig::state`].
-#[allow(clippy::type_complexity)]
+#[allow(
+    clippy::type_complexity,
+    reason = "the boxed futures are each used once, aliases would only move them"
+)]
 pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
     resolver: Arc<ResolvesServerCertAcme>,
@@ -45,9 +79,10 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     early_action: Option<BoxFuture<Event<EC, EA>>>,
     load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
-    order: Option<BoxFuture<Result<Vec<u8>, OrderError>>>,
+    order: Option<BoxFuture<Result<Vec<u8>, OrderFailure>>>,
     backoff_cnt: usize,
-    wait: Option<Timer>,
+    wait: Option<Pin<Box<Sleep>>>,
+    renew_at: Option<OffsetDateTime>,
 }
 
 /// Item of the [`AcmeState`] stream, reporting the outcome of one step.
@@ -74,6 +109,12 @@ pub enum EventError<EC: Debug, EA: Debug> {
     /// Loading the certificate from the cache failed.
     #[error("cert cache load: {0}")]
     CertCacheLoad(EC),
+    /// The account cache could not be read, so this run orders with a new key that is not stored.
+    ///
+    /// Return `Ok(None)` from [`AccountCache::load_account`] when no key is stored.
+    /// Otherwise every start uses a new account.
+    ///
+    /// [`AccountCache::load_account`]: crate::AccountCache::load_account
     #[error("account cache load: {0}")]
     AccountCacheLoad(EA),
     /// Storing the newly issued certificate in the cache failed.
@@ -85,7 +126,9 @@ pub enum EventError<EC: Debug, EA: Debug> {
     /// The certificate from the cache could not be parsed.
     #[error("cached cert parse: {0}")]
     CachedCertParse(CertParseError),
-    /// Ordering a certificate failed, and the next order follows after a backoff.
+    /// An order failed, and the next one starts after a backoff.
+    ///
+    /// If the CA rejects the account, later orders use a new account key kept in memory only.
     #[error("order: {0}")]
     Order(OrderError),
     /// The newly issued certificate could not be parsed.
@@ -114,8 +157,8 @@ pub enum OrderError {
     /// The authorization for the given domain was still pending after the last check.
     #[error("authorization for {0} failed too many times")]
     TooManyAttemptsAuth(String),
-    /// The order was still processing after the last check.
-    #[error("order status stayed on processing too long")]
+    /// The order stayed `processing` or stopped advancing for too long.
+    #[error("order did not reach a final status in time, last status {:?}", .0.status)]
     ProcessingTimeout(Order),
 }
 
@@ -139,10 +182,23 @@ pub enum CertParseError {
     /// The crypto provider cannot load the private key, or it does not match the certificate.
     #[error("private key is unsupported or does not match the certificate")]
     InvalidPrivateKey,
+    /// The newly issued certificate has already expired.
+    #[error("certificate has already expired")]
+    Expired,
 }
 
 fn rcgen_err(err: rcgen::Error) -> OrderError {
     OrderError::Rcgen(err.into())
+}
+
+impl<EC: Debug, EA: Debug> fmt::Debug for AcmeState<EC, EA> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcmeState")
+            .field("config", &self.config)
+            .field("renew_at", &self.renew_at)
+            .field("backoff_cnt", &self.backoff_cnt)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
@@ -237,6 +293,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             order: None,
             backoff_cnt: 0,
             wait: None,
+            renew_at: None,
         }
     }
     fn parse_cert(
@@ -266,7 +323,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         Ok((cert, validity))
     }
 
-    #[allow(clippy::result_large_err)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "runs once per certificate, so the error size does not matter"
+    )]
     fn process_cert(&mut self, pem: Vec<u8>, cached: bool) -> Event<EC, EA> {
         let provider = self.crypto_provider();
         let (cert, validity) = match (Self::parse_cert(&provider, &pem), cached) {
@@ -278,14 +338,14 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 };
             }
         };
-        self.resolver.set_cert(Arc::new(cert));
         let [not_before, not_after] = validity;
-        let renew_at = not_after - (not_after - not_before) / 3_i32;
-        // Negative durations (renewal already due) fail the conversion and become zero.
-        let wait_duration = (renew_at - OffsetDateTime::now_utc())
-            .try_into()
-            .unwrap_or_default();
-        self.wait = Some(after(wait_duration));
+        // The deployed certificate may still be valid, so keep it and the cache.
+        if !cached && not_after <= OffsetDateTime::now_utc() {
+            warn!(%not_after, "the CA issued an expired certificate, keeping the deployed one");
+            return Err(EventError::NewCertParse(CertParseError::Expired));
+        }
+        self.resolver.set_cert(Arc::new(cert));
+        self.renew_at = Some(not_after - (not_after - not_before) / 3_i32);
         if cached {
             return Ok(EventOk::DeployedCachedCert);
         }
@@ -302,21 +362,46 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }));
         Event::Ok(EventOk::DeployedNewCert)
     }
+    /// Runs one order.
+    #[allow(
+        clippy::result_large_err,
+        reason = "returns once per order, so the error size does not matter"
+    )]
     async fn order(
         config: Arc<AcmeConfig<EC, EA>>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
+    ) -> Result<Vec<u8>, OrderFailure> {
+        let account = async {
+            let directory =
+                Directory::discover(&config.client_config, &config.directory_url).await?;
+            Account::create_with_keypair(
+                &config.client_config,
+                directory,
+                &config.contact,
+                &key_pair,
+                &config.eab,
+            )
+            .await
+        }
+        .await
+        .map_err(|err| OrderFailure {
+            account_rejected: err.rejects_account(),
+            error: err.into(),
+        })?;
+        // CAs also use `unauthorized` for order problems, so only account errors count.
+        Self::order_with_account(&config, &resolver, &account)
+            .await
+            .map_err(|error| OrderFailure {
+                error,
+                account_rejected: false,
+            })
+    }
+    async fn order_with_account(
+        config: &AcmeConfig<EC, EA>,
+        resolver: &ResolvesServerCertAcme,
+        account: &Account,
     ) -> Result<Vec<u8>, OrderError> {
-        let directory = Directory::discover(&config.client_config, &config.directory_url).await?;
-        let account = Account::create_with_keypair(
-            &config.client_config,
-            directory,
-            &config.contact,
-            &key_pair,
-            &config.eab,
-        )
-        .await?;
-
         let identifiers = config.identifiers();
         if config.profile.is_none() && identifiers.iter().any(|id| matches!(id, Identifier::Ip(_)))
         {
@@ -341,13 +426,15 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             )
             .await?;
         info!(profile = ?config.profile, "created order");
+        let mut stalled_rounds = 0;
         loop {
+            let previous_progress = order.status.progress();
             match order.status {
                 OrderStatus::Pending => {
                     let auth_futures = order
                         .authorizations
                         .iter()
-                        .map(|url| Self::authorize(&config, &resolver, &account, url));
+                        .map(|url| Self::authorize(config, resolver, account, url));
                     try_join_all(auth_futures).await?;
                     info!("completed all authorizations");
                     order = account.order(&config.client_config, &order_url).await?;
@@ -385,6 +472,15 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                     return Ok(pem.into_bytes());
                 }
                 OrderStatus::Invalid => return Err(OrderError::BadOrder(order)),
+            }
+            // A CA can lag in updating the status, and a broken CA can move it backwards.
+            if order.status.progress() <= previous_progress {
+                let Some(delay) = stall_delay(stalled_rounds) else {
+                    return Err(OrderError::ProcessingTimeout(order));
+                };
+                info!(status = ?order.status, "order status did not advance");
+                after(delay).await;
+                stalled_rounds += 1;
             }
         }
     }
@@ -426,6 +522,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }
         Err(OrderError::TooManyAttemptsAuth(identifier.to_string()))
     }
+    /// Delays the next order with an exponential backoff.
+    fn back_off(&mut self) {
+        self.wait = Some(after(BACKOFF_BASE_DELAY * (1 << self.backoff_cnt)));
+        self.backoff_cnt = (self.backoff_cnt + 1).min(16);
+    }
     fn poll_next_infinite(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Event<EC, EA>> {
         loop {
             // queued early action
@@ -439,6 +540,17 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             if let Some(timer) = &mut self.wait {
                 ready!(timer.poll(cx));
                 self.wait.take();
+            }
+
+            // wait for renewal
+            if let Some(renew_at) = self.renew_at {
+                match renewal_sleep(renew_at, OffsetDateTime::now_utc()) {
+                    Some(sleep) => {
+                        self.wait = Some(after(sleep));
+                        continue;
+                    }
+                    None => self.renew_at = None,
+                }
             }
 
             // load from cert cache
@@ -458,10 +570,23 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             if let Some(load_account) = &mut self.load_account {
                 let result = ready!(load_account.poll(cx));
                 self.load_account.take();
+                // Never overwrite a stored key, it may be the only access to an account.
                 match result {
-                    Ok(Some(key_pair)) => self.account_key = Some(key_pair),
+                    Ok(Some(key_pair)) => match Account::check_key_pair(&key_pair) {
+                        Ok(()) => self.account_key = Some(key_pair),
+                        Err(err) => {
+                            error!(
+                                %err,
+                                "cannot use the cached account key, fix or delete it. Ordering with a new key that is not stored"
+                            );
+                            self.account_key = Some(Account::generate_key_pair());
+                        }
+                    },
                     Ok(None) => {}
-                    Err(err) => return Poll::Ready(Err(EventError::AccountCacheLoad(err))),
+                    Err(err) => {
+                        self.account_key = Some(Account::generate_key_pair());
+                        return Poll::Ready(Err(EventError::AccountCacheLoad(err)));
+                    }
                 }
             }
 
@@ -471,14 +596,30 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 self.order.take();
                 match result {
                     Ok(pem) => {
-                        self.backoff_cnt = 0;
-                        return Poll::Ready(Self::process_cert(self.get_mut(), pem, false));
+                        let event = self.process_cert(pem, false);
+                        // An unusable or already due certificate counts as a failed order.
+                        let now = OffsetDateTime::now_utc();
+                        let due = self.renew_at.is_some_and(|t| time_until(t, now).is_none());
+                        if event.is_err() || due {
+                            self.back_off();
+                        } else {
+                            self.backoff_cnt = 0;
+                        }
+                        return Poll::Ready(event);
                     }
-                    Err(err) => {
-                        // TODO: replace key on some errors or high backoff_cnt?
-                        self.wait = Some(after(Duration::from_secs(1 << self.backoff_cnt)));
-                        self.backoff_cnt = (self.backoff_cnt + 1).min(16);
-                        return Poll::Ready(Err(EventError::Order(err)));
+                    Err(OrderFailure {
+                        error,
+                        account_rejected,
+                    }) => {
+                        // Keeps the stored key, so a wrong CA answer cannot lose a valid account.
+                        if account_rejected {
+                            error!(
+                                "the CA rejected the ACME account, ordering with a new account key that is not stored"
+                            );
+                            self.account_key = Some(Account::generate_key_pair());
+                        }
+                        self.back_off();
+                        return Poll::Ready(Err(EventError::Order(error)));
                     }
                 }
             }
@@ -520,5 +661,42 @@ impl<EC: 'static + Debug, EA: 'static + Debug> Stream for AcmeState<EC, EA> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(Some(ready!(self.poll_next_infinite(cx))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN: Duration = Duration::from_secs(60);
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+
+    #[test]
+    fn renewal_sleep_is_capped_at_max_renewal_sleep() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let cases = [
+            (now - MIN, None),
+            (now, None),
+            (now + MIN, Some(MIN)),
+            (now + MAX_RENEWAL_SLEEP, Some(MAX_RENEWAL_SLEEP)),
+            (now + 30 * 24 * HOUR, Some(MAX_RENEWAL_SLEEP)),
+        ];
+        for (renew_at, expected) in cases {
+            assert_eq!(
+                renewal_sleep(renew_at, now),
+                expected,
+                "renew at {renew_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn stall_delay_doubles_until_the_round_limit() {
+        let delays: Vec<_> = (0..=MAX_STALLED_ROUNDS).map(stall_delay).collect();
+        let expected: Vec<_> = (0..MAX_STALLED_ROUNDS)
+            .map(|round| Some(Duration::from_secs(1 << round)))
+            .chain([None])
+            .collect();
+        assert_eq!(delays, expected);
     }
 }

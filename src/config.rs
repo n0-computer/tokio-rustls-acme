@@ -11,7 +11,7 @@ use rustls::DEFAULT_VERSIONS;
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, ServerConfig};
 use std::convert::Infallible;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -26,6 +26,16 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
     pub(crate) profile: Option<String>,
+}
+
+impl<EC: Debug, EA: Debug> fmt::Debug for AcmeConfig<EC, EA> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcmeConfig")
+            .field("directory_url", &self.directory_url)
+            .field("domains", &self.domains)
+            .field("contact", &self.contact)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AcmeConfig<Infallible, Infallible> {
@@ -206,6 +216,8 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
+    /// Binds the ACME account to an account at the CA with the key ID `kid` and HMAC `key`
+    /// (RFC 8555 section 7.3.4). Some CAs require this.
     pub fn external_account_binding(mut self, kid: impl AsRef<str>, key: impl AsRef<[u8]>) -> Self {
         self.eab = Some(ExternalAccountKey::new(kid.as_ref().into(), key.as_ref()));
         self
@@ -227,6 +239,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
+    /// Stores certificates and account keys in `cache`.
     pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> {
         AcmeConfig {
             client_config: self.client_config,
