@@ -21,7 +21,8 @@ use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
-    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
+    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, InvalidIdentifier, Order,
+    OrderStatus,
 };
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
@@ -199,6 +200,9 @@ pub enum OrderError {
     /// The authorization for the given domain was still pending after the last check.
     #[error("authorization for {0} failed too many times")]
     TooManyAttemptsAuth(String),
+    /// A configured identifier is not a valid IP address or DNS name.
+    #[error("invalid identifier: {0}")]
+    InvalidIdentifier(#[from] InvalidIdentifier),
     /// The CA does not offer the configured profile.
     #[error("the CA does not offer profile {profile:?}, it offers {offered:?}")]
     UnknownProfile {
@@ -424,6 +428,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
     ) -> Result<Vec<u8>, OrderFailure> {
+        // Checked before any request, so a typo fails without contacting the CA.
+        let identifiers = config.parsed_identifiers().map_err(|err| OrderFailure {
+            error: err.into(),
+            account_rejected: false,
+        })?;
         let account = async {
             let directory =
                 Directory::discover(&config.client_config, &config.directory_url).await?;
@@ -442,7 +451,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             error: err.into(),
         })?;
         // CAs also use `unauthorized` for order problems, so only account errors count.
-        Self::order_with_account(&config, &resolver, &account)
+        Self::order_with_account(&config, &resolver, &account, &identifiers)
             .await
             .map_err(|error| OrderFailure {
                 error,
@@ -453,6 +462,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         config: &AcmeConfig<EC, EA>,
         resolver: &ResolvesServerCertAcme,
         account: &Account,
+        identifiers: &[Identifier],
     ) -> Result<Vec<u8>, OrderError> {
         if let Some(profile) = &config.profile {
             let meta = &account.directory.meta;
@@ -467,7 +477,6 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 None => warn!(%profile, "the CA lists no profiles and may ignore the profile"),
             }
         }
-        let identifiers = config.parsed_identifiers();
         if config.profile.is_none() && identifiers.iter().any(|id| matches!(id, Identifier::Ip(_)))
         {
             warn!(
@@ -486,7 +495,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         let (order_url, mut order) = account
             .new_order(
                 &config.client_config,
-                &identifiers,
+                identifiers,
                 config.profile.as_deref(),
             )
             .await?;

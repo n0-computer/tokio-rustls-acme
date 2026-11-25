@@ -16,7 +16,9 @@ use rustls::{
 use support::{ACME_IDENTIFIER_OID, ACME_TLS_ALPN, AcceptAnyCert, MockAcme};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
-use tokio_rustls_acme::{AcmeAcceptor, AcmeConfig, EventOk, ResolvesServerCertAcme};
+use tokio_rustls_acme::{
+    AcmeAcceptor, AcmeConfig, EventError, EventOk, OrderError, ResolvesServerCertAcme,
+};
 use x509_parser::{
     certificate::X509Certificate, extensions::GeneralName, oid_registry::Oid, prelude::FromDer,
 };
@@ -254,5 +256,34 @@ async fn validated_order_follows_jws_rules_and_deploys_own_key() {
     assert!(
         result.client.is_some(),
         "the deployed certificate does not verify for {DOMAIN}"
+    );
+}
+
+/// Fails the order of an invalid identifier before any request to the CA.
+#[tokio::test]
+async fn invalid_identifier_fails_before_contacting_the_ca() {
+    let mock = MockAcme::start().await;
+    let mut state = AcmeConfig::new_with_client_tls_config(["foo bar"], mock.client_config.clone())
+        .directory(&mock.directory_url)
+        .state();
+    // The account key is stored first, then the order fails.
+    let err = tokio::time::timeout(LIMIT, async {
+        loop {
+            match state.next().await.expect("state stream ended") {
+                Ok(_) => {}
+                Err(err) => return err,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the order");
+    assert!(
+        matches!(err, EventError::Order(OrderError::InvalidIdentifier(_))),
+        "expected an invalid identifier error, got {err:?}"
+    );
+    assert_eq!(
+        mock.state().hits("GET /dir"),
+        0,
+        "the client contacted the CA"
     );
 }

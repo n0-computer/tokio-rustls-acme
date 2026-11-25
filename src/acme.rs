@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -22,7 +21,7 @@ use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig,
     crypto::CryptoProvider,
-    pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+    pki_types::{DnsName, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -432,7 +431,7 @@ pub enum AuthStatus {
 /// An ACME identifier (RFC 8555 section 9.7.7, RFC 8738 for IP addresses).
 ///
 /// Parsing a string with [`str::parse`] picks [`Identifier::Ip`] if it is an IP address and
-/// [`Identifier::Dns`] otherwise. IP addresses serialize in their canonical text form (RFC 5952
+/// [`Identifier::Dns`] if it is a valid DNS name, see the [`FromStr`] impl. IP addresses serialize in their canonical text form (RFC 5952
 /// for IPv6), as RFC 8738 section 3 requires.
 ///
 /// The parsing follows [`IpAddr`]'s `FromStr`. An IPv4-mapped IPv6 address like
@@ -455,12 +454,55 @@ impl From<IpAddr> for Identifier {
 }
 
 impl FromStr for Identifier {
-    type Err = Infallible;
+    type Err = InvalidIdentifier;
 
-    /// Parses `s` as an IP identifier if it is an IP address, and as a DNS identifier otherwise.
+    /// Parses `s` as an IP address, or else as a DNS name.
+    ///
+    /// DNS names are lowercased and lose a trailing dot. Rejects the unspecified addresses,
+    /// IPv4-mapped IPv6 addresses, wildcards, non-ASCII names and names that are not valid DNS
+    /// names, including ones that look like IP addresses, such as `010.0.0.1`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::from_text(s))
+        if let Ok(ip) = s.parse::<IpAddr>() {
+            return match ip {
+                ip if ip.is_unspecified() => Err(InvalidIdentifier::UnspecifiedIp(ip)),
+                IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
+                    Err(InvalidIdentifier::Ipv4MappedIp(v6))
+                }
+                ip => Ok(Identifier::Ip(ip)),
+            };
+        }
+        if !s.is_ascii() {
+            return Err(InvalidIdentifier::NonAscii(s.to_owned()));
+        }
+        let name = s.strip_suffix('.').unwrap_or(s).to_ascii_lowercase();
+        if name.starts_with('*') {
+            return Err(InvalidIdentifier::Wildcard(s.to_owned()));
+        }
+        DnsName::try_from(name.as_str())
+            .map_err(|_| InvalidIdentifier::InvalidDnsName(s.to_owned()))?;
+        Ok(Identifier::Dns(name))
     }
+}
+
+/// An error from parsing an [`Identifier`].
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidIdentifier {
+    /// The string is neither an IP address nor a valid DNS name.
+    #[error("{0:?} is neither an IP address nor a valid DNS name")]
+    InvalidDnsName(String),
+    /// The name is not ASCII. Internationalized names need their punycode form (`xn--`).
+    #[error("{0:?} is not ASCII, use the punycode form of the name")]
+    NonAscii(String),
+    /// The name is a wildcard, which tls-alpn-01 cannot validate.
+    #[error("{0:?} is a wildcard, which tls-alpn-01 cannot validate")]
+    Wildcard(String),
+    /// The address is unspecified (`0.0.0.0` or `::`).
+    #[error("{0} is the unspecified address")]
+    UnspecifiedIp(IpAddr),
+    /// The address is an IPv4-mapped IPv6 address. Use the IPv4 address instead.
+    #[error("{0} is an IPv4-mapped IPv6 address, use the IPv4 address")]
+    Ipv4MappedIp(Ipv6Addr),
 }
 
 impl fmt::Display for Identifier {
@@ -473,13 +515,6 @@ impl fmt::Display for Identifier {
 }
 
 impl Identifier {
-    /// Returns `s` as an IP identifier if it is an IP address, and as a DNS identifier otherwise.
-    pub(crate) fn from_text(s: &str) -> Self {
-        match s.parse::<IpAddr>() {
-            Ok(ip) => Identifier::Ip(ip),
-            Err(_) => Identifier::Dns(s.to_owned()),
-        }
-    }
     /// Returns the subject alternative name that certifies this identifier.
     pub(crate) fn subject_alt_name(&self) -> Result<SanType, rcgen::Error> {
         Ok(match self {
@@ -641,12 +676,60 @@ mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parses `s` as a valid identifier.
+    fn id(s: &str) -> Identifier {
+        s.parse()
+            .unwrap_or_else(|err| panic!("{s:?} should parse: {err}"))
+    }
+
+    #[test]
+    fn identifier_parsing_rejects_invalid_input() {
+        let cases = [
+            ("", InvalidIdentifier::InvalidDnsName(String::new())),
+            (
+                "010.0.0.1",
+                InvalidIdentifier::InvalidDnsName("010.0.0.1".into()),
+            ),
+            (
+                "foo bar",
+                InvalidIdentifier::InvalidDnsName("foo bar".into()),
+            ),
+            (
+                "fe80::1%eth0",
+                InvalidIdentifier::InvalidDnsName("fe80::1%eth0".into()),
+            ),
+            (
+                "b\u{fc}cher.example",
+                InvalidIdentifier::NonAscii("b\u{fc}cher.example".into()),
+            ),
+            (
+                "*.example.com",
+                InvalidIdentifier::Wildcard("*.example.com".into()),
+            ),
+            (
+                "0.0.0.0",
+                InvalidIdentifier::UnspecifiedIp("0.0.0.0".parse().unwrap()),
+            ),
+            (
+                "::",
+                InvalidIdentifier::UnspecifiedIp("::".parse().unwrap()),
+            ),
+            (
+                "::ffff:192.0.2.1",
+                InvalidIdentifier::Ipv4MappedIp("::ffff:192.0.2.1".parse().unwrap()),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(input.parse::<Identifier>(), Err(expected), "{input:?}");
+        }
+    }
     use rustls::crypto::KeyProvider;
     use rustls::sign::SigningKey;
 
     #[test]
     fn new_order_payload_has_profile_only_when_set() {
-        let identifiers = [Identifier::from_text("192.0.2.1")];
+        let identifiers = [id("192.0.2.1")];
         let payload = |profile| {
             serde_json::to_string(&NewOrder {
                 identifiers: &identifiers,
@@ -687,15 +770,11 @@ mod tests {
     #[test]
     fn subject_alt_name_matches_the_identifier() {
         assert_eq!(
-            Identifier::from_text("192.0.2.1")
-                .subject_alt_name()
-                .unwrap(),
+            id("192.0.2.1").subject_alt_name().unwrap(),
             SanType::IpAddress("192.0.2.1".parse().unwrap())
         );
         assert_eq!(
-            Identifier::from_text("example.com")
-                .subject_alt_name()
-                .unwrap(),
+            id("example.com").subject_alt_name().unwrap(),
             SanType::DnsName("example.com".try_into().unwrap())
         );
     }
@@ -724,34 +803,27 @@ mod tests {
     #[test]
     fn server_name_for_identifier() {
         assert_eq!(
-            Identifier::from_text("Example.COM").tls_alpn_01_server_name(),
+            Identifier::Dns("Example.COM".into()).tls_alpn_01_server_name(),
             "example.com"
         );
         assert_eq!(
-            Identifier::from_text("10.0.0.1").tls_alpn_01_server_name(),
+            id("10.0.0.1").tls_alpn_01_server_name(),
             "1.0.0.10.in-addr.arpa"
         );
     }
 
     #[test]
     fn identifier_from_str() {
+        assert_eq!(id("example.com"), Identifier::Dns("example.com".into()));
         assert_eq!(
-            Identifier::from_text("example.com"),
-            Identifier::Dns("example.com".into())
-        );
-        assert_eq!(
-            Identifier::from_text("192.0.2.1"),
+            id("192.0.2.1"),
             Identifier::Ip("192.0.2.1".parse().unwrap())
         );
         assert_eq!(
-            Identifier::from_text("2001:db8::1"),
+            id("2001:db8::1"),
             Identifier::Ip("2001:db8::1".parse().unwrap())
         );
-        // Not a valid IPv4 address (leading zero), so it falls through to DNS.
-        assert_eq!(
-            Identifier::from_text("010.1.1.1"),
-            Identifier::Dns("010.1.1.1".into())
-        );
+        assert_eq!(id("Example.COM."), Identifier::Dns("example.com".into()));
     }
 
     #[test]
@@ -759,21 +831,17 @@ mod tests {
         // RFC 5952: lowercase, longest zero run compressed, no leading zeros.
         for input in ["2001:DB8:0:0::1", "2001:0db8:0000:0000:0000:0000:0000:0001"] {
             assert_eq!(
-                Identifier::from_text(input),
+                id(input),
                 Identifier::Ip("2001:db8::1".parse().unwrap()),
                 "{input}"
             );
         }
-        assert_eq!(Identifier::from_text("0:0::1").to_string(), "::1");
+        assert_eq!(id("0:0::1").to_string(), "::1");
     }
 
     #[test]
     fn identifier_wire_format() {
-        let ids = [
-            Identifier::from_text("example.com"),
-            Identifier::from_text("192.0.2.1"),
-            Identifier::from_text("2001:DB8::1"),
-        ];
+        let ids = [id("example.com"), id("192.0.2.1"), id("2001:DB8::1")];
         let json = serde_json::to_string(&ids).unwrap();
         assert_eq!(
             json,
@@ -785,11 +853,8 @@ mod tests {
 
     #[test]
     fn identifier_display() {
-        assert_eq!(Identifier::from_text("::1").to_string(), "::1");
-        assert_eq!(
-            Identifier::from_text("example.com").to_string(),
-            "example.com"
-        );
+        assert_eq!(id("::1").to_string(), "::1");
+        assert_eq!(id("example.com").to_string(), "example.com");
     }
 
     #[derive(Debug)]
@@ -830,11 +895,7 @@ mod tests {
             error: None,
         }];
 
-        let result = account.tls_alpn_01(
-            &provider,
-            &challenges,
-            &Identifier::from_text("example.com"),
-        );
+        let result = account.tls_alpn_01(&provider, &challenges, &id("example.com"));
         assert!(matches!(result, Err(AcmeError::Crypto(_))));
     }
 

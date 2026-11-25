@@ -1,5 +1,5 @@
 use crate::acme::{
-    ExternalAccountKey, Identifier, LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+    ExternalAccountKey, Identifier, InvalidIdentifier, LETS_ENCRYPT_PRODUCTION_DIRECTORY,
     LETS_ENCRYPT_STAGING_DIRECTORY,
 };
 use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
@@ -204,15 +204,15 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     }
 
     /// Returns the configured identifiers, parsed and without duplicates.
-    pub(crate) fn parsed_identifiers(&self) -> Vec<Identifier> {
+    pub(crate) fn parsed_identifiers(&self) -> Result<Vec<Identifier>, InvalidIdentifier> {
         let mut identifiers = Vec::new();
         for domain in &self.domains {
-            let identifier = Identifier::from_text(domain);
+            let identifier = domain.parse()?;
             if !identifiers.contains(&identifier) {
                 identifiers.push(identifier);
             }
         }
-        identifiers
+        Ok(identifiers)
     }
 
     /// Requests certificates with the given ACME profile.
@@ -328,5 +328,31 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     ) -> Incoming<TCP, ETCP, ITCP, EC, EA> {
         self.state()
             .incoming_with_server(tcp_incoming, server_config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parsed_identifiers_normalizes_and_deduplicates() {
+        let config = AcmeConfig::new(["Example.COM.", "example.com", "::1", "0:0::1"]);
+        assert_eq!(
+            config.parsed_identifiers(),
+            Ok(vec![
+                Identifier::Dns("example.com".into()),
+                Identifier::Ip("::1".parse().unwrap()),
+            ])
+        );
+    }
+
+    #[test]
+    fn parsed_identifiers_rejects_an_invalid_identifier() {
+        let config = AcmeConfig::new(["example.com", "*.example.com"]);
+        assert_eq!(
+            config.parsed_identifiers(),
+            Err(InvalidIdentifier::Wildcard("*.example.com".into()))
+        );
     }
 }
