@@ -27,20 +27,34 @@ const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
 /// when it rotates its hierarchy. If no offered chain matches, the default chain is used and a
 /// warning is logged.
 ///
+/// The CA lists the other chains in `Link` headers of the certificate download. Each is fetched
+/// with a request signed by the ACME account, also from another HTTPS origin if the CA points
+/// there. An alternate is used only if it is a valid chain for the certificate to the root:
+/// each certificate must be issued and signed by the next one, a CA certificate valid now.
+///
+/// # Let's Encrypt
+///
+/// Let's Encrypt issues the ECDSA certificates that this crate orders with a default chain to
+/// ISRG Root X1, an RSA root that most clients trust. It also offers a chain to ISRG Root X2,
+/// an ECDSA root in trust stores updated since about 2022, which needs no RSA signature.
+/// [`letsencrypt_x2`](Self::letsencrypt_x2) and
+/// [`letsencrypt_dual_chain`](Self::letsencrypt_dual_chain) use it. The hierarchy changes over
+/// time, see <https://letsencrypt.org/certificates/>.
+///
 /// # DualChain and client capabilities
 ///
 /// [`DualChain`](CertChainPreference::DualChain) picks the chain per connection from the
 /// signature schemes in the client's TLS ClientHello. The alternate is served to clients that
-/// can't verify every signature in the default chain but can verify the alternate. The choice is
-/// made by [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream), which
+/// can't verify every signature in the default chain but can verify the alternate, like rustls
+/// clients built without RSA support. A client that advertises a scheme it can't actually
+/// verify, or that doesn't trust the alternate's root, gains nothing. The choice uses the
+/// `signature_algorithms` extension only, so a TLS 1.3 client that lists a scheme only in
+/// `signature_algorithms_cert` counts as not supporting it.
+///
+/// The choice is made by [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream), which
 /// [`AcmeState::incoming`](crate::AcmeState::incoming) and the Axum acceptor use. A
 /// `ServerConfig` that uses [`AcmeState::resolver`](crate::AcmeState::resolver) elsewhere serves
-/// the default chain to every client. This helps
-/// clients that leave out algorithms they can't verify, e.g. rustls clients built without RSA
-/// support. A client that advertises a scheme it can't actually verify, or that doesn't trust
-/// the alternate's root, gains nothing. The choice uses the `signature_algorithms` extension
-/// only, so a TLS 1.3 client that lists a scheme only in `signature_algorithms_cert` counts as
-/// not supporting it.
+/// the default chain to every client.
 ///
 /// # Changing the preference
 ///
@@ -52,14 +66,16 @@ pub enum CertChainPreference {
     /// Serves the default chain from the ACME server.
     #[default]
     Default,
-    /// Serves the chain whose root issuer common name is the given string.
+    /// Serves the chain to the given root instead of the default chain.
     ///
-    /// Falls back to the default chain if no chain matches, or if fetching the alternates fails.
+    /// Falls back to the default chain if the CA offers no valid chain to the root, or if
+    /// fetching the alternates fails or takes longer than 10 seconds.
     PreferredChain(ChainRoot),
     /// Serves the default chain, and the chain to the given root to clients that only verify it.
     ///
-    /// The root is named by its issuer common name. See the type docs for how the chain is
-    /// picked per connection.
+    /// The certificate is served before its alternate is fetched, or loaded from the cache,
+    /// which may take up to 10 seconds. See the type docs for how the chain is picked per
+    /// connection.
     DualChain(ChainRoot),
 }
 
@@ -132,19 +148,18 @@ impl CertChainPreference {
     pub fn dual_chain(root: impl Into<ChainRoot>) -> Self {
         Self::DualChain(root.into())
     }
-    /// Returns a preference for Let's Encrypt's chain to ISRG Root X2, which is ECDSA-only.
+    /// Returns a preference for Let's Encrypt's chain to ISRG Root X2, which needs no RSA.
     ///
-    /// For ECDSA certificates, Let's Encrypt's default chain has its intermediate signed by
-    /// ISRG Root X1 (RSA), with the X2-signed one offered as an alternate. Certificates from
-    /// newer hierarchies (e.g. the 2026 Root YE for the `tlsserver` and `shortlived`
-    /// profiles) may not offer an X2 chain, in which case the default chain is used.
+    /// Only clients that trust ISRG Root X2 verify it, see the [type docs](Self). If Let's
+    /// Encrypt offers no chain to ISRG Root X2, the default chain is used.
     pub fn letsencrypt_x2() -> Self {
         Self::preferred_chain(LETSENCRYPT_ISRG_ROOT_X2)
     }
     /// Returns a preference that adds Let's Encrypt's ISRG Root X2 chain for clients without RSA.
     ///
-    /// The default chain, with the intermediate signed by ISRG Root X1 (RSA), stays the
-    /// primary. Same caveats as [`letsencrypt_x2`](Self::letsencrypt_x2).
+    /// The default chain to ISRG Root X1 stays the primary, so clients that trust only ISRG
+    /// Root X1 keep working. Clients that can't verify RSA signatures get the chain to ISRG
+    /// Root X2, see [`letsencrypt_x2`](Self::letsencrypt_x2).
     pub fn letsencrypt_dual_chain() -> Self {
         Self::dual_chain(LETSENCRYPT_ISRG_ROOT_X2)
     }
