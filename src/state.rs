@@ -331,7 +331,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 async move {
                     config
                         .cache
-                        .load_cert(&config.domains, &config.directory_url)
+                        .load_cert(&config.cache_domains(), &config.directory_url)
                         .await
                 }
             })),
@@ -409,7 +409,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         self.early_action = Some(Box::pin(async move {
             match config
                 .cache
-                .store_cert(&config.domains, &config.directory_url, &pem)
+                .store_cert(&config.cache_domains(), &config.directory_url, &pem)
                 .await
             {
                 Ok(()) => Ok(EventOk::CertCacheStore),

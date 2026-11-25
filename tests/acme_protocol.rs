@@ -17,7 +17,7 @@ use support::{ACME_IDENTIFIER_OID, ACME_TLS_ALPN, AcceptAnyCert, MockAcme};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 use tokio_rustls_acme::{
-    AcmeAcceptor, AcmeConfig, EventError, EventOk, OrderError, ResolvesServerCertAcme,
+    AcmeAcceptor, AcmeConfig, AcmeState, EventError, EventOk, OrderError, ResolvesServerCertAcme,
 };
 use x509_parser::{
     certificate::X509Certificate, extensions::GeneralName, oid_registry::Oid, prelude::FromDer,
@@ -259,31 +259,45 @@ async fn validated_order_follows_jws_rules_and_deploys_own_key() {
     );
 }
 
-/// Fails the order of an invalid identifier before any request to the CA.
+/// Fails the order of invalid identifiers before any request to the CA.
 #[tokio::test]
 async fn invalid_identifier_fails_before_contacting_the_ca() {
-    let mock = MockAcme::start().await;
-    let mut state = AcmeConfig::new_with_client_tls_config(["foo bar"], mock.client_config.clone())
-        .directory(&mock.directory_url)
-        .state();
+    let cases: [&[&str]; 3] = [
+        &["foo bar"],
+        &["example.org.."],
+        // Both identifiers would need the same challenge SNI.
+        &["192.0.2.1", "1.2.0.192.in-addr.arpa"],
+    ];
+    for domains in cases {
+        let mock = MockAcme::start().await;
+        let mut state = AcmeConfig::new_with_client_tls_config(domains, mock.client_config.clone())
+            .directory(&mock.directory_url)
+            .state();
+        let err = first_order_error(&mut state).await;
+        assert!(
+            matches!(err, OrderError::InvalidIdentifier(_)),
+            "{domains:?}: expected an invalid identifier error, got {err:?}"
+        );
+        assert_eq!(
+            mock.state().hits("GET /dir"),
+            0,
+            "{domains:?}: the client contacted the CA"
+        );
+    }
+}
+
+/// Drives `state` until its first error, which must be an order error.
+async fn first_order_error(state: &mut AcmeState) -> OrderError {
     // The account key is stored first, then the order fails.
-    let err = tokio::time::timeout(LIMIT, async {
+    tokio::time::timeout(LIMIT, async {
         loop {
             match state.next().await.expect("state stream ended") {
                 Ok(_) => {}
-                Err(err) => return err,
+                Err(EventError::Order(err)) => return err,
+                Err(err) => panic!("expected an order error, got {err:?}"),
             }
         }
     })
     .await
-    .expect("timed out waiting for the order");
-    assert!(
-        matches!(err, EventError::Order(OrderError::InvalidIdentifier(_))),
-        "expected an invalid identifier error, got {err:?}"
-    );
-    assert_eq!(
-        mock.state().hits("GET /dir"),
-        0,
-        "the client contacted the CA"
-    );
+    .expect("timed out waiting for the order")
 }

@@ -430,13 +430,10 @@ pub enum AuthStatus {
 
 /// An ACME identifier (RFC 8555 section 9.7.7, RFC 8738 for IP addresses).
 ///
-/// Parsing a string with [`str::parse`] picks [`Identifier::Ip`] if it is an IP address and
-/// [`Identifier::Dns`] if it is a valid DNS name, see the [`FromStr`] impl. IP addresses serialize in their canonical text form (RFC 5952
-/// for IPv6), as RFC 8738 section 3 requires.
-///
-/// The parsing follows [`IpAddr`]'s `FromStr`. An IPv4-mapped IPv6 address like
-/// `::ffff:192.0.2.1` stays an IPv6 identifier, which a CA may reject. Strings that do not parse,
-/// like `fe80::1%eth0` with a zone or `010.0.0.1` with a leading zero, become DNS identifiers.
+/// Parsing a string with [`str::parse`] yields [`Identifier::Ip`] for an IP address and
+/// [`Identifier::Dns`] for a valid DNS name, and rejects everything else, see the [`FromStr`]
+/// impl. IP addresses serialize in their canonical text form (RFC 5952 for IPv6), as RFC 8738
+/// section 3 requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 #[non_exhaustive]
@@ -456,31 +453,16 @@ impl From<IpAddr> for Identifier {
 impl FromStr for Identifier {
     type Err = InvalidIdentifier;
 
-    /// Parses `s` as an IP address, or else as a DNS name.
+    /// Parses `s` as an IP address, or else as a DNS name, and validates it.
     ///
-    /// DNS names are lowercased and lose a trailing dot. Rejects the unspecified addresses,
-    /// IPv4-mapped IPv6 addresses, wildcards, non-ASCII names and names that are not valid DNS
-    /// names, including ones that look like IP addresses, such as `010.0.0.1`.
+    /// See [`Identifier::validated`] for the rules. Zone IDs such as `fe80::1%eth0` and
+    /// zero-padded IPv4 such as `010.0.0.1` are not IP addresses, and fail as DNS names.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Ok(ip) = s.parse::<IpAddr>() {
-            return match ip {
-                ip if ip.is_unspecified() => Err(InvalidIdentifier::UnspecifiedIp(ip)),
-                IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
-                    Err(InvalidIdentifier::Ipv4MappedIp(v6))
-                }
-                ip => Ok(Identifier::Ip(ip)),
-            };
+        match s.parse::<IpAddr>() {
+            Ok(ip) => Identifier::Ip(ip),
+            Err(_) => Identifier::Dns(s.to_owned()),
         }
-        if !s.is_ascii() {
-            return Err(InvalidIdentifier::NonAscii(s.to_owned()));
-        }
-        let name = s.strip_suffix('.').unwrap_or(s).to_ascii_lowercase();
-        if name.starts_with('*') {
-            return Err(InvalidIdentifier::Wildcard(s.to_owned()));
-        }
-        DnsName::try_from(name.as_str())
-            .map_err(|_| InvalidIdentifier::InvalidDnsName(s.to_owned()))?;
-        Ok(Identifier::Dns(name))
+        .validated()
     }
 }
 
@@ -488,6 +470,12 @@ impl FromStr for Identifier {
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InvalidIdentifier {
+    /// Two identifiers of the order share the challenge name that the CA sends as SNI.
+    ///
+    /// An IP address and its reverse-DNS name, like `192.0.2.1` and `1.2.0.192.in-addr.arpa`,
+    /// need different challenge certificates for the same SNI, so one order can't hold both.
+    #[error("two identifiers share the challenge name {0:?}")]
+    ChallengeNameConflict(String),
     /// The string is neither an IP address nor a valid DNS name.
     #[error("{0:?} is neither an IP address nor a valid DNS name")]
     InvalidDnsName(String),
@@ -515,6 +503,39 @@ impl fmt::Display for Identifier {
 }
 
 impl Identifier {
+    /// Returns the identifier normalized for an order, or why it can't be ordered.
+    ///
+    /// DNS names are lowercased and lose one trailing dot. They must be ASCII (internationalized
+    /// names in their punycode form), not wildcards, and valid DNS names to rustls, which rejects
+    /// names that look like IP addresses and accepts underscores for private CAs. IP addresses
+    /// must not be unspecified or IPv4-mapped IPv6.
+    pub fn validated(self) -> Result<Self, InvalidIdentifier> {
+        match self {
+            Identifier::Ip(ip) => match ip {
+                ip if ip.is_unspecified() => Err(InvalidIdentifier::UnspecifiedIp(ip)),
+                IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
+                    Err(InvalidIdentifier::Ipv4MappedIp(v6))
+                }
+                ip => Ok(Identifier::Ip(ip)),
+            },
+            Identifier::Dns(name) => Self::normalized_dns_name(name).map(Identifier::Dns),
+        }
+    }
+    /// Returns `name` lowercased and without one trailing dot, or why it is no valid DNS name.
+    fn normalized_dns_name(name: String) -> Result<String, InvalidIdentifier> {
+        if !name.is_ascii() {
+            return Err(InvalidIdentifier::NonAscii(name));
+        }
+        let normalized = name.strip_suffix('.').unwrap_or(&name).to_ascii_lowercase();
+        if normalized.starts_with('*') {
+            return Err(InvalidIdentifier::Wildcard(name));
+        }
+        // rustls accepts one trailing dot, so a second one would survive normalization.
+        if normalized.ends_with('.') || DnsName::try_from(normalized.as_str()).is_err() {
+            return Err(InvalidIdentifier::InvalidDnsName(name));
+        }
+        Ok(normalized)
+    }
     /// Returns the subject alternative name that certifies this identifier.
     pub(crate) fn subject_alt_name(&self) -> Result<SanType, rcgen::Error> {
         Ok(match self {
@@ -676,6 +697,8 @@ mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::crypto::KeyProvider;
+    use rustls::sign::SigningKey;
 
     /// Parses `s` as a valid identifier.
     fn id(s: &str) -> Identifier {
@@ -687,6 +710,11 @@ mod tests {
     fn identifier_parsing_rejects_invalid_input() {
         let cases = [
             ("", InvalidIdentifier::InvalidDnsName(String::new())),
+            (".", InvalidIdentifier::InvalidDnsName(".".into())),
+            (
+                "example.org..",
+                InvalidIdentifier::InvalidDnsName("example.org..".into()),
+            ),
             (
                 "010.0.0.1",
                 InvalidIdentifier::InvalidDnsName("010.0.0.1".into()),
@@ -724,8 +752,28 @@ mod tests {
             assert_eq!(input.parse::<Identifier>(), Err(expected), "{input:?}");
         }
     }
-    use rustls::crypto::KeyProvider;
-    use rustls::sign::SigningKey;
+
+    #[test]
+    fn validated_checks_typed_identifiers_like_parsed_ones() {
+        assert_eq!(
+            Identifier::Dns("Example.ORG.".into()).validated(),
+            Ok(Identifier::Dns("example.org".into()))
+        );
+        // A DNS identifier keeps its type, so an IP literal is no valid DNS name.
+        assert_eq!(
+            Identifier::Dns("192.0.2.1".into()).validated(),
+            Err(InvalidIdentifier::InvalidDnsName("192.0.2.1".into()))
+        );
+        assert_eq!(
+            Identifier::Ip("::".parse().unwrap()).validated(),
+            Err(InvalidIdentifier::UnspecifiedIp("::".parse().unwrap()))
+        );
+        // rustls accepts underscores, which private CAs may issue for.
+        assert_eq!(
+            Identifier::Dns("_svc.example.org".into()).validated(),
+            Ok(Identifier::Dns("_svc.example.org".into()))
+        );
+    }
 
     #[test]
     fn new_order_payload_has_profile_only_when_set() {
