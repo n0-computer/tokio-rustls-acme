@@ -26,7 +26,6 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls_acme::{
     AcmeAcceptor, AcmeConfig, AcmeState, CertCache, EventError, EventOk, OrderError,
     ResolvesServerCertAcme,
-    acme::Identifier,
     caches::{NoCache, TestCache},
 };
 use x509_parser::{
@@ -35,9 +34,6 @@ use x509_parser::{
 
 const DOMAIN: &str = "invariants.example.com";
 const LIMIT: Duration = Duration::from_secs(30);
-
-/// Sets the identifiers of a config.
-type Configure = fn(AcmeConfig<Infallible>) -> AcmeConfig<Infallible>;
 
 /// An ACME order that waits for the CA to validate its tls-alpn-01 challenge.
 struct PendingChallenge {
@@ -279,34 +275,27 @@ async fn validated_order_follows_jws_rules_and_deploys_own_key() {
 }
 
 /// Fails invalid identifiers before any request to the CA, and without a cached certificate.
+///
+/// The kinds of invalid identifiers are unit tested in `acme` and `config`.
 #[tokio::test]
 async fn invalid_identifiers_fail_before_the_cache_and_the_ca() {
-    let cases: [Configure; 3] = [
-        |config| config.identifiers([Identifier::Dns("192.0.2.1".into())]),
-        // Both identifiers would need the same challenge SNI.
-        |config| config.domains(["192.0.2.1", "1.2.0.192.in-addr.arpa"]),
-        |config| config.domains([""; 0]),
-    ];
     let mock = MockAcme::start().await;
-    for (case, configure) in cases.into_iter().enumerate() {
-        let config = || configure(mock_config(&mock));
-        // TestCache holds a certificate for any identifiers, like a cache of an earlier version.
-        let cold = config().state();
-        let warm = config()
-            .cache(TestCache::<Infallible, Infallible>::new())
-            .state();
-        for (start, mut state) in [("cold", cold), ("warm", warm)] {
-            let event = tokio::time::timeout(LIMIT, state.next()).await;
-            assert!(
-                matches!(
-                    event,
-                    Ok(Some(Err(EventError::Order(OrderError::InvalidIdentifier(
-                        _
-                    )))))
-                ),
-                "case {case}, {start} start: {event:?}"
-            );
-        }
+    // Both identifiers would need the same challenge SNI.
+    let config = || mock_config(&mock).domains(["192.0.2.1", "1.2.0.192.in-addr.arpa"]);
+    // TestCache holds a certificate for any identifiers, like a cache of an earlier version.
+    let cold = config().state();
+    let warm = config()
+        .cache(TestCache::<Infallible, Infallible>::new())
+        .state();
+    for (start, mut state) in [("cold", cold), ("warm", warm)] {
+        let event = tokio::time::timeout(LIMIT, state.next()).await;
+        let invalid = matches!(
+            event,
+            Ok(Some(Err(EventError::Order(OrderError::InvalidIdentifier(
+                _
+            )))))
+        );
+        assert!(invalid, "{start} start: {event:?}");
     }
     assert_eq!(
         mock.state().hits("GET /dir"),
@@ -315,25 +304,20 @@ async fn invalid_identifiers_fail_before_the_cache_and_the_ca() {
     );
 }
 
-/// Loads and stores the certificate under the identifiers as given, from either builder.
+/// Loads and stores the certificate under the identifiers as given, see `config` for the keys.
 #[tokio::test]
-async fn cache_keys_follow_the_builder() {
+async fn cache_keys_are_the_identifiers_as_given() {
     let key = "Invariants.Example.COM.";
-    let cases: [Configure; 2] = [
-        |config| config.domains(["Invariants.Example.COM."]),
-        |config| config.identifiers([Identifier::Dns("Invariants.Example.COM.".into())]),
-    ];
-    for configure in cases {
-        let mock = MockAcme::start().await;
-        let cache = KeyRecorder::default();
-        let keys = cache.keys.clone();
-        let state = configure(mock_config(&mock))
-            .cache_compose(cache, NoCache::<Infallible>::new())
-            .state();
-        deploy(state).await.expect("order failed");
-        let expected = [format!("load {key}"), format!("store {key}")];
-        assert_eq!(*keys.lock().expect("poisoned"), expected);
-    }
+    let mock = MockAcme::start().await;
+    let cache = KeyRecorder::default();
+    let keys = cache.keys.clone();
+    let state = mock_config(&mock)
+        .domains([key])
+        .cache_compose(cache, NoCache::<Infallible>::new())
+        .state();
+    deploy(state).await.expect("order failed");
+    let expected = [format!("load {key}"), format!("store {key}")];
+    assert_eq!(*keys.lock().expect("poisoned"), expected);
 }
 
 /// Deploys only a certificate whose profile the CA confirms, if one is configured.

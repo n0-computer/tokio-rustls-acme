@@ -9,7 +9,6 @@
 mod server;
 
 use std::{
-    collections::BTreeSet,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
@@ -407,56 +406,34 @@ async fn test_multi_domain_san() {
     site.deploy().await.expect("order failed");
 
     for domain in domains {
-        let peer_certs = fetch_chain_for(&pebble, domain).await;
-
-        let (_, leaf) = x509_parser::parse_x509_certificate(peer_certs[0].as_ref())
-            .expect("failed to parse leaf certificate");
-        let sans: Vec<String> = leaf
-            .subject_alternative_name()
-            .expect("SAN extension missing")
-            .expect("SAN extension empty")
-            .value
-            .general_names
-            .iter()
-            .filter_map(|name| match name {
-                x509_parser::extensions::GeneralName::DNSName(dns) => Some(dns.to_string()),
-                _ => None,
-            })
-            .collect();
-
-        for name in domains {
-            assert!(
-                sans.contains(&name.to_string()),
-                "SAN should contain {}, got: {:?}",
-                name,
-                sans
-            );
-        }
-        eprintln!("multi-domain SANs served for {domain}: {sans:?}");
+        let chain = fetch_chain_for(&pebble, domain).await;
+        assert_eq!(sans(&chain[0]), domains, "served for {domain}");
     }
 }
 
-/// Collects the IP address SANs of a DER certificate, sorted.
-fn ip_sans(cert: &CertificateDer<'_>) -> Vec<IpAddr> {
-    let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
+/// Returns the DNS and IP address SANs of the DER certificate `cert`, sorted.
+fn sans(cert: &CertificateDer<'_>) -> Vec<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).expect("valid certificate");
     let san = cert
         .subject_alternative_name()
         .expect("SAN extension malformed")
         .expect("SAN extension missing");
-    san.value
+    let mut sans: Vec<String> = san
+        .value
         .general_names
         .iter()
-        .filter_map(|name| match name {
-            GeneralName::IPAddress(bytes) => match bytes.len() {
-                4 => Some(IpAddr::from(<[u8; 4]>::try_from(*bytes).unwrap())),
-                16 => Some(IpAddr::from(<[u8; 16]>::try_from(*bytes).unwrap())),
-                n => panic!("IP SAN with {n} bytes"),
-            },
+        .filter_map(|name| match *name {
+            GeneralName::DNSName(name) => Some(name.to_string()),
+            GeneralName::IPAddress(&[a, b, c, d]) => Some(IpAddr::from([a, b, c, d]).to_string()),
+            GeneralName::IPAddress(octets) => {
+                let octets = <[u8; 16]>::try_from(octets).expect("an IPv4 or IPv6 address");
+                Some(IpAddr::from(octets).to_string())
+            }
             _ => None,
         })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+        .collect();
+    sans.sort();
+    sans
 }
 
 /// Orders a certificate for the IP addresses `ips`, with `profile` if set.
@@ -494,34 +471,10 @@ async fn acquire_ip_cert(
     result.map(|()| chains.swap_remove(0))
 }
 
-/// Issues a certificate for an IPv4 address through real tls-alpn-01 validation.
+/// Issues one certificate for an IPv4 and an IPv6 address through real tls-alpn-01 validation.
 ///
-/// The CA sends the reverse-DNS name `1.0.0.127.in-addr.arpa` as SNI (RFC 8738 section 6), so
-/// this fails unless the resolver serves the challenge certificate under that name.
-#[tokio::test]
-#[ignore]
-async fn test_validated_ipv4_certificate() {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    let chain = acquire_ip_cert(&[ip], None).await.expect("order failed");
-    assert_eq!(ip_sans(&chain[0]), [ip]);
-}
-
-/// Issues a certificate for an IPv6 address through real tls-alpn-01 validation.
-///
-/// The CA sends the nibble-format reverse name under `ip6.arpa` as SNI.
-#[tokio::test]
-#[ignore]
-async fn test_validated_ipv6_certificate() {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
-    let chain = acquire_ip_cert(&[ip], None).await.expect("order failed");
-    assert_eq!(ip_sans(&chain[0]), [ip]);
-}
-
-/// Issues one certificate for both an IPv4 and an IPv6 address.
+/// The CA sends the reverse-DNS names, like `1.0.0.127.in-addr.arpa`, as SNI (RFC 8738 section
+/// 6), so this fails unless the resolver serves the challenge certificates under them.
 #[tokio::test]
 #[ignore]
 async fn test_validated_dual_stack_certificate() {
@@ -532,7 +485,7 @@ async fn test_validated_dual_stack_certificate() {
         IpAddr::V6(Ipv6Addr::LOCALHOST),
     ];
     let chain = acquire_ip_cert(&ips, None).await.expect("order failed");
-    assert_eq!(ip_sans(&chain[0]), ips);
+    assert_eq!(sans(&chain[0]), ["127.0.0.1", "::1"]);
 }
 
 /// Issues one certificate for an IP address and a domain.
@@ -555,17 +508,7 @@ async fn test_validated_mixed_ip_and_domain_certificate() {
     fetch_chain_for(&pebble, domain).await;
     site.close().await;
 
-    assert_eq!(ip_sans(&chain[0]), [ip]);
-    let (_, leaf) = x509_parser::parse_x509_certificate(chain[0].as_ref()).unwrap();
-    let has_dns = leaf
-        .subject_alternative_name()
-        .expect("SAN extension malformed")
-        .expect("SAN extension missing")
-        .value
-        .general_names
-        .iter()
-        .any(|name| matches!(name, GeneralName::DNSName(d) if *d == domain));
-    assert!(has_dns, "certificate should contain a DNS SAN for {domain}");
+    assert_eq!(sans(&chain[0]), [ip_identifier.as_str(), domain]);
 }
 
 /// Returns the lifetime of a DER certificate (`notAfter - notBefore`) in seconds.
