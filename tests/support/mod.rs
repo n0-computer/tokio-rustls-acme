@@ -403,6 +403,8 @@ pub(crate) struct MockAcmeState {
     pub issue_validity: Validity,
     /// Token of the tls-alpn-01 challenge.
     pub token: String,
+    /// `profile` of the `newOrder` response, left out if `None`.
+    pub profile: Option<Value>,
     /// Domain of the most recent order.
     pub domain: String,
     /// JWK of the most recent `newAccount` request.
@@ -411,6 +413,8 @@ pub(crate) struct MockAcmeState {
     pub deactivated_key: Option<[u8; 65]>,
     /// Answers the next finalization with `unauthorized`, then resets.
     pub reject_finalize: bool,
+    /// Value of the authorization's identifier, if not the ordered one.
+    pub authz_value: Option<String>,
     /// Number of requests per `"METHOD /path"`.
     pub hits: HashMap<String, usize>,
     /// Arrival times of the requests per `"METHOD /path"`, on the real clock.
@@ -463,10 +467,12 @@ impl MockAcme {
             order_script: OrderScript::Normal,
             issue_validity: Validity::Fresh,
             token: "bW9jay1hY21lLXRva2Vu".to_string(),
+            profile: None,
             domain: String::new(),
             account_jwk: None,
             deactivated_key: None,
             reject_finalize: false,
+            authz_value: None,
             hits: HashMap::new(),
             arrivals: HashMap::new(),
             jws_violations: Vec::new(),
@@ -577,15 +583,21 @@ fn handle_acme(
                 .unwrap_or_default()
                 .to_string();
             state.issued = None;
-            Response::json(201, &order_json(base, &state))
-                .header("location", format!("{base}/order/1"))
+            let mut created = order_json(base, &state);
+            if let Some(profile) = &state.profile {
+                created["profile"] = profile.clone();
+            }
+            Response::json(201, &created).header("location", format!("{base}/order/1"))
         }
         "POST /order/1" => Response::json(200, &order_json(base, &state)),
         "POST /authz/1" => Response::json(
             200,
             &json!({
                 "status": state.authz_status,
-                "identifier": {"type": "dns", "value": state.domain},
+                "identifier": {
+                    "type": "dns",
+                    "value": state.authz_value.as_ref().unwrap_or(&state.domain),
+                },
                 "challenges": [{
                     "type": "tls-alpn-01",
                     "url": format!("{base}/chall/1"),

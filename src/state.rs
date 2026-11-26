@@ -13,7 +13,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer as RustlsCertificate, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Sleep;
 use tracing::{error, info, warn};
@@ -21,7 +21,8 @@ use x509_parser::parse_x509_certificate;
 
 use crate::acceptor::AcmeAcceptor;
 use crate::acme::{
-    Account, AcmeError, Auth, AuthStatus, Directory, Identifier, Order, OrderStatus,
+    Account, AcmeError, Auth, AuthStatus, CreatedOrder, Directory, Identifier, InvalidIdentifier,
+    Order, OrderStatus,
 };
 use crate::{AcmeConfig, Incoming, ResolvesServerCertAcme};
 
@@ -33,6 +34,21 @@ const MAX_RENEWAL_SLEEP: Duration = Duration::from_secs(60 * 60);
 
 /// Number of order rounds that can fail to advance the order status before the order fails.
 const MAX_STALLED_ROUNDS: u32 = 10;
+
+/// Lifetime under which certificates renew at half their lifetime instead of two thirds.
+const SHORT_LIFETIME: TimeDuration = TimeDuration::days(10);
+
+/// Largest exponent of the backoff between failed orders, which doubles [`BACKOFF_BASE_DELAY`].
+const MAX_BACKOFF_EXPONENT: u32 = 16;
+
+/// Longest delay between failed orders, which the backoff reaches at [`MAX_BACKOFF_EXPONENT`].
+const MAX_RETRY_DELAY: Duration = BACKOFF_BASE_DELAY.saturating_mul(1 << MAX_BACKOFF_EXPONENT);
+
+/// Lower bound of the remaining-validity cap on the delay between failed orders.
+const MIN_RETRY_DELAY_CAP: Duration = Duration::from_secs(10 * 60);
+
+/// Part of the remaining validity that caps the delay between failed orders.
+const RETRY_DELAY_VALIDITY_DIVISOR: u32 = 10;
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -49,6 +65,50 @@ fn time_until(deadline: OffsetDateTime, now: OffsetDateTime) -> Option<Duration>
 /// Returns how long to sleep before the next renewal check, or `None` once renewal is due.
 fn renewal_sleep(renew_at: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
     time_until(renew_at, now).map(|left| left.min(MAX_RENEWAL_SLEEP))
+}
+
+/// Returns when to renew a certificate valid from `not_before` to `not_after`.
+///
+/// At two thirds of the lifetime, or at half for lifetimes under [`SHORT_LIFETIME`], like certbot.
+fn renewal_time(not_before: OffsetDateTime, not_after: OffsetDateTime) -> OffsetDateTime {
+    let lifetime = not_after - not_before;
+    if lifetime < SHORT_LIFETIME {
+        not_before + lifetime / 2
+    } else {
+        not_before + lifetime * 2 / 3
+    }
+}
+
+/// Returns the longest delay between failed orders for a certificate that expires at `expiry`.
+///
+/// A tenth of the remaining validity, within [`MIN_RETRY_DELAY_CAP`] and [`MAX_RETRY_DELAY`], and
+/// at most half of it, so a retry comes before the expiry.
+fn max_retry_delay(expiry: Option<OffsetDateTime>, now: OffsetDateTime) -> Duration {
+    let Some(expiry) = expiry else {
+        return MAX_RETRY_DELAY;
+    };
+    let Some(left) = time_until(expiry, now) else {
+        return MIN_RETRY_DELAY_CAP;
+    };
+    (left / RETRY_DELAY_VALIDITY_DIVISOR)
+        .clamp(MIN_RETRY_DELAY_CAP, MAX_RETRY_DELAY)
+        .min((left / 2).max(BACKOFF_BASE_DELAY))
+}
+
+/// Returns the first of `identifiers` that the leaf of `cert` doesn't certify in its SANs.
+fn uncertified_identifier<'a>(
+    cert: &CertifiedKey,
+    identifiers: &'a [Identifier],
+) -> Option<&'a Identifier> {
+    let leaf = cert.end_entity_cert().ok();
+    let leaf = leaf.and_then(|leaf| parse_x509_certificate(leaf).ok());
+    let san = leaf
+        .as_ref()
+        .and_then(|(_, leaf)| leaf.subject_alternative_name().ok().flatten());
+    let names = san.map_or(&[][..], |san| &san.value.general_names[..]);
+    identifiers
+        .iter()
+        .find(|identifier| !names.iter().any(|name| identifier.is_certified_by(name)))
 }
 
 /// Returns the delay after stalled order round `round`, or `None` once the order should fail.
@@ -73,6 +133,8 @@ struct OrderFailure {
 )]
 pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
+    /// The identifiers of the config, validated once, since the config doesn't change.
+    identifiers: Result<Arc<[Identifier]>, InvalidIdentifier>,
     resolver: Arc<ResolvesServerCertAcme>,
     account_key: Option<Vec<u8>>,
 
@@ -80,9 +142,11 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     load_cert: Option<BoxFuture<Result<Option<Vec<u8>>, EC>>>,
     load_account: Option<BoxFuture<Result<Option<Vec<u8>>, EA>>>,
     order: Option<BoxFuture<Result<Vec<u8>, OrderFailure>>>,
-    backoff_cnt: usize,
+    backoff_cnt: u32,
     wait: Option<Pin<Box<Sleep>>>,
     renew_at: Option<OffsetDateTime>,
+    /// Expiry of the deployed certificate.
+    cert_expiry: Option<OffsetDateTime>,
 }
 
 /// Item of the [`AcmeState`] stream, reporting the outcome of one step.
@@ -131,7 +195,7 @@ pub enum EventError<EC: Debug, EA: Debug> {
     /// If the CA rejects the account, later orders use a new account key kept in memory only.
     #[error("order: {0}")]
     Order(OrderError),
-    /// The newly issued certificate could not be parsed.
+    /// The newly issued certificate is unusable, so the deployed one stays.
     #[error("new cert parse: {0}")]
     NewCertParse(CertParseError),
 }
@@ -157,12 +221,23 @@ pub enum OrderError {
     /// The authorization for the given domain was still pending after the last check.
     #[error("authorization for {0} failed too many times")]
     TooManyAttemptsAuth(String),
+    /// The configured identifiers can't be ordered, or an authorization names an invalid one.
+    #[error("invalid identifier: {0}")]
+    InvalidIdentifier(#[from] InvalidIdentifier),
+    /// The CA didn't confirm the profile of [`AcmeConfig::profile`] in the order it created.
+    #[error("the CA selected profile {selected:?} instead of {requested:?}")]
+    ProfileMismatch {
+        /// The configured profile.
+        requested: String,
+        /// The profile the CA named in the order, if any.
+        selected: Option<String>,
+    },
     /// The order stayed `processing` or stopped advancing for too long.
     #[error("order did not reach a final status in time, last status {:?}", .0.status)]
     ProcessingTimeout(Order),
 }
 
-/// An error from parsing a PEM bundle of private key and certificate chain.
+/// Why a PEM bundle of private key and certificate chain can't be served.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum CertParseError {
@@ -185,6 +260,9 @@ pub enum CertParseError {
     /// The newly issued certificate has already expired.
     #[error("certificate has already expired")]
     Expired,
+    /// The newly issued certificate doesn't certify an ordered identifier in its SANs.
+    #[error("certificate does not certify {0}")]
+    MissingIdentifier(Identifier),
 }
 
 fn rcgen_err(err: rcgen::Error) -> OrderError {
@@ -267,20 +345,24 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
     /// [`AcmeConfig::state`].
     pub fn new(config: AcmeConfig<EC, EA>) -> Self {
         let config = Arc::new(config);
+        let identifiers = config.validated_identifiers().map(Arc::from);
+        // A config that can't order serves no cached certificate either.
+        let load_cert = identifiers.is_ok().then(|| {
+            let config = config.clone();
+            Box::pin(async move {
+                config
+                    .cache
+                    .load_cert(&config.cache_key(), &config.directory_url)
+                    .await
+            }) as BoxFuture<_>
+        });
         Self {
             config: config.clone(),
+            identifiers,
             resolver: ResolvesServerCertAcme::new(),
             account_key: None,
             early_action: None,
-            load_cert: Some(Box::pin({
-                let config = config.clone();
-                async move {
-                    config
-                        .cache
-                        .load_cert(&config.domains, &config.directory_url)
-                        .await
-                }
-            })),
+            load_cert,
             load_account: Some(Box::pin({
                 let config = config;
                 async move {
@@ -294,6 +376,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             backoff_cnt: 0,
             wait: None,
             renew_at: None,
+            cert_expiry: None,
         }
     }
     fn parse_cert(
@@ -344,8 +427,26 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             warn!(%not_after, "the CA issued an expired certificate, keeping the deployed one");
             return Err(EventError::NewCertParse(CertParseError::Expired));
         }
+        // Without one, clients that connect by it would fail after a successful deployment.
+        let missing = (self.identifiers.as_ref().ok())
+            .and_then(|identifiers| uncertified_identifier(&cert, identifiers))
+            .cloned();
+        let renew_at = match missing {
+            None => renewal_time(not_before, not_after),
+            Some(missing) if !cached => {
+                warn!(%missing, "the CA left an ordered identifier out, keeping the deployed one");
+                return Err(EventError::NewCertParse(CertParseError::MissingIdentifier(
+                    missing,
+                )));
+            }
+            Some(missing) => {
+                warn!(%missing, "the cached certificate lacks an identifier, renewing it now");
+                OffsetDateTime::now_utc()
+            }
+        };
         self.resolver.set_cert(Arc::new(cert));
-        self.renew_at = Some(not_after - (not_after - not_before) / 3_i32);
+        self.renew_at = Some(renew_at);
+        self.cert_expiry = Some(not_after);
         if cached {
             return Ok(EventOk::DeployedCachedCert);
         }
@@ -353,7 +454,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         self.early_action = Some(Box::pin(async move {
             match config
                 .cache
-                .store_cert(&config.domains, &config.directory_url, &pem)
+                .store_cert(&config.cache_key(), &config.directory_url, &pem)
                 .await
             {
                 Ok(()) => Ok(EventOk::CertCacheStore),
@@ -371,6 +472,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         config: Arc<AcmeConfig<EC, EA>>,
         resolver: Arc<ResolvesServerCertAcme>,
         key_pair: Vec<u8>,
+        identifiers: Arc<[Identifier]>,
     ) -> Result<Vec<u8>, OrderFailure> {
         let account = async {
             let directory =
@@ -390,7 +492,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             error: err.into(),
         })?;
         // CAs also use `unauthorized` for order problems, so only account errors count.
-        Self::order_with_account(&config, &resolver, &account)
+        Self::order_with_account(&config, &resolver, &account, &identifiers)
             .await
             .map_err(|error| OrderFailure {
                 error,
@@ -401,14 +503,41 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         config: &AcmeConfig<EC, EA>,
         resolver: &ResolvesServerCertAcme,
         account: &Account,
+        identifiers: &[Identifier],
     ) -> Result<Vec<u8>, OrderError> {
-        let mut params = CertificateParams::new(config.domains.clone()).map_err(rcgen_err)?;
+        let has_ip = identifiers.iter().any(|id| matches!(id, Identifier::Ip(_)));
+        if has_ip && config.profile.is_none() && config.is_lets_encrypt() {
+            warn!("Let's Encrypt issues IP certificates only under the `shortlived` profile");
+        }
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = identifiers
+            .iter()
+            .map(Identifier::subject_alt_name)
+            .collect::<Result<_, _>>()
+            .map_err(rcgen_err)?;
         params.distinguished_name = DistinguishedName::new();
         let key_pair = rcgen::KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(rcgen_err)?;
 
-        let (order_url, mut order) = account
-            .new_order(&config.client_config, config.domains.clone())
+        let CreatedOrder {
+            url: order_url,
+            mut order,
+            profile,
+        } = account
+            .new_order(
+                &config.client_config,
+                identifiers,
+                config.profile.as_deref(),
+            )
             .await?;
+        if let Some(requested) = &config.profile
+            && profile.as_ref() != Some(requested)
+        {
+            return Err(OrderError::ProfileMismatch {
+                requested: requested.clone(),
+                selected: profile,
+            });
+        }
+        info!(?profile, "created order");
         let mut stalled_rounds = 0;
         loop {
             let previous_progress = order.status.progress();
@@ -474,20 +603,18 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         url: &String,
     ) -> Result<(), OrderError> {
         let auth = account.auth(&config.client_config, url).await?;
-        let (domain, challenge_url) = match auth.status {
+        let (identifier, challenge_url) = match auth.status {
             AuthStatus::Pending => {
-                let Identifier::Dns(domain) = auth.identifier;
-                info!(%domain, "trigger challenge");
-                let (challenge, auth_key) = account.tls_alpn_01(
-                    config.crypto_provider(),
-                    &auth.challenges,
-                    domain.clone(),
-                )?;
-                resolver.set_auth_key(domain.clone(), Arc::new(auth_key));
+                // A CA may spell it otherwise, like `Example.COM.`, which would miss the SNI.
+                let identifier = auth.identifier.validated()?;
+                info!(%identifier, "trigger challenge");
+                let (challenge, auth_key) =
+                    account.tls_alpn_01(config.crypto_provider(), &auth.challenges, &identifier)?;
+                resolver.set_auth_key(&identifier, Arc::new(auth_key));
                 account
                     .challenge(&config.client_config, &challenge.url)
                     .await?;
-                (domain, challenge.url.clone())
+                (identifier, challenge.url.clone())
             }
             AuthStatus::Valid => return Ok(()),
             _ => return Err(OrderError::BadAuth(auth)),
@@ -497,7 +624,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             let auth = account.auth(&config.client_config, url).await?;
             match auth.status {
                 AuthStatus::Pending => {
-                    info!(%domain, "authorization still pending");
+                    info!(%identifier, "authorization still pending");
                     account
                         .challenge(&config.client_config, &challenge_url)
                         .await?
@@ -506,12 +633,15 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 _ => return Err(OrderError::BadAuth(auth)),
             }
         }
-        Err(OrderError::TooManyAttemptsAuth(domain))
+        Err(OrderError::TooManyAttemptsAuth(identifier.to_string()))
     }
-    /// Delays the next order with an exponential backoff.
+    /// Delays the next order with an exponential backoff, capped by [`max_retry_delay`].
     fn back_off(&mut self) {
-        self.wait = Some(after(BACKOFF_BASE_DELAY * (1 << self.backoff_cnt)));
-        self.backoff_cnt = (self.backoff_cnt + 1).min(16);
+        let cap = max_retry_delay(self.cert_expiry, OffsetDateTime::now_utc());
+        self.wait = Some(after(
+            (BACKOFF_BASE_DELAY * (1 << self.backoff_cnt)).min(cap),
+        ));
+        self.backoff_cnt = (self.backoff_cnt + 1).min(MAX_BACKOFF_EXPONENT);
     }
     fn poll_next_infinite(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Event<EC, EA>> {
         loop {
@@ -545,7 +675,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 self.load_cert.take();
                 match result {
                     Ok(Some(pem)) => {
-                        return Poll::Ready(Self::process_cert(self.get_mut(), pem, true));
+                        return Poll::Ready(self.process_cert(pem, true));
                     }
                     Ok(None) => {}
                     Err(err) => return Poll::Ready(Err(EventError::CertCacheLoad(err))),
@@ -611,6 +741,15 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             }
 
             // schedule order
+            let identifiers = match &self.identifiers {
+                Ok(identifiers) => identifiers.clone(),
+                // Fails before any request, so a typo doesn't reach the CA.
+                Err(err) => {
+                    let event = Err(EventError::Order(err.clone().into()));
+                    self.back_off();
+                    return Poll::Ready(event);
+                }
+            };
             let account_key = match &self.account_key {
                 None => {
                     let account_key = Account::generate_key_pair();
@@ -637,7 +776,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             };
             let config = self.config.clone();
             let resolver = self.resolver.clone();
-            self.order = Some(Box::pin(Self::order(config, resolver, account_key)));
+            self.order = Some(Box::pin(Self::order(
+                config,
+                resolver,
+                account_key,
+                identifiers,
+            )));
         }
     }
 }
@@ -653,7 +797,10 @@ impl<EC: 'static + Debug, EA: 'static + Debug> Stream for AcmeState<EC, EA> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_config;
+    use tokio::time::Instant;
 
+    const SECOND: Duration = Duration::from_secs(1);
     const MIN: Duration = Duration::from_secs(60);
     const HOUR: Duration = Duration::from_secs(60 * 60);
 
@@ -684,5 +831,58 @@ mod tests {
             .chain([None])
             .collect();
         assert_eq!(delays, expected);
+    }
+
+    #[test]
+    fn renewal_time_is_half_the_lifetime_for_short_certificates() {
+        let not_before = OffsetDateTime::UNIX_EPOCH;
+        let cases = [
+            // Let's Encrypt's `shortlived` profile, 160 hours.
+            (TimeDuration::hours(160), TimeDuration::hours(80)),
+            (TimeDuration::days(90), TimeDuration::days(60)),
+            (SHORT_LIFETIME, SHORT_LIFETIME * 2 / 3),
+        ];
+        for (lifetime, renew_after) in cases {
+            assert_eq!(
+                renewal_time(not_before, not_before + lifetime),
+                not_before + renew_after,
+                "lifetime {lifetime}"
+            );
+        }
+    }
+
+    /// The state backs off from its certificate's expiry, see [`max_retry_delay`].
+    #[tokio::test(start_paused = true)]
+    async fn back_off_caps_the_delay_by_the_remaining_validity() {
+        let mut state = test_config(&["example.com"]).state();
+        state.cert_expiry = Some(OffsetDateTime::now_utc() + 4 * MIN);
+        state.backoff_cnt = MAX_BACKOFF_EXPONENT;
+        state.back_off();
+        let delay = state.wait.as_ref().expect("a backoff").deadline() - Instant::now();
+        // The expiry nears while the test runs.
+        assert!(delay <= 2 * MIN && 2 * MIN - delay < SECOND, "{delay:?}");
+    }
+
+    #[test]
+    fn max_retry_delay_follows_the_remaining_validity() {
+        const MINUTE: TimeDuration = TimeDuration::minutes(1);
+        const HOUR: TimeDuration = TimeDuration::hours(1);
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let cases = [
+            (None, MAX_RETRY_DELAY),
+            (Some(now + 80 * HOUR), Duration::from_secs(8 * 60 * 60)),
+            (Some(now + 30 * 24 * HOUR), MAX_RETRY_DELAY),
+            (Some(now + HOUR), MIN_RETRY_DELAY_CAP),
+            // Half the remaining validity, so a retry happens before expiry.
+            (Some(now + 4 * MINUTE), Duration::from_secs(2 * 60)),
+            (
+                Some(now + TimeDuration::milliseconds(100)),
+                BACKOFF_BASE_DELAY,
+            ),
+            (Some(now - HOUR), MIN_RETRY_DELAY_CAP),
+        ];
+        for (expiry, expected) in cases {
+            assert_eq!(max_retry_delay(expiry, now), expected, "expiry {expiry:?}");
+        }
     }
 }

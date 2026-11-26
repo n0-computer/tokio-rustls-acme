@@ -9,7 +9,7 @@ use std::{
     env,
     fs::{self, File},
     io,
-    net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -31,6 +31,8 @@ const INSTALL_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/pebble");
 const LOCALHOST: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// How often to start Pebble on fresh ports when another process took one of them first.
 const START_ATTEMPTS: usize = 3;
+/// Attempts to find a tls-alpn-01 port that is free on both `127.0.0.1` and `::1`.
+const BIND_ATTEMPTS: usize = 10;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Validity of certificates from the default profile, short enough to renew within a test.
@@ -42,12 +44,17 @@ const RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// A running Pebble whose validation authority resolves every name to `127.0.0.1`.
 ///
+/// Pebble validates an IP identifier on its address, so the tls-alpn-01 port is also served on
+/// `::1` if the host has IPv6.
+///
 /// Stops both processes when dropped, and prints their logs if the test panicked.
 pub(crate) struct Pebble {
     ports: Ports,
     /// The tls-alpn-01 listener, open for Pebble's lifetime so that no other process can take
     /// its port. Each [`Site`](crate::Site) serves on a clone of it.
     tls_alpn_listener: TcpListener,
+    /// The tls-alpn-01 listener on `::1`, if the host has IPv6.
+    tls_alpn_listener_v6: Option<TcpListener>,
     client_config: Arc<ClientConfig>,
     processes: Vec<Process>,
     _dir: TempDir,
@@ -58,8 +65,8 @@ impl Pebble {
     pub(crate) async fn start() -> Self {
         let dir = tempfile::tempdir().expect("failed to create Pebble dir");
         let tls = WfeTls::generate(dir.path());
-        let tls_alpn_listener =
-            TcpListener::bind((LOCALHOST, 0)).expect("failed to bind the tls-alpn-01 listener");
+        let (tls_alpn_listener, tls_alpn_listener_v6) =
+            bind_tls_alpn().expect("failed to bind the tls-alpn-01 listener");
         let tls_alpn_port = tls_alpn_listener
             .local_addr()
             .expect("failed to read the tls-alpn-01 port")
@@ -75,6 +82,7 @@ impl Pebble {
                     return Self {
                         ports,
                         tls_alpn_listener,
+                        tls_alpn_listener_v6,
                         client_config: tls.client_config,
                         processes,
                         _dir: dir,
@@ -97,19 +105,34 @@ impl Pebble {
         self.ports.tls_alpn
     }
 
-    /// Returns a clone of the tls-alpn-01 listener for tokio.
+    /// Returns whether the tls-alpn-01 port is also served on `::1`.
+    pub(crate) fn serves_ipv6(&self) -> bool {
+        self.tls_alpn_listener_v6.is_some()
+    }
+
+    /// Returns clones of the tls-alpn-01 listeners for tokio.
     ///
-    /// The listener stays open in [`Pebble`], so the port is never free for another process,
+    /// The listeners stay open in [`Pebble`], so the port is never free for another process,
     /// also not between two sites that serve it in turn.
-    pub(crate) fn tls_alpn_listener(&self) -> tokio::net::TcpListener {
-        let listener = self
-            .tls_alpn_listener
-            .try_clone()
-            .expect("failed to clone the tls-alpn-01 listener");
-        listener
-            .set_nonblocking(true)
-            .expect("failed to make the tls-alpn-01 listener non-blocking");
-        tokio::net::TcpListener::from_std(listener).expect("failed to register the listener")
+    pub(crate) fn tls_alpn_listeners(&self) -> Vec<tokio::net::TcpListener> {
+        let listeners = [
+            Some(&self.tls_alpn_listener),
+            self.tls_alpn_listener_v6.as_ref(),
+        ];
+        listeners
+            .into_iter()
+            .flatten()
+            .map(|listener| {
+                let listener = listener
+                    .try_clone()
+                    .expect("failed to clone the tls-alpn-01 listener");
+                listener
+                    .set_nonblocking(true)
+                    .expect("failed to make the tls-alpn-01 listener non-blocking");
+                tokio::net::TcpListener::from_std(listener)
+                    .expect("failed to register the listener")
+            })
+            .collect()
     }
 
     /// Returns the URL of the ACME directory.
@@ -289,6 +312,24 @@ impl Ports {
         // that our processes did not exit because their bind failed.
         check_running(processes)
     }
+}
+
+/// Binds a free tls-alpn-01 port on `127.0.0.1`, and the same port on `::1` if the host has IPv6.
+fn bind_tls_alpn() -> io::Result<(TcpListener, Option<TcpListener>)> {
+    for _ in 0..BIND_ATTEMPTS {
+        let listener = TcpListener::bind((LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        match TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+            Ok(listener_v6) => return Ok((listener, Some(listener_v6))),
+            // Another process has the port on `::1`, so try another one.
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {}
+            Err(_) => return Ok((listener, None)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "no port is free on both 127.0.0.1 and ::1",
+    ))
 }
 
 /// Binds a free port on `127.0.0.1`, keeps the listener in `held` and returns the port.

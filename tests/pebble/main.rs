@@ -10,7 +10,7 @@ mod server;
 
 use std::{
     io,
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -32,6 +32,7 @@ use tokio_rustls_acme::{
     AccountCache, AcmeAcceptor, AcmeConfig, AcmeState, CertCache, EventError, EventOk, OrderError,
     caches::DirCache,
 };
+use x509_parser::extensions::GeneralName;
 
 use crate::server::Pebble;
 
@@ -65,7 +66,9 @@ impl Site {
                 .with_cert_resolver(state.resolver()),
         );
         let mut server = JoinSet::new();
-        server.spawn(serve(pebble.tls_alpn_listener(), acceptor, server_config));
+        for listener in pebble.tls_alpn_listeners() {
+            server.spawn(serve(listener, acceptor.clone(), server_config.clone()));
+        }
         Self { state, server }
     }
 
@@ -122,8 +125,12 @@ async fn serve(listener: TcpListener, acceptor: AcmeAcceptor, server_config: Arc
     }
 }
 
-/// Connects to the tls-alpn-01 port of `pebble` and returns the verified chain served for `name`.
-async fn fetch_chain(pebble: &Pebble, name: ServerName<'static>) -> Vec<CertificateDer<'static>> {
+/// Connects to the tls-alpn-01 port of `pebble` on `addr`, and returns the chain for `name`.
+async fn fetch_chain(
+    pebble: &Pebble,
+    addr: IpAddr,
+    name: ServerName<'static>,
+) -> Vec<CertificateDer<'static>> {
     let connector = TlsConnector::from(Arc::new(
         ClientConfig::builder_with_provider(test_crypto_provider())
             .with_protocol_versions(DEFAULT_VERSIONS)
@@ -132,9 +139,9 @@ async fn fetch_chain(pebble: &Pebble, name: ServerName<'static>) -> Vec<Certific
             .with_no_client_auth(),
     ));
     let port = pebble.tls_alpn_port();
-    let tcp = TcpStream::connect((LOCALHOST, port))
+    let tcp = TcpStream::connect((addr, port))
         .await
-        .unwrap_or_else(|e| panic!("failed to connect to {LOCALHOST}:{port}: {e}"));
+        .unwrap_or_else(|e| panic!("failed to connect to {addr} on port {port}: {e}"));
     let tls = connector
         .connect(name.clone(), tcp)
         .await
@@ -148,10 +155,10 @@ async fn fetch_chain(pebble: &Pebble, name: ServerName<'static>) -> Vec<Certific
     chain.to_vec()
 }
 
-/// Like [`fetch_chain`], with `domain` as server name.
+/// Like [`fetch_chain`], with `domain` as server name on the address it resolves to.
 async fn fetch_chain_for(pebble: &Pebble, domain: &str) -> Vec<CertificateDer<'static>> {
     let name = ServerName::try_from(domain.to_owned()).expect("invalid domain");
-    fetch_chain(pebble, name).await
+    fetch_chain(pebble, LOCALHOST.into(), name).await
 }
 
 /// Asserts that `chain` verifies for `domain` against Pebble's roots only with its intermediates.
@@ -399,31 +406,158 @@ async fn test_multi_domain_san() {
     site.deploy().await.expect("order failed");
 
     for domain in domains {
-        let peer_certs = fetch_chain_for(&pebble, domain).await;
-
-        let (_, leaf) = x509_parser::parse_x509_certificate(peer_certs[0].as_ref())
-            .expect("failed to parse leaf certificate");
-        let sans: Vec<String> = leaf
-            .subject_alternative_name()
-            .expect("SAN extension missing")
-            .expect("SAN extension empty")
-            .value
-            .general_names
-            .iter()
-            .filter_map(|name| match name {
-                x509_parser::extensions::GeneralName::DNSName(dns) => Some(dns.to_string()),
-                _ => None,
-            })
-            .collect();
-
-        for name in domains {
-            assert!(
-                sans.contains(&name.to_string()),
-                "SAN should contain {}, got: {:?}",
-                name,
-                sans
-            );
-        }
-        eprintln!("multi-domain SANs served for {domain}: {sans:?}");
+        let chain = fetch_chain_for(&pebble, domain).await;
+        assert_eq!(sans(&chain[0]), domains, "served for {domain}");
     }
+}
+
+/// Returns the DNS and IP address SANs of the DER certificate `cert`, sorted.
+fn sans(cert: &CertificateDer<'_>) -> Vec<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).expect("valid certificate");
+    let san = cert
+        .subject_alternative_name()
+        .expect("SAN extension malformed")
+        .expect("SAN extension missing");
+    let mut sans: Vec<String> = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match *name {
+            GeneralName::DNSName(name) => Some(name.to_string()),
+            GeneralName::IPAddress(&[a, b, c, d]) => Some(IpAddr::from([a, b, c, d]).to_string()),
+            GeneralName::IPAddress(octets) => {
+                let octets = <[u8; 16]>::try_from(octets).expect("an IPv4 or IPv6 address");
+                Some(IpAddr::from(octets).to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    sans.sort();
+    sans
+}
+
+/// Orders a certificate for the IP addresses `ips`, with `profile` if set.
+///
+/// Starts its own Pebble, and after deployment connects to each address of `ips` with the address
+/// as server name. Returns the chain served on the first address, or the error of the order.
+#[allow(
+    clippy::result_large_err,
+    reason = "the crate returns `OrderError` by value in its events too"
+)]
+async fn acquire_ip_cert(
+    ips: &[IpAddr],
+    profile: Option<&str>,
+) -> Result<Vec<CertificateDer<'static>>, OrderError> {
+    let pebble = Pebble::start().await;
+    assert!(
+        ips.iter().all(IpAddr::is_ipv4) || pebble.serves_ipv6(),
+        "the test needs IPv6 on ::1"
+    );
+    let identifiers: Vec<String> = ips.iter().map(IpAddr::to_string).collect();
+    let identifiers: Vec<&str> = identifiers.iter().map(String::as_str).collect();
+    let mut config = pebble.config(&identifiers);
+    if let Some(profile) = profile {
+        config = config.profile(profile);
+    }
+    let mut site = Site::start(config, &pebble);
+    let result = site.deploy().await;
+    let mut chains = Vec::new();
+    if result.is_ok() {
+        for &ip in ips {
+            chains.push(fetch_chain(&pebble, ip, ServerName::from(ip)).await);
+        }
+    }
+    site.close().await;
+    result.map(|()| chains.swap_remove(0))
+}
+
+/// Issues one certificate for an IPv4 and an IPv6 address through real tls-alpn-01 validation.
+///
+/// The CA sends the reverse-DNS names, like `1.0.0.127.in-addr.arpa`, as SNI (RFC 8738 section
+/// 6), so this fails unless the resolver serves the challenge certificates under them.
+#[tokio::test]
+#[ignore]
+async fn test_validated_dual_stack_certificate() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let ips = [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ];
+    let chain = acquire_ip_cert(&ips, None).await.expect("order failed");
+    assert_eq!(sans(&chain[0]), ["127.0.0.1", "::1"]);
+}
+
+/// Issues one certificate for an IP address and a domain.
+///
+/// Pebble validates both on `127.0.0.1`: the IP identifier with its reverse-DNS name as SNI, and
+/// the domain, which `challtestsrv` resolves there, with the domain as SNI.
+#[tokio::test]
+#[ignore]
+async fn test_validated_mixed_ip_and_domain_certificate() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let pebble = Pebble::start().await;
+    let ip = IpAddr::V4(LOCALHOST);
+    let domain = "mixed.example.com";
+    let ip_identifier = ip.to_string();
+    let mut site = Site::start(pebble.config(&[&ip_identifier, domain]), &pebble);
+    site.deploy().await.expect("order failed");
+
+    let chain = fetch_chain(&pebble, ip, ServerName::from(ip)).await;
+    fetch_chain_for(&pebble, domain).await;
+    site.close().await;
+
+    assert_eq!(sans(&chain[0]), [ip_identifier.as_str(), domain]);
+}
+
+/// Returns the lifetime of a DER certificate (`notAfter - notBefore`) in seconds.
+fn lifetime_secs(cert: &CertificateDer<'_>) -> i64 {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
+    let validity = cert.validity();
+    validity.not_after.timestamp() - validity.not_before.timestamp()
+}
+
+/// Requests certificates under specific ACME profiles and checks that the CA applied them.
+///
+/// The harness gives the profiles distinct validity periods, see [`server`]. Pebble issues
+/// certificates valid for `validityPeriod - 1` seconds.
+#[tokio::test]
+#[ignore]
+async fn test_profile_selects_lifetime() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    for (profile, validity_period) in [("shortlived", 10), ("default", 20)] {
+        let chain = acquire_ip_cert(&[ip], Some(profile))
+            .await
+            .unwrap_or_else(|e| panic!("order with profile {profile} failed: {e}"));
+        assert_eq!(
+            lifetime_secs(&chain[0]),
+            validity_period - 1,
+            "lifetime for profile {profile}"
+        );
+    }
+}
+
+/// Checks that the CA rejects an order for a profile it doesn't offer.
+///
+/// Pebble rejects the order before it validates anything. The identifier is a documentation
+/// address, so a regression that validates hits no listener.
+#[tokio::test]
+#[ignore]
+async fn test_unknown_profile_is_rejected() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let pebble = Pebble::start().await;
+    let config = pebble.config(&["192.0.2.1"]).profile("no-such-profile");
+    let mut site = Site::start(config, &pebble);
+    let err = site
+        .deploy()
+        .await
+        .expect_err("order with an unknown profile should fail");
+    assert!(
+        matches!(err, OrderError::Acme(_)) && err.to_string().contains("invalidProfile"),
+        "expected Pebble's invalidProfile error, got {err:?}"
+    );
 }

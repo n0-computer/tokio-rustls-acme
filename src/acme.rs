@@ -1,3 +1,6 @@
+use std::fmt;
+use std::net::{IpAddr, Ipv6Addr};
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub use crate::crypto::CryptoError;
@@ -12,17 +15,18 @@ pub use crate::jose::JoseError;
 use crate::jose::{key_authorization_sha256, sign, sign_eab};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rcgen::{CustomExtension, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, CustomExtension, PKCS_ECDSA_P256_SHA256, SanType};
 use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig,
     crypto::CryptoProvider,
-    pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+    pki_types::{DnsName, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tracing::debug;
+use x509_parser::extensions::GeneralName;
 
 /// Directory URL of the Let's Encrypt staging environment.
 pub const LETS_ENCRYPT_STAGING_DIRECTORY: &str =
@@ -38,9 +42,9 @@ pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 pub(crate) struct Account {
     pub(crate) key_pair: EcdsaKeyPair,
     /// Directory of the ACME server that holds this account.
-    pub directory: Directory,
+    pub(crate) directory: Directory,
     /// Account URL from the server, sent as `kid` in signed requests.
-    pub kid: String,
+    pub(crate) kid: String,
 }
 
 static ALG: &EcdsaSigningAlgorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
@@ -137,22 +141,23 @@ impl Account {
         debug!(?body, "response");
         Ok((location, body))
     }
+    /// Creates a new order for `identifiers`, with the certificate profile `profile` if set.
     pub(crate) async fn new_order(
         &self,
         client_config: &Arc<ClientConfig>,
-        domains: Vec<String>,
-    ) -> Result<(String, Order), AcmeError> {
-        let domains: Vec<Identifier> = domains.into_iter().map(Identifier::Dns).collect();
-        let payload = format!(
-            "{{\"identifiers\":{}}}",
-            serde_json::to_string(&domains).map_err(json_err)?
-        );
-        let response = self
+        identifiers: &[Identifier],
+        profile: Option<&str>,
+    ) -> Result<CreatedOrder, AcmeError> {
+        let payload = serde_json::to_string(&NewOrder {
+            identifiers,
+            profile,
+        })
+        .map_err(json_err)?;
+        let (location, body) = self
             .request(client_config, &self.directory.new_order, &payload)
             .await?;
-        let url = response.0.ok_or(AcmeError::MissingHeader("Location"))?;
-        let order = serde_json::from_str(&response.1).map_err(json_err)?;
-        Ok((url, order))
+        let url = location.ok_or(AcmeError::MissingHeader("Location"))?;
+        CreatedOrder::from_response(url, &body)
     }
     /// Fetches the authorization object at `url`.
     pub(crate) async fn auth(
@@ -206,7 +211,7 @@ impl Account {
         &self,
         crypto_provider: &CryptoProvider,
         challenges: &'a [Challenge],
-        domain: String,
+        identifier: &Identifier,
     ) -> Result<(&'a Challenge, CertifiedKey), AcmeError> {
         let challenge = challenges
             .iter()
@@ -216,7 +221,8 @@ impl Account {
             Some(challenge) => challenge,
             None => return Err(AcmeError::NoTlsAlpn01Challenge),
         };
-        let mut params = rcgen::CertificateParams::new(vec![domain]).map_err(rcgen_err)?;
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![identifier.subject_alt_name().map_err(rcgen_err)?];
         let key_auth = key_authorization_sha256(&self.key_pair, &challenge.token)?;
         params.custom_extensions = vec![CustomExtension::new_acme_identifier(key_auth.as_ref())];
 
@@ -240,11 +246,11 @@ impl Account {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Directory {
     /// URL that hands out fresh replay nonces.
-    pub new_nonce: String,
+    pub(crate) new_nonce: String,
     /// URL to create an account or look up an existing one.
-    pub new_account: String,
+    pub(crate) new_account: String,
     /// URL to create a new order.
-    pub new_order: String,
+    pub(crate) new_order: String,
 }
 
 impl Directory {
@@ -277,7 +283,7 @@ impl Directory {
 /// A key that binds a new account to an external CA account (RFC 8555 section 7.3.4).
 pub(crate) struct ExternalAccountKey {
     /// Key identifier that the CA assigned to the external account.
-    pub kid: String,
+    pub(crate) kid: String,
     pub(crate) key: hmac::Key,
 }
 
@@ -388,13 +394,189 @@ pub enum AuthStatus {
     Deactivated,
 }
 
-/// An ACME identifier (RFC 8555 section 9.7.7).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// An ACME identifier (RFC 8555 section 9.7.7, RFC 8738 for IP addresses).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum Identifier {
     /// A DNS name.
     Dns(String),
+    /// An IP address.
+    Ip(IpAddr),
+}
+
+impl From<IpAddr> for Identifier {
+    fn from(ip: IpAddr) -> Self {
+        Identifier::Ip(ip)
+    }
+}
+
+impl FromStr for Identifier {
+    type Err = InvalidIdentifier;
+
+    /// Parses `s` as an IP address, or else as a DNS name, see [`Identifier::validated`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_text(s).validated()
+    }
+}
+
+/// Why an identifier, or the identifiers of a config, can't be ordered.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidIdentifier {
+    /// The config has no identifiers.
+    #[error("no identifiers to order")]
+    NoIdentifiers,
+    /// Two identifiers share a challenge SNI, like `192.0.2.1` and `1.2.0.192.in-addr.arpa`.
+    #[error("two identifiers share the challenge name {0:?}")]
+    ChallengeNameConflict(String),
+    /// The string is neither an IP address nor a valid DNS name.
+    #[error("{0:?} is neither an IP address nor a valid DNS name")]
+    InvalidDnsName(String),
+    /// The name is not ASCII. Internationalized names need their punycode form (`xn--`).
+    #[error("{0:?} is not ASCII, use the punycode form of the name")]
+    NonAscii(String),
+    /// The name is a wildcard, which tls-alpn-01 cannot validate.
+    #[error("{0:?} is a wildcard, which tls-alpn-01 cannot validate")]
+    Wildcard(String),
+    /// The address is unspecified (`0.0.0.0` or `::`).
+    #[error("{0} is the unspecified address")]
+    UnspecifiedIp(IpAddr),
+    /// The address is an IPv4-mapped IPv6 address. Use the IPv4 address instead.
+    #[error("{0} is an IPv4-mapped IPv6 address, use the IPv4 address")]
+    Ipv4MappedIp(Ipv6Addr),
+}
+
+impl fmt::Display for Identifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Identifier::Dns(name) => f.write_str(name),
+            Identifier::Ip(ip) => ip.fmt(f),
+        }
+    }
+}
+
+impl Identifier {
+    /// Returns `text` as an IP identifier if it is an IP address, else as a DNS one, unvalidated.
+    pub(crate) fn from_text(text: &str) -> Self {
+        match text.parse::<IpAddr>() {
+            Ok(ip) => Identifier::Ip(ip),
+            Err(_) => Identifier::Dns(text.to_owned()),
+        }
+    }
+    /// Returns the identifier normalized for an order, or why it can't be ordered.
+    ///
+    /// DNS names are lowercased, lose one trailing dot, and must be valid ASCII names without a
+    /// wildcard. IP addresses must not be unspecified or IPv4-mapped.
+    pub fn validated(self) -> Result<Self, InvalidIdentifier> {
+        match self {
+            Identifier::Ip(ip) if ip.is_unspecified() => Err(InvalidIdentifier::UnspecifiedIp(ip)),
+            Identifier::Ip(IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some() => {
+                Err(InvalidIdentifier::Ipv4MappedIp(v6))
+            }
+            ip @ Identifier::Ip(_) => Ok(ip),
+            Identifier::Dns(name) => Self::normalized_dns_name(name).map(Identifier::Dns),
+        }
+    }
+    /// Returns `name` lowercased and without one trailing dot, or why it is no valid DNS name.
+    fn normalized_dns_name(name: String) -> Result<String, InvalidIdentifier> {
+        if !name.is_ascii() {
+            return Err(InvalidIdentifier::NonAscii(name));
+        }
+        let normalized = name.strip_suffix('.').unwrap_or(&name).to_ascii_lowercase();
+        if normalized.starts_with('*') {
+            return Err(InvalidIdentifier::Wildcard(name));
+        }
+        // rustls accepts one trailing dot, so a second one would survive normalization.
+        if normalized.ends_with('.') || DnsName::try_from(normalized.as_str()).is_err() {
+            return Err(InvalidIdentifier::InvalidDnsName(name));
+        }
+        Ok(normalized)
+    }
+    /// Returns whether the subject alternative name `name` certifies this identifier.
+    pub(crate) fn is_certified_by(&self, name: &GeneralName<'_>) -> bool {
+        match (self, name) {
+            // webpki rejects a SAN with a trailing dot, so it certifies nothing.
+            (Identifier::Dns(dns), GeneralName::DNSName(name)) => name.eq_ignore_ascii_case(dns),
+            (Identifier::Ip(ip), GeneralName::IPAddress(octets)) => match ip {
+                IpAddr::V4(v4) => *octets == v4.octets(),
+                IpAddr::V6(v6) => *octets == v6.octets(),
+            },
+            _ => false,
+        }
+    }
+    /// Returns the subject alternative name that certifies this identifier.
+    pub(crate) fn subject_alt_name(&self) -> Result<SanType, rcgen::Error> {
+        Ok(match self {
+            Identifier::Dns(name) => SanType::DnsName(name.clone().try_into()?),
+            Identifier::Ip(ip) => SanType::IpAddress(*ip),
+        })
+    }
+    /// Returns the SNI the CA sends to validate this validated identifier, see RFC 8738 for IPs.
+    pub(crate) fn tls_alpn_01_server_name(&self) -> String {
+        match self {
+            Identifier::Dns(name) => name.clone(),
+            Identifier::Ip(ip) => reverse_dns_name(*ip),
+        }
+    }
+}
+
+/// Returns the reverse-DNS name of `ip` (RFC 1035 section 3.5, RFC 3596 section 2.5).
+fn reverse_dns_name(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, d] = v4.octets();
+            format!("{d}.{c}.{b}.{a}.in-addr.arpa")
+        }
+        IpAddr::V6(v6) => {
+            let nibbles: String = v6
+                .octets()
+                .iter()
+                .rev()
+                .map(|byte| format!("{:x}.{:x}.", byte & 0xf, byte >> 4))
+                .collect();
+            nibbles + "ip6.arpa"
+        }
+    }
+}
+
+/// An order that `newOrder` created.
+#[derive(Debug)]
+pub(crate) struct CreatedOrder {
+    /// URL of the order, from the `Location` header.
+    pub(crate) url: String,
+    /// The order as created.
+    pub(crate) order: Order,
+    /// The profile the CA selected for the order (draft-ietf-acme-profiles), if it named one.
+    pub(crate) profile: Option<String>,
+}
+
+impl CreatedOrder {
+    /// Parses the `newOrder` response `body` of the order at `url`.
+    ///
+    /// A `profile` that is not a string counts as none.
+    fn from_response(url: String, body: &str) -> Result<Self, AcmeError> {
+        let value: serde_json::Value = serde_json::from_str(body).map_err(json_err)?;
+        let profile = value
+            .get("profile")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let order = Order::deserialize(value).map_err(json_err)?;
+        Ok(Self {
+            url,
+            order,
+            profile,
+        })
+    }
+}
+
+/// The payload of a `newOrder` request (RFC 8555 section 7.4).
+#[derive(Debug, Serialize)]
+struct NewOrder<'a> {
+    identifiers: &'a [Identifier],
+    /// The certificate profile (draft-ietf-acme-profiles), left out when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'a str>,
 }
 
 /// A challenge object (RFC 8555 section 8).
@@ -512,6 +694,132 @@ mod tests {
     use rustls::crypto::KeyProvider;
     use rustls::sign::SigningKey;
 
+    /// Parses `s` as a valid identifier.
+    fn id(s: &str) -> Identifier {
+        s.parse()
+            .unwrap_or_else(|err| panic!("{s:?} should parse: {err}"))
+    }
+
+    #[test]
+    fn parsing_normalizes_identifiers() {
+        let cases = [
+            ("example.com", Identifier::Dns("example.com".into())),
+            ("Example.COM.", Identifier::Dns("example.com".into())),
+            // rustls accepts underscores, which private CAs may issue for.
+            (
+                "_svc.example.org",
+                Identifier::Dns("_svc.example.org".into()),
+            ),
+            ("192.0.2.1", Identifier::Ip("192.0.2.1".parse().unwrap())),
+            // RFC 5952: lowercase, longest zero run compressed, no leading zeros.
+            (
+                "2001:0DB8:0::0001",
+                Identifier::Ip("2001:db8::1".parse().unwrap()),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(id(input), expected, "{input:?}");
+        }
+        assert_eq!(id("0:0::1").to_string(), "::1");
+    }
+
+    #[test]
+    fn invalid_identifiers_are_rejected() {
+        let dns = |name: &str| InvalidIdentifier::InvalidDnsName(name.into());
+        let cases = [
+            ("", dns("")),
+            (".", dns(".")),
+            ("example.org..", dns("example.org..")),
+            ("010.0.0.1", dns("010.0.0.1")),
+            ("foo bar", dns("foo bar")),
+            ("fe80::1%eth0", dns("fe80::1%eth0")),
+            (
+                "b\u{fc}cher.example",
+                InvalidIdentifier::NonAscii("b\u{fc}cher.example".into()),
+            ),
+            (
+                "*.example.com",
+                InvalidIdentifier::Wildcard("*.example.com".into()),
+            ),
+            (
+                "::",
+                InvalidIdentifier::UnspecifiedIp("::".parse().unwrap()),
+            ),
+            (
+                "::ffff:192.0.2.1",
+                InvalidIdentifier::Ipv4MappedIp("::ffff:192.0.2.1".parse().unwrap()),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(input.parse::<Identifier>(), Err(expected), "{input:?}");
+        }
+        // A typed DNS identifier keeps its type, so an IP literal is no valid DNS name.
+        let typed = Identifier::Dns("192.0.2.1".into()).validated();
+        assert_eq!(typed, Err(dns("192.0.2.1")));
+    }
+
+    #[test]
+    fn challenge_server_names() {
+        let cases = [
+            (id("Example.COM"), "example.com".to_owned()),
+            (id("192.0.2.1"), "1.2.0.192.in-addr.arpa".to_owned()),
+            // Example from RFC 3596 section 2.5, lowercased.
+            (
+                id("4321:0:1:2:3:4:567:89ab"),
+                "b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.ip6.arpa"
+                    .to_owned(),
+            ),
+            (id("::1"), format!("1.{}ip6.arpa", "0.".repeat(31))),
+        ];
+        for (identifier, name) in cases {
+            assert_eq!(identifier.tls_alpn_01_server_name(), name, "{identifier}");
+        }
+    }
+
+    #[test]
+    fn is_certified_by_matches_the_san_type_and_value() {
+        let v4 = [192, 0, 2, 1];
+        let v6 = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
+        let cases = [
+            ("example.com", GeneralName::DNSName("Example.COM"), true),
+            ("example.com", GeneralName::DNSName("example.com."), false),
+            (
+                "example.com",
+                GeneralName::DNSName("www.example.com"),
+                false,
+            ),
+            ("192.0.2.1", GeneralName::IPAddress(&v4), true),
+            ("192.0.2.1", GeneralName::DNSName("192.0.2.1"), false),
+            ("2001:db8::1", GeneralName::IPAddress(&v6), true),
+            ("2001:db8::1", GeneralName::IPAddress(&v4), false),
+        ];
+        for (identifier, name, certified) in cases {
+            let certifies = id(identifier).is_certified_by(&name);
+            assert_eq!(certifies, certified, "{identifier} by {name:?}");
+        }
+    }
+
+    #[test]
+    fn new_order_payload_has_profile_only_when_set() {
+        let identifiers = [id("example.com"), id("2001:DB8::1")];
+        let payload = |profile| {
+            let order = NewOrder {
+                identifiers: &identifiers,
+                profile,
+            };
+            serde_json::to_string(&order).unwrap()
+        };
+        let identifiers_json = concat!(
+            r#""identifiers":[{"type":"dns","value":"example.com"},"#,
+            r#"{"type":"ip","value":"2001:db8::1"}]"#,
+        );
+        assert_eq!(payload(None), format!("{{{identifiers_json}}}"));
+        assert_eq!(
+            payload(Some("shortlived")),
+            format!(r#"{{{identifiers_json},"profile":"shortlived"}}"#)
+        );
+    }
+
     #[derive(Debug)]
     struct RejectingKeyProvider;
 
@@ -549,7 +857,7 @@ mod tests {
             error: None,
         }];
 
-        let result = account.tls_alpn_01(&provider, &challenges, "example.com".into());
+        let result = account.tls_alpn_01(&provider, &challenges, &id("example.com"));
         assert!(matches!(result, Err(AcmeError::Crypto(_))));
     }
 

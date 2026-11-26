@@ -1,4 +1,4 @@
-use crate::acme::ACME_TLS_ALPN_NAME;
+use crate::acme::{ACME_TLS_ALPN_NAME, Identifier};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::BTreeMap;
@@ -31,12 +31,14 @@ impl ResolvesServerCertAcme {
     pub(crate) fn set_cert(&self, cert: Arc<CertifiedKey>) {
         self.inner.lock().expect("poisoned").cert = Some(cert);
     }
-    pub(crate) fn set_auth_key(&self, domain: String, cert: Arc<CertifiedKey>) {
+    /// Serves `cert` to tls-alpn-01 validation requests for `identifier`.
+    pub(crate) fn set_auth_key(&self, identifier: &Identifier, cert: Arc<CertifiedKey>) {
+        let server_name = identifier.tls_alpn_01_server_name();
         self.inner
             .lock()
             .expect("poisoned")
             .auth_keys
-            .insert(domain, cert);
+            .insert(server_name, cert);
     }
 }
 
@@ -53,19 +55,36 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
                     debug!("client did not supply SNI");
                     None
                 }
-                Some(domain) => {
-                    let domain = domain.to_owned();
-                    let domain: String = AsRef::<str>::as_ref(&domain).into();
-                    self.inner
-                        .lock()
-                        .expect("poisoned")
-                        .auth_keys
-                        .get(&domain)
-                        .cloned()
-                }
+                Some(server_name) => self
+                    .inner
+                    .lock()
+                    .expect("poisoned")
+                    .auth_keys
+                    .get(challenge_server_name(server_name))
+                    .cloned(),
             }
         } else {
             self.inner.lock().expect("poisoned").cert.clone()
         }
+    }
+}
+
+/// Returns the received SNI `server_name` without the trailing dot that rustls keeps.
+fn challenge_server_name(server_name: &str) -> &str {
+    server_name.strip_suffix('.').unwrap_or(server_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn challenge_server_name_strips_one_trailing_dot() {
+        // The rustls client strips the dot before sending, so a handshake cannot test this.
+        assert_eq!(
+            challenge_server_name("1.2.0.192.in-addr.arpa."),
+            "1.2.0.192.in-addr.arpa"
+        );
+        assert_eq!(challenge_server_name("example.org"), "example.org");
     }
 }

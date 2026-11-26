@@ -1,4 +1,5 @@
 //! An easy-to-use, async compatible [ACME] client library using [rustls].
+//!
 //! The validation mechanism used is tls-alpn-01, which allows serving acme challenge responses and
 //! regular TLS traffic on the same port.
 //!
@@ -51,6 +52,8 @@
 //! well as accepting TLS connections, which are handed over to the caller on success.
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "tls-webpki-roots")]
+//! # {
 //! use std::io;
 //! use std::time::Duration;
 //! use tokio::io::AsyncWriteExt;
@@ -106,6 +109,7 @@
 //! Content-Type: text/plain; charset=utf-8
 //!
 //! Hello Tls!"#;
+//! # }
 //! ```
 //!
 //! `examples/high_level.rs` implements a "Hello Tls!" server similar to the one above, which accepts
@@ -117,6 +121,20 @@
 //! For testing with the staging directory you may open `https://<your domain>:<port>` in a browser
 //! that allows TLS connections to servers signed by an untrusted CA (in Firefox click "Advanced..."
 //! -> "Accept the Risk and Continue").
+//!
+//! ## IP address certificates
+//!
+//! Identifiers that parse as IP addresses are ordered as IP identifiers (RFC 8738), validated
+//! on port 443 of each address. Let's Encrypt issues them only under the `shortlived` profile:
+//!
+//! ```rust
+//! # #[cfg(feature = "tls-webpki-roots")]
+//! # {
+//! use tokio_rustls_acme::AcmeConfig;
+//!
+//! let config = AcmeConfig::new(["192.0.2.1", "2001:db8::1"]).profile("shortlived");
+//! # }
+//! ```
 //!
 //! ## Low-level Rustls API
 //!

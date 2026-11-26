@@ -108,11 +108,6 @@ async fn wait_for_event(events: &Events, wanted: impl Fn(&Result<String, String>
     );
 }
 
-/// Returns whether `err` is the `Debug` output of an expired new certificate error.
-fn is_expired_error(err: &str) -> bool {
-    err == "NewCertParse(Expired)"
-}
-
 #[tokio::test]
 async fn order_round_backs_off_while_order_status_does_not_advance() {
     let cases = [
@@ -148,45 +143,79 @@ async fn renewal_backs_off_when_new_certificate_is_already_due() {
 }
 
 #[tokio::test]
-async fn renewal_keeps_previous_certificate_when_new_certificate_is_expired() {
-    let mock = MockAcme::start().await;
-    mock.state().issue_validity = Validity::Expired;
-    // The cached certificate is still valid but due for renewal, so an order starts at once.
-    let cached = MockCa::new().issue_with_key(DOMAIN, Validity::Due);
-    let cache = RecordingCache::new(cached);
-    let stored_certs = cache.stored_certs.clone();
-    let state = AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
-        .directory(&mock.directory_url)
-        .cache(cache)
-        .state();
-    let (driver, events) = drive(state);
+async fn renewal_keeps_previous_certificate_when_new_certificate_is_unusable() {
+    let cases: [(&[&str], Validity, &str); 2] = [
+        (&[DOMAIN], Validity::Expired, "NewCertParse(Expired)"),
+        // The mock CA certifies only the first identifier.
+        (
+            &[DOMAIN, "192.0.2.1"],
+            Validity::Fresh,
+            "NewCertParse(MissingIdentifier(Ip(192.0.2.1)))",
+        ),
+    ];
+    for (domains, validity, error) in cases {
+        let mock = MockAcme::start().await;
+        mock.state().issue_validity = validity;
+        // The cached certificate is still valid but due for renewal, so an order starts at once.
+        let cached = MockCa::new().issue_with_key(DOMAIN, Validity::Due);
+        let cache = RecordingCache::new(cached);
+        let stored_certs = cache.stored_certs.clone();
+        let state = AcmeConfig::new_with_client_tls_config(domains, mock.client_config.clone())
+            .directory(&mock.directory_url)
+            .cache(cache)
+            .state();
+        let (driver, events) = drive(state);
 
-    wait_for_event(&events, |event| {
-        event.as_ref().is_err_and(|err| is_expired_error(err))
-    })
-    .await;
-    assert_retry_delay(&mock, "POST /order").await;
-    driver.abort();
+        wait_for_event(&events, |event| {
+            event.as_ref().is_err_and(|err| err == error)
+        })
+        .await;
+        assert_retry_delay(&mock, "POST /order").await;
+        driver.abort();
 
-    assert_only_expected_errors(&events, is_expired_error);
-    assert_reached(&mock, "POST /cert/1");
-    {
-        let events = events.lock().expect("poisoned");
-        assert_eq!(
-            events.first().map(Result::as_deref),
-            Some(Ok("DeployedCachedCert")),
-            "the client did not start from the cached certificate: {events:#?}"
-        );
+        assert_only_expected_errors(&events, |err| err == error);
+        assert_reached(&mock, "POST /cert/1");
+        {
+            let events = events.lock().expect("poisoned");
+            assert_eq!(
+                events.first().map(Result::as_deref),
+                Some(Ok("DeployedCachedCert")),
+                "the client did not start from the cached certificate: {events:#?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event.as_deref() == Ok("DeployedNewCert")),
+                "the client deployed the unusable certificate: {events:#?}"
+            );
+        }
         assert!(
-            !events
-                .iter()
-                .any(|event| event.as_deref() == Ok("DeployedNewCert")),
-            "the client deployed the expired certificate: {events:#?}"
+            stored_certs.lock().expect("poisoned").is_empty(),
+            "the client cached the unusable certificate"
         );
     }
-    assert!(
-        stored_certs.lock().expect("poisoned").is_empty(),
-        "the client cached the expired certificate"
+}
+
+/// A cached certificate without an identifier is served, but renewed at once.
+#[tokio::test]
+async fn cached_certificate_without_an_identifier_is_renewed_at_once() {
+    let mock = MockAcme::start().await;
+    let cached = MockCa::new().issue_with_key(DOMAIN, Validity::Fresh);
+    let state =
+        AcmeConfig::new_with_client_tls_config([DOMAIN, "192.0.2.1"], mock.client_config.clone())
+            .directory(&mock.directory_url)
+            .cache(RecordingCache::new(cached))
+            .state();
+    let (driver, events) = drive(state);
+
+    mock.wait_for_hits("POST /order", 1, LIMIT).await;
+    driver.abort();
+
+    let events = events.lock().expect("poisoned");
+    assert_eq!(
+        events.first().map(Result::as_deref),
+        Some(Ok("DeployedCachedCert")),
+        "the client did not serve the cached certificate: {events:#?}"
     );
 }
 

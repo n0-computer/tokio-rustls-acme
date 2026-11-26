@@ -5,7 +5,13 @@
 
 mod support;
 
-use std::{convert::TryFrom, sync::Arc, time::Duration};
+use std::{
+    convert::{Infallible, TryFrom},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use async_trait::async_trait;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use n0_future::StreamExt;
@@ -13,10 +19,15 @@ use rustls::{
     ClientConfig, DEFAULT_VERSIONS, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, ServerName},
 };
+use serde_json::json;
 use support::{ACME_IDENTIFIER_OID, ACME_TLS_ALPN, AcceptAnyCert, MockAcme};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
-use tokio_rustls_acme::{AcmeAcceptor, AcmeConfig, EventOk, ResolvesServerCertAcme};
+use tokio_rustls_acme::{
+    AcmeAcceptor, AcmeConfig, AcmeState, CertCache, EventError, EventOk, OrderError,
+    ResolvesServerCertAcme,
+    caches::{NoCache, TestCache},
+};
 use x509_parser::{
     certificate::X509Certificate, extensions::GeneralName, oid_registry::Oid, prelude::FromDer,
 };
@@ -40,9 +51,12 @@ impl Drop for PendingChallenge {
 }
 
 /// Starts an order for [`DOMAIN`] and returns once the client triggered the challenge.
-async fn pending_challenge() -> PendingChallenge {
+///
+/// The authorization names the identifier `authz_value`, or [`DOMAIN`] if it is `None`.
+async fn pending_challenge(authz_value: Option<&str>) -> PendingChallenge {
     let mock = MockAcme::start().await;
     mock.state().authz_status = "pending";
+    mock.state().authz_value = authz_value.map(str::to_owned);
     let mut state = AcmeConfig::new_with_client_tls_config([DOMAIN], mock.client_config.clone())
         .directory(&mock.directory_url)
         .state();
@@ -157,42 +171,45 @@ fn expected_acme_identifier(mock: &MockAcme) -> Vec<u8> {
 
 #[tokio::test]
 async fn tls_alpn_01_response_conforms_to_rfc_8737() {
-    let challenge = pending_challenge().await;
+    // A CA may spell the identifier of the authorization otherwise.
+    for authz_value in [None, Some("Invariants.Example.COM.")] {
+        let challenge = pending_challenge(authz_value).await;
 
-    let result = handshake(&challenge, DOMAIN, &[ACME_TLS_ALPN], None).await;
+        let result = handshake(&challenge, DOMAIN, &[ACME_TLS_ALPN], None).await;
 
-    assert!(
-        result.handled_as_validation,
-        "the acceptor must end a validation handshake itself"
-    );
-    let (leaf, alpn) = result.client.expect("validation handshake completes");
-    assert_eq!(alpn.as_deref(), Some(ACME_TLS_ALPN));
+        assert!(
+            result.handled_as_validation,
+            "the acceptor must end a validation handshake itself, {authz_value:?}"
+        );
+        let (leaf, alpn) = result.client.expect("validation handshake completes");
+        assert_eq!(alpn.as_deref(), Some(ACME_TLS_ALPN));
 
-    let (_, cert) = X509Certificate::from_der(&leaf).unwrap();
-    assert_eq!(cert.subject(), cert.issuer(), "must be self-issued");
-    cert.verify_signature(None)
-        .expect("must be signed with its own public key");
-    let san = cert.subject_alternative_name().unwrap().expect("has a SAN");
-    assert!(
-        matches!(san.value.general_names.as_slice(), [GeneralName::DNSName(name)] if *name == DOMAIN),
-        "the SAN must hold the validated domain and nothing else: {:?}",
-        san.value.general_names
-    );
-    let oid = Oid::from(ACME_IDENTIFIER_OID).unwrap();
-    let extension = cert
-        .get_extension_unique(&oid)
-        .unwrap()
-        .expect("has an acmeIdentifier extension");
-    assert!(extension.critical, "acmeIdentifier must be critical");
-    // The extension value is a DER OCTET STRING with the 32-byte digest.
-    let mut expected = vec![0x04, 0x20];
-    expected.extend(expected_acme_identifier(&challenge.mock));
-    assert_eq!(extension.value, expected);
+        let (_, cert) = X509Certificate::from_der(&leaf).unwrap();
+        assert_eq!(cert.subject(), cert.issuer(), "must be self-issued");
+        cert.verify_signature(None)
+            .expect("must be signed with its own public key");
+        let san = cert.subject_alternative_name().unwrap().expect("has a SAN");
+        let names = &san.value.general_names;
+        assert!(
+            matches!(names.as_slice(), [GeneralName::DNSName(name)] if *name == DOMAIN),
+            "the SAN must hold the validated domain and nothing else: {names:?}",
+        );
+        let oid = Oid::from(ACME_IDENTIFIER_OID).unwrap();
+        let extension = cert
+            .get_extension_unique(&oid)
+            .unwrap()
+            .expect("has an acmeIdentifier extension");
+        assert!(extension.critical, "acmeIdentifier must be critical");
+        // The extension value is a DER OCTET STRING with the 32-byte digest.
+        let mut expected = vec![0x04, 0x20];
+        expected.extend(expected_acme_identifier(&challenge.mock));
+        assert_eq!(extension.value, expected);
+    }
 }
 
 #[tokio::test]
 async fn challenge_certificate_requires_exact_acme_alpn_and_matching_sni() {
-    let challenge = pending_challenge().await;
+    let challenge = pending_challenge(None).await;
 
     let cases: [(&str, &[&[u8]]); 4] = [
         (DOMAIN, &[]),
@@ -212,7 +229,7 @@ async fn challenge_certificate_requires_exact_acme_alpn_and_matching_sni() {
 
 #[tokio::test]
 async fn validated_order_follows_jws_rules_and_deploys_own_key() {
-    let mut challenge = pending_challenge().await;
+    let mut challenge = pending_challenge(None).await;
     challenge.mock.state().authz_status = "valid";
 
     tokio::time::timeout(LIMIT, async {
@@ -255,4 +272,134 @@ async fn validated_order_follows_jws_rules_and_deploys_own_key() {
         result.client.is_some(),
         "the deployed certificate does not verify for {DOMAIN}"
     );
+}
+
+/// Fails invalid identifiers before any request to the CA, and without a cached certificate.
+///
+/// The kinds of invalid identifiers are unit tested in `acme` and `config`.
+#[tokio::test]
+async fn invalid_identifiers_fail_before_the_cache_and_the_ca() {
+    let mock = MockAcme::start().await;
+    // Both identifiers would need the same challenge SNI.
+    let config = || mock_config(&mock).domains(["192.0.2.1", "1.2.0.192.in-addr.arpa"]);
+    // TestCache holds a certificate for any identifiers, like a cache of an earlier version.
+    let cold = config().state();
+    let warm = config()
+        .cache(TestCache::<Infallible, Infallible>::new())
+        .state();
+    for (start, mut state) in [("cold", cold), ("warm", warm)] {
+        let event = tokio::time::timeout(LIMIT, state.next()).await;
+        let invalid = matches!(
+            event,
+            Ok(Some(Err(EventError::Order(OrderError::InvalidIdentifier(
+                _
+            )))))
+        );
+        assert!(invalid, "{start} start: {event:?}");
+    }
+    assert_eq!(
+        mock.state().hits("GET /dir"),
+        0,
+        "the client contacted the CA"
+    );
+}
+
+/// Loads and stores the certificate under the identifiers as given, see `config` for the keys.
+#[tokio::test]
+async fn cache_keys_are_the_identifiers_as_given() {
+    let key = "Invariants.Example.COM.";
+    let mock = MockAcme::start().await;
+    let cache = KeyRecorder::default();
+    let keys = cache.keys.clone();
+    let state = mock_config(&mock)
+        .domains([key])
+        .cache_compose(cache, NoCache::<Infallible>::new())
+        .state();
+    deploy(state).await.expect("order failed");
+    let expected = [format!("load {key}"), format!("store {key}")];
+    assert_eq!(*keys.lock().expect("poisoned"), expected);
+}
+
+/// Deploys only a certificate whose profile the CA confirms, if one is configured.
+#[tokio::test]
+async fn configured_profile_must_be_confirmed() {
+    let malformed = json!({"name": 42});
+    let cases = [
+        (Some("shortlived"), Some(json!("shortlived")), Ok(())),
+        (Some("shortlived"), None, Err(None)),
+        (
+            Some("shortlived"),
+            Some(json!("classic")),
+            Err(Some("classic")),
+        ),
+        (Some("shortlived"), Some(malformed.clone()), Err(None)),
+        (None, Some(malformed), Ok(())),
+    ];
+    for (configured, profile, expected) in cases {
+        let mock = MockAcme::start().await;
+        mock.state().profile = profile.clone();
+        let mut config = mock_config(&mock).domains([DOMAIN]);
+        if let Some(configured) = configured {
+            config = config.profile(configured);
+        }
+        match (deploy(config.state()).await, expected) {
+            (Ok(()), Ok(())) => {}
+            (Err(OrderError::ProfileMismatch { selected, .. }), Err(expected)) => {
+                assert_eq!(selected.as_deref(), expected, "{profile:?}");
+                let finalized = mock.state().hits("POST /finalize/1");
+                assert_eq!(finalized, 0, "{profile:?}: the client finalized the order");
+            }
+            (result, _) => panic!("{configured:?} with {profile:?}: {result:?}"),
+        }
+    }
+}
+
+/// Returns a config for the CA of `mock`, without identifiers.
+fn mock_config(mock: &MockAcme) -> AcmeConfig<Infallible> {
+    AcmeConfig::new_with_client_tls_config([""; 0], mock.client_config.clone())
+        .directory(&mock.directory_url)
+}
+
+/// A cert cache that stays empty and records the keys of its loads and stores.
+#[derive(Debug, Default)]
+struct KeyRecorder {
+    /// Each load and store, like `load example.com,example.org`.
+    keys: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl CertCache for KeyRecorder {
+    type EC = Infallible;
+
+    async fn load_cert(&self, domains: &[String], _: &str) -> Result<Option<Vec<u8>>, Infallible> {
+        let mut keys = self.keys.lock().expect("poisoned");
+        keys.push(format!("load {}", domains.join(",")));
+        Ok(None)
+    }
+
+    async fn store_cert(&self, domains: &[String], _: &str, _: &[u8]) -> Result<(), Infallible> {
+        let mut keys = self.keys.lock().expect("poisoned");
+        keys.push(format!("store {}", domains.join(",")));
+        Ok(())
+    }
+}
+
+/// Drives `state` until it stores a new certificate, or returns the first order error.
+#[allow(
+    clippy::result_large_err,
+    reason = "the crate returns `OrderError` by value in its events too"
+)]
+async fn deploy(mut state: AcmeState) -> Result<(), OrderError> {
+    tokio::time::timeout(LIMIT, async {
+        loop {
+            match state.next().await.expect("state stream ended") {
+                Ok(EventOk::CertCacheStore) => return Ok(()),
+                Ok(_) => {}
+                Err(EventError::Order(err)) => return Err(err),
+                Err(err) => panic!("expected an order error, got {err:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the order")
 }

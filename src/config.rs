@@ -1,5 +1,6 @@
 use crate::acme::{
-    ExternalAccountKey, LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY,
+    ExternalAccountKey, Identifier, InvalidIdentifier, LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+    LETS_ENCRYPT_STAGING_DIRECTORY,
 };
 use crate::caches::{BoxedErrCache, CompositeCache, NoCache};
 use crate::{AccountCache, Cache, CertCache};
@@ -9,6 +10,8 @@ use n0_future::Stream;
 use rustls::DEFAULT_VERSIONS;
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, ServerConfig};
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::convert::Infallible;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -20,17 +23,19 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) client_config: Arc<ClientConfig>,
     pub(crate) directory_url: String,
-    pub(crate) domains: Vec<String>,
+    /// The identifiers as configured, not yet validated.
+    identifiers: Vec<Identifier>,
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
+    pub(crate) profile: Option<String>,
 }
 
 impl<EC: Debug, EA: Debug> fmt::Debug for AcmeConfig<EC, EA> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AcmeConfig")
             .field("directory_url", &self.directory_url)
-            .field("domains", &self.domains)
+            .field("identifiers", &self.identifiers)
             .field("contact", &self.contact)
             .finish_non_exhaustive()
     }
@@ -43,6 +48,8 @@ impl AcmeConfig<Infallible, Infallible> {
     /// otherwise ring (the default). The same provider is used for the HTTPS client,
     /// the TLS handshake, and key parsing. Use
     /// [`AcmeConfig::new_with_crypto_provider`] to pick a different provider.
+    ///
+    /// `domains` are DNS names or IP addresses, see [`AcmeConfig::domains`].
     ///
     /// ```rust,no_run
     /// # use tokio_rustls_acme::AcmeConfig;
@@ -125,10 +132,11 @@ impl AcmeConfig<Infallible, Infallible> {
         AcmeConfig {
             client_config,
             directory_url: LETS_ENCRYPT_STAGING_DIRECTORY.into(),
-            domains: domains.into_iter().map(|s| s.as_ref().into()).collect(),
+            identifiers: Self::text_identifiers(domains),
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
+            profile: None,
         }
     }
 }
@@ -161,14 +169,85 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         .into();
         self
     }
-    /// Sets the domains to request a certificate for, replacing the current ones.
+    /// Sets the identifiers to request a certificate for, DNS names or IP addresses.
+    ///
+    /// Invalid ones fail every order, see [`Identifier::validated`]. They key the certificate
+    /// cache as given, IP addresses in canonical form.
     pub fn domains(mut self, domains: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
-        self.domains = domains.into_iter().map(|s| s.as_ref().into()).collect();
+        self.identifiers = Self::text_identifiers(domains);
         self
     }
-    /// Adds a domain to request a certificate for.
+    /// Sets typed identifiers to request a certificate for, like [`IpAddr`](std::net::IpAddr)s.
+    ///
+    /// Each keeps its type, and keys the certificate cache like [`AcmeConfig::domains`].
+    pub fn identifiers(
+        mut self,
+        identifiers: impl IntoIterator<Item = impl Into<Identifier>>,
+    ) -> Self {
+        self.identifiers = identifiers.into_iter().map(Into::into).collect();
+        self
+    }
+    /// Adds an identifier (DNS name or IP address) to request a certificate for.
     pub fn domains_push(mut self, domain: impl AsRef<str>) -> Self {
-        self.domains.push(domain.as_ref().into());
+        self.identifiers
+            .push(Identifier::from_text(domain.as_ref()));
+        self
+    }
+
+    /// Returns `domains` as identifiers, not yet validated.
+    fn text_identifiers(domains: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<Identifier> {
+        domains
+            .into_iter()
+            .map(|domain| Identifier::from_text(domain.as_ref()))
+            .collect()
+    }
+
+    /// Returns whether the directory is one of Let's Encrypt's.
+    pub(crate) fn is_lets_encrypt(&self) -> bool {
+        [
+            LETS_ENCRYPT_PRODUCTION_DIRECTORY,
+            LETS_ENCRYPT_STAGING_DIRECTORY,
+        ]
+        .contains(&self.directory_url.as_str())
+    }
+
+    /// Returns the strings that key the certificate cache, see [`AcmeConfig::domains`].
+    pub(crate) fn cache_key(&self) -> Vec<String> {
+        self.identifiers.iter().map(Identifier::to_string).collect()
+    }
+
+    /// Returns the validated identifiers to order, without duplicates, or why they can't be.
+    pub(crate) fn validated_identifiers(&self) -> Result<Vec<Identifier>, InvalidIdentifier> {
+        if self.identifiers.is_empty() {
+            return Err(InvalidIdentifier::NoIdentifiers);
+        }
+        let mut identifiers = Vec::new();
+        let mut challenge_names = BTreeMap::new();
+        for identifier in &self.identifiers {
+            let identifier = identifier.clone().validated()?;
+            match challenge_names.entry(identifier.tls_alpn_01_server_name()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(identifier.clone());
+                    identifiers.push(identifier);
+                }
+                Entry::Occupied(entry) if *entry.get() == identifier => {}
+                Entry::Occupied(entry) => {
+                    return Err(InvalidIdentifier::ChallengeNameConflict(
+                        entry.key().clone(),
+                    ));
+                }
+            }
+        }
+        Ok(identifiers)
+    }
+
+    /// Requires the ACME profile `profile` (draft-ietf-acme-profiles) for new orders.
+    ///
+    /// The CA must confirm it in the order, or the order fails with
+    /// [`OrderError::ProfileMismatch`](crate::OrderError::ProfileMismatch), so every order fails
+    /// with a CA without profiles. Let's Encrypt issues IP certificates only under `shortlived`.
+    pub fn profile(mut self, profile: impl AsRef<str>) -> Self {
+        self.profile = Some(profile.as_ref().into());
         self
     }
 
@@ -200,10 +279,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         AcmeConfig {
             client_config: self.client_config,
             directory_url: self.directory_url,
-            domains: self.domains,
+            identifiers: self.identifiers,
             contact: self.contact,
             cache: Box::new(cache),
             eab: self.eab,
+            profile: self.profile,
         }
     }
     /// Stores certificates in `cert_cache` and account keys in `account_cache`.
@@ -261,5 +341,66 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     ) -> Incoming<TCP, ETCP, ITCP, EC, EA> {
         self.state()
             .incoming_with_server(tcp_incoming, server_config)
+    }
+}
+
+/// Returns a config for `domains` that needs no webpki roots, like the custom-root builds.
+#[cfg(test)]
+pub(crate) fn test_config(domains: &[&str]) -> AcmeConfig<Infallible> {
+    let client_config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .expect("the provider supports the default versions")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+    AcmeConfig::new_with_client_tls_config(domains, Arc::new(client_config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validated_identifiers_deduplicate_and_reject_conflicts() {
+        let ip = |ip: &str| Identifier::Ip(ip.parse().unwrap());
+        let ipv6_reverse = format!("1.{}8.b.d.0.1.0.0.2.ip6.arpa", "0.".repeat(23));
+        let cases = [
+            (
+                vec!["Example.COM.", "example.com", "::1", "0:0::1"],
+                Ok(vec![Identifier::Dns("example.com".into()), ip("::1")]),
+            ),
+            (vec![], Err(InvalidIdentifier::NoIdentifiers)),
+            (
+                vec!["192.0.2.1", "1.2.0.192.in-addr.arpa"],
+                Err(InvalidIdentifier::ChallengeNameConflict(
+                    "1.2.0.192.in-addr.arpa".into(),
+                )),
+            ),
+            (
+                vec!["2001:db8::1", &ipv6_reverse],
+                Err(InvalidIdentifier::ChallengeNameConflict(
+                    ipv6_reverse.clone(),
+                )),
+            ),
+        ];
+        for (domains, expected) in cases {
+            let identifiers = test_config(&domains).validated_identifiers();
+            assert_eq!(identifiers, expected, "{domains:?}");
+        }
+    }
+
+    #[test]
+    fn cache_keys_are_identifiers_as_given_with_canonical_ips() {
+        let typed = [
+            Identifier::Dns("Example.COM.".into()),
+            Identifier::from_text("0:0::1"),
+        ];
+        let configs = [
+            test_config(&["Example.COM.", "0:0::1"]),
+            test_config(&[]).identifiers(typed),
+        ];
+        for config in configs {
+            assert_eq!(config.cache_key(), ["Example.COM.", "::1"]);
+        }
     }
 }
