@@ -470,13 +470,11 @@ impl Identifier {
     /// wildcard. IP addresses must not be unspecified or IPv4-mapped.
     pub fn validated(self) -> Result<Self, InvalidIdentifier> {
         match self {
-            Identifier::Ip(ip) => match ip {
-                ip if ip.is_unspecified() => Err(InvalidIdentifier::UnspecifiedIp(ip)),
-                IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
-                    Err(InvalidIdentifier::Ipv4MappedIp(v6))
-                }
-                ip => Ok(Identifier::Ip(ip)),
-            },
+            Identifier::Ip(ip) if ip.is_unspecified() => Err(InvalidIdentifier::UnspecifiedIp(ip)),
+            Identifier::Ip(IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some() => {
+                Err(InvalidIdentifier::Ipv4MappedIp(v6))
+            }
+            ip @ Identifier::Ip(_) => Ok(ip),
             Identifier::Dns(name) => Self::normalized_dns_name(name).map(Identifier::Dns),
         }
     }
@@ -500,12 +498,10 @@ impl Identifier {
         match (self, name) {
             // webpki rejects a SAN with a trailing dot, so it certifies nothing.
             (Identifier::Dns(dns), GeneralName::DNSName(name)) => name.eq_ignore_ascii_case(dns),
-            (Identifier::Ip(IpAddr::V4(ip)), GeneralName::IPAddress(octets)) => {
-                *octets == ip.octets()
-            }
-            (Identifier::Ip(IpAddr::V6(ip)), GeneralName::IPAddress(octets)) => {
-                *octets == ip.octets()
-            }
+            (Identifier::Ip(ip), GeneralName::IPAddress(octets)) => match ip {
+                IpAddr::V4(v4) => *octets == v4.octets(),
+                IpAddr::V6(v6) => *octets == v6.octets(),
+            },
             _ => false,
         }
     }
@@ -516,10 +512,10 @@ impl Identifier {
             Identifier::Ip(ip) => SanType::IpAddress(*ip),
         })
     }
-    /// Returns the SNI the CA sends to validate this identifier, see RFC 8738 section 6 for IPs.
+    /// Returns the SNI the CA sends to validate this validated identifier, see RFC 8738 for IPs.
     pub(crate) fn tls_alpn_01_server_name(&self) -> String {
         match self {
-            Identifier::Dns(name) => name.to_ascii_lowercase(),
+            Identifier::Dns(name) => name.clone(),
             Identifier::Ip(ip) => reverse_dns_name(*ip),
         }
     }
@@ -765,10 +761,7 @@ mod tests {
     #[test]
     fn challenge_server_names() {
         let cases = [
-            (
-                Identifier::Dns("Example.COM".into()),
-                "example.com".to_owned(),
-            ),
+            (id("Example.COM"), "example.com".to_owned()),
             (id("192.0.2.1"), "1.2.0.192.in-addr.arpa".to_owned()),
             // Example from RFC 3596 section 2.5, lowercased.
             (

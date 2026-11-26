@@ -344,21 +344,21 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
     }
 }
 
+/// Returns a config for `domains` that needs no webpki roots, like the custom-root builds.
+#[cfg(test)]
+pub(crate) fn test_config(domains: &[&str]) -> AcmeConfig<Infallible> {
+    let client_config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .expect("the provider supports the default versions")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+    AcmeConfig::new_with_client_tls_config(domains, Arc::new(client_config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustls::crypto::ring;
-    use rustls::{DEFAULT_VERSIONS, RootCertStore};
-
-    /// Returns a config for `domains` that needs no webpki roots, like the custom-root builds.
-    fn config(domains: &[&str]) -> AcmeConfig<Infallible> {
-        let client_config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
-            .with_protocol_versions(DEFAULT_VERSIONS)
-            .expect("the provider supports the default versions")
-            .with_root_certificates(RootCertStore::empty())
-            .with_no_client_auth();
-        AcmeConfig::new_with_client_tls_config(domains, Arc::new(client_config))
-    }
 
     #[test]
     fn validated_identifiers_deduplicate_and_reject_conflicts() {
@@ -384,7 +384,7 @@ mod tests {
             ),
         ];
         for (domains, expected) in cases {
-            let identifiers = config(&domains).validated_identifiers();
+            let identifiers = test_config(&domains).validated_identifiers();
             assert_eq!(identifiers, expected, "{domains:?}");
         }
     }
@@ -396,8 +396,8 @@ mod tests {
             Identifier::from_text("0:0::1"),
         ];
         let configs = [
-            config(&["Example.COM.", "0:0::1"]),
-            config(&[]).identifiers(typed),
+            test_config(&["Example.COM.", "0:0::1"]),
+            test_config(&[]).identifiers(typed),
         ];
         for config in configs {
             assert_eq!(config.cache_key(), ["Example.COM.", "::1"]);
