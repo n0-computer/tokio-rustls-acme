@@ -1,7 +1,8 @@
 //! Integration tests against a Pebble ACME test server that validates challenges.
 //!
 //! Each test starts its own Pebble and `challtestsrv` on free ports, see [`server`], so the tests
-//! can run in parallel, also with other runs of them.
+//! can run in parallel, also with other runs of them. Pebble runs with alternate roots, so it
+//! also offers alternate chains.
 //!
 //! Install the Pebble binaries with `cargo make pebble-install`, then run the tests with
 //! `cargo test --test pebble -- --ignored`, or both with `cargo make test-pebble`.
@@ -29,8 +30,8 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 use tokio_rustls_acme::{
-    AccountCache, AcmeAcceptor, AcmeConfig, AcmeState, CertCache, EventError, EventOk, OrderError,
-    caches::DirCache,
+    AccountCache, AcmeAcceptor, AcmeConfig, AcmeState, CertCache, CertChainPreference, EventError,
+    EventOk, OrderError, caches::DirCache,
 };
 
 use crate::server::Pebble;
@@ -38,6 +39,8 @@ use crate::server::Pebble;
 /// The address that Pebble's validation authority resolves every name to.
 const LOCALHOST: Ipv4Addr = Ipv4Addr::LOCALHOST;
 const ORDER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time for the state machine to finish work that reports no event.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Returns a fresh ring crypto provider. The pebble tests pin themselves to
 /// ring (via the dev-dependency) regardless of which crate features are on,
@@ -94,6 +97,14 @@ impl Site {
         .expect("timed out waiting for certificate deployment")
     }
 
+    /// Polls the state machine for [`IDLE_TIMEOUT`], in which it must report nothing.
+    ///
+    /// Lets it finish work without an event, like loading a cached alternate chain.
+    async fn run_idle(&mut self) {
+        let event = tokio::time::timeout(IDLE_TIMEOUT, self.state.next()).await;
+        assert!(event.is_err(), "unexpected event {event:?}");
+    }
+
     /// Closes the listener and waits until its port is free.
     async fn close(mut self) {
         self.server.shutdown().await;
@@ -112,7 +123,7 @@ async fn serve(listener: TcpListener, acceptor: AcmeAcceptor, server_config: Arc
             match acceptor.accept(tcp).await {
                 Ok(None) => eprintln!("served tls-alpn-01 challenge to {peer}"),
                 Ok(Some(start)) => {
-                    if let Err(err) = start.into_stream(server_config).await {
+                    if let Err(err) = acceptor.into_stream(start, server_config).await {
                         eprintln!("TLS handshake with {peer} failed: {err}");
                     }
                 }
@@ -210,12 +221,17 @@ struct AcmeEvents {
     cached_cert_parse_error: bool,
 }
 
-/// Runs a [`Site`] with `cache` until it deploys a certificate, collecting events.
-async fn acquire_cert_with_cache<C>(pebble: &Pebble, domain: &str, cache: C) -> (Site, AcmeEvents)
+/// Runs a [`Site`] with `cert_chain` and `cache` until it deploys a certificate.
+async fn acquire_cert_with_cache<C>(
+    pebble: &Pebble,
+    domain: &str,
+    cert_chain: CertChainPreference,
+    cache: C,
+) -> (Site, AcmeEvents)
 where
     C: CertCache<EC = io::Error> + AccountCache<EA = io::Error> + Send + Sync + 'static,
 {
-    let config = pebble.config(&[domain]).cache(cache);
+    let config = pebble.config(&[domain]).cert_chain(cert_chain).cache(cache);
     let mut site = Site::start(config, pebble);
     let mut events = AcmeEvents::default();
 
@@ -276,6 +292,8 @@ async fn test_default_chain() {
     let peer_certs = fetch_chain_for(&pebble, domain).await;
     eprintln!("default chain: received {} certificates", peer_certs.len());
     assert_needs_intermediates(&pebble, &peer_certs, domain).await;
+    assert_eq!(peer_certs.last(), Some(&pebble.intermediate(0).await));
+    assert!(!site.state.resolver().serves_alternate_chain());
 }
 
 /// Verify that DirCache persists certs and a second run loads from cache.
@@ -294,8 +312,13 @@ async fn test_dir_cache_stores_and_reloads() {
     let cache_path: PathBuf = cache_dir.path().into();
 
     // First run: fresh order, should store to cache.
-    let (site, events) =
-        acquire_cert_with_cache(&pebble, domain, DirCache::new(cache_path.clone())).await;
+    let (site, events) = acquire_cert_with_cache(
+        &pebble,
+        domain,
+        CertChainPreference::Default,
+        DirCache::new(cache_path.clone()),
+    )
+    .await;
     assert!(events.deployed_new, "first run should deploy a new cert");
     assert!(
         events.cert_cache_store,
@@ -307,8 +330,13 @@ async fn test_dir_cache_stores_and_reloads() {
     site.close().await;
 
     // Second run: same cache dir, should load from cache without ordering.
-    let (_site, events2) =
-        acquire_cert_with_cache(&pebble, domain, DirCache::new(cache_path)).await;
+    let (_site, events2) = acquire_cert_with_cache(
+        &pebble,
+        domain,
+        CertChainPreference::Default,
+        DirCache::new(cache_path),
+    )
+    .await;
     assert!(
         events2.deployed_cached,
         "second run should deploy cached cert"
@@ -333,8 +361,13 @@ async fn test_corrupted_cache_reissues_with_cached_account() {
     let cache_dir = tempfile::tempdir().expect("failed to create temp dir");
     let cache_path: PathBuf = cache_dir.path().into();
 
-    let (site, events) =
-        acquire_cert_with_cache(&pebble, domain, DirCache::new(cache_path.clone())).await;
+    let (site, events) = acquire_cert_with_cache(
+        &pebble,
+        domain,
+        CertChainPreference::Default,
+        DirCache::new(cache_path.clone()),
+    )
+    .await;
     assert!(
         events.deployed_new && events.account_cache_store,
         "first run should issue a cert and store the account, got {events:?}"
@@ -346,7 +379,13 @@ async fn test_corrupted_cache_reissues_with_cached_account() {
     std::fs::write(cache_file(&cache_path, "cached_cert_"), b"not a valid PEM")
         .expect("failed to corrupt cached cert");
 
-    let (_site, events) = acquire_cert_with_cache(&pebble, domain, DirCache::new(cache_path)).await;
+    let (_site, events) = acquire_cert_with_cache(
+        &pebble,
+        domain,
+        CertChainPreference::Default,
+        DirCache::new(cache_path),
+    )
+    .await;
     assert!(
         events.cached_cert_parse_error && events.deployed_new && !events.deployed_cached,
         "second run should reject the cached cert and issue a new one, got {events:?}"
@@ -426,4 +465,110 @@ async fn test_multi_domain_san() {
         }
         eprintln!("multi-domain SANs served for {domain}: {sans:?}");
     }
+}
+
+/// PreferredChain serves the alternate chain whose root matches the issuer.
+#[tokio::test]
+#[ignore]
+async fn test_preferred_chain() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let pebble = Pebble::start().await;
+    let domain = "preferred-chain.example.com";
+    let preference = CertChainPreference::preferred_chain(pebble.root_cn(1).await);
+    let mut site = Site::start(pebble.config(&[domain]).cert_chain(preference), &pebble);
+    site.deploy().await.expect("order failed");
+
+    let chain = fetch_chain_for(&pebble, domain).await;
+    assert_eq!(
+        chain.last(),
+        Some(&pebble.intermediate(1).await),
+        "should serve the alternate chain"
+    );
+    assert!(
+        !site.state.resolver().serves_alternate_chain(),
+        "PreferredChain serves one chain"
+    );
+}
+
+/// Falls back to the default chain when no offered chain matches the PreferredChain root.
+#[tokio::test]
+#[ignore]
+async fn test_preferred_chain_falls_back_to_default() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let pebble = Pebble::start().await;
+    let domain = "preferred-fallback.example.com";
+    let preference = CertChainPreference::preferred_chain("No Such Root");
+    let mut site = Site::start(pebble.config(&[domain]).cert_chain(preference), &pebble);
+    site.deploy().await.expect("order failed");
+
+    let chain = fetch_chain_for(&pebble, domain).await;
+    assert_eq!(
+        chain.last(),
+        Some(&pebble.intermediate(0).await),
+        "should serve the default chain"
+    );
+}
+
+/// DualChain stores the alternate chain in `DirCache`, next to the certificate.
+///
+/// Pebble's chains need the same schemes, so no client gets the alternate. Serving it, also
+/// after a restart, is tested in `state` and `tests/dual_chain.rs`.
+#[tokio::test]
+#[ignore]
+async fn test_dual_chain_cache() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let pebble = Pebble::start().await;
+    let domain = "dual-chain-cache.example.com";
+    let cache_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let cache_path: PathBuf = cache_dir.path().into();
+    let preference = CertChainPreference::dual_chain(pebble.root_cn(1).await);
+
+    let (mut site, events) = acquire_cert_with_cache(
+        &pebble,
+        domain,
+        preference.clone(),
+        DirCache::new(cache_path.clone()),
+    )
+    .await;
+    assert!(
+        events.deployed_new && events.cert_cache_store,
+        "first run should issue and store a cert, got {events:?}"
+    );
+    // The alternate follows the certificate.
+    site.run_idle().await;
+    site.close().await;
+
+    let alt_file = std::fs::read_dir(&cache_path)
+        .expect("failed to read cache dir")
+        .map(|entry| entry.expect("failed to read cache dir entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("cached_alt_cert_"))
+        })
+        .expect("should have an alternate cert cache file");
+    let alt_pems = pem::parse_many(std::fs::read(&alt_file).expect("failed to read alt cache"))
+        .expect("failed to parse alt cache");
+    assert!(
+        alt_pems.iter().all(|p| p.tag() == "CERTIFICATE"),
+        "the alternate cache file should hold no key"
+    );
+    assert_eq!(
+        alt_pems.last().map(|p| p.contents()),
+        Some(pebble.intermediate(1).await.as_ref()),
+        "the alternate cache file should hold the alternate chain"
+    );
+
+    let (mut site, events) =
+        acquire_cert_with_cache(&pebble, domain, preference, DirCache::new(cache_path)).await;
+    assert!(
+        events.deployed_cached && !events.deployed_new,
+        "second run should deploy the cached cert, got {events:?}"
+    );
+    site.run_idle().await;
+    let chain = fetch_chain_for(&pebble, domain).await;
+    assert_eq!(chain.last(), Some(&pebble.intermediate(0).await));
 }

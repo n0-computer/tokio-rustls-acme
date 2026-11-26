@@ -39,6 +39,12 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
             },
         }
     }
+    async fn remove_if_exist(&self, file: impl AsRef<Path>) -> Result<(), std::io::Error> {
+        match fs::remove_file(self.inner.as_ref().join(file)).await {
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
     async fn write(
         &self,
         file: impl AsRef<Path>,
@@ -75,14 +81,23 @@ impl<P: AsRef<Path> + Send + Sync> DirCache<P> {
         format!("cached_account_{hash}")
     }
     fn cached_cert_file_name(domains: &[String], directory_url: impl AsRef<str>) -> String {
+        format!("cached_cert_{}", Self::domains_hash(domains, directory_url))
+    }
+    fn cached_alt_cert_file_name(domains: &[String], directory_url: impl AsRef<str>) -> String {
+        format!(
+            "cached_alt_cert_{}",
+            Self::domains_hash(domains, directory_url)
+        )
+    }
+    /// Returns the hash of `domains` and `directory_url` that names their files.
+    fn domains_hash(domains: &[String], directory_url: impl AsRef<str>) -> String {
         let mut ctx = Context::new(&SHA256);
         for domain in domains {
             ctx.update(domain.as_ref());
             ctx.update(&[0])
         }
         ctx.update(directory_url.as_ref().as_bytes());
-        let hash = URL_SAFE_NO_PAD.encode(ctx.finish());
-        format!("cached_cert_{hash}")
+        URL_SAFE_NO_PAD.encode(ctx.finish())
     }
 }
 
@@ -106,6 +121,26 @@ impl<P: AsRef<Path> + Send + Sync> CertCache for DirCache<P> {
         let file_name = Self::cached_cert_file_name(domains, directory_url);
         self.write(file_name, cert).await
     }
+    async fn load_alt_cert(
+        &self,
+        domains: &[String],
+        directory_url: &str,
+    ) -> Result<Option<Vec<u8>>, Self::EC> {
+        let file_name = Self::cached_alt_cert_file_name(domains, directory_url);
+        self.read_if_exist(file_name).await
+    }
+    async fn store_alt_cert(
+        &self,
+        domains: &[String],
+        directory_url: &str,
+        chain: Option<&[u8]>,
+    ) -> Result<(), Self::EC> {
+        let file_name = Self::cached_alt_cert_file_name(domains, directory_url);
+        match chain {
+            Some(chain) => self.write(file_name, chain).await,
+            None => self.remove_if_exist(file_name).await,
+        }
+    }
 }
 
 #[async_trait]
@@ -128,5 +163,41 @@ impl<P: AsRef<Path> + Send + Sync> AccountCache for DirCache<P> {
     ) -> Result<(), Self::EA> {
         let file_name = Self::cached_account_file_name(contact, directory_url);
         self.write(file_name, account).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DOMAINS: &[&str] = &["example.com"];
+    const DIRECTORY_URL: &str = "https://acme.example/dir";
+
+    #[tokio::test]
+    async fn store_alt_cert_none_removes_the_alternate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DirCache::new(dir.path());
+        let domains: Vec<String> = DOMAINS.iter().map(|d| d.to_string()).collect();
+        cache
+            .store_alt_cert(&domains, DIRECTORY_URL, Some(b"alt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.load_alt_cert(&domains, DIRECTORY_URL).await.unwrap(),
+            Some(b"alt".to_vec())
+        );
+        cache
+            .store_alt_cert(&domains, DIRECTORY_URL, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.load_alt_cert(&domains, DIRECTORY_URL).await.unwrap(),
+            None
+        );
+        // Removing again finds nothing to remove, which is fine.
+        cache
+            .store_alt_cert(&domains, DIRECTORY_URL, None)
+            .await
+            .unwrap();
     }
 }

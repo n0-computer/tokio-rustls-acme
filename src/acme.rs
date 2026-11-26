@@ -10,6 +10,7 @@ pub use crate::https_helper::HttpsRequestError;
 use crate::https_helper::{self, Method, Response, https};
 pub use crate::jose::JoseError;
 use crate::jose::{key_authorization_sha256, sign, sign_eab};
+use crate::link;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rcgen::{CustomExtension, PKCS_ECDSA_P256_SHA256};
@@ -110,32 +111,34 @@ impl Account {
             directory,
         })
     }
+    /// Sends `payload` to `url` in a request signed by this account.
+    async fn post(
+        &self,
+        client_config: &Arc<ClientConfig>,
+        url: &str,
+        payload: &str,
+    ) -> Result<Response, AcmeError> {
+        let body = sign(
+            &self.key_pair,
+            Some(&self.kid),
+            self.directory.nonce(client_config).await?,
+            url,
+            payload,
+        )?;
+        let https_only = self.directory.https_only();
+        Ok(https(client_config, url, Method::Post, Some(body), https_only).await?)
+    }
     async fn request(
         &self,
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
         payload: &str,
-    ) -> Result<(Option<String>, String), AcmeError> {
-        let body = sign(
-            &self.key_pair,
-            Some(&self.kid),
-            self.directory.nonce(client_config).await?,
-            url.as_ref(),
-            payload,
-        )?;
-        let https_only = self.directory.https_only();
-        let response = https(
-            client_config,
-            url.as_ref(),
-            Method::Post,
-            Some(body),
-            https_only,
-        )
-        .await?;
+    ) -> Result<ApiResponse, AcmeError> {
+        let response = self.post(client_config, url.as_ref(), payload).await?;
         let location = get_header(&response, "Location").ok();
         let body = https_helper::text(response).await?;
         debug!(?body, "response");
-        Ok((location, body))
+        Ok(ApiResponse { body, location })
     }
     pub(crate) async fn new_order(
         &self,
@@ -150,8 +153,10 @@ impl Account {
         let response = self
             .request(client_config, &self.directory.new_order, &payload)
             .await?;
-        let url = response.0.ok_or(AcmeError::MissingHeader("Location"))?;
-        let order = serde_json::from_str(&response.1).map_err(json_err)?;
+        let url = response
+            .location
+            .ok_or(AcmeError::MissingHeader("Location"))?;
+        let order = serde_json::from_str(&response.body).map_err(json_err)?;
         Ok((url, order))
     }
     /// Fetches the authorization object at `url`.
@@ -162,7 +167,7 @@ impl Account {
     ) -> Result<Auth, AcmeError> {
         let payload = "".to_string();
         let response = self.request(client_config, url, &payload).await?;
-        serde_json::from_str(&response.1).map_err(json_err)
+        serde_json::from_str(&response.body).map_err(json_err)
     }
     /// Tells the server that the challenge at `url` is ready for validation.
     pub(crate) async fn challenge(
@@ -180,7 +185,7 @@ impl Account {
         url: impl AsRef<str>,
     ) -> Result<Order, AcmeError> {
         let response = self.request(client_config, &url, "").await?;
-        serde_json::from_str(&response.1).map_err(json_err)
+        serde_json::from_str(&response.body).map_err(json_err)
     }
     /// Sends the DER-encoded `csr` to the finalize `url` and returns the updated order.
     pub(crate) async fn finalize(
@@ -191,7 +196,23 @@ impl Account {
     ) -> Result<Order, AcmeError> {
         let payload = format!("{{\"csr\":\"{}\"}}", URL_SAFE_NO_PAD.encode(csr),);
         let response = self.request(client_config, &url, &payload).await?;
-        serde_json::from_str(&response.1).map_err(json_err)
+        serde_json::from_str(&response.body).map_err(json_err)
+    }
+    /// Downloads the PEM certificate chain at `url`, with the URLs of its alternate chains.
+    pub(crate) async fn certificate_with_alternate_urls(
+        &self,
+        client_config: &Arc<ClientConfig>,
+        url: impl AsRef<str>,
+    ) -> Result<CertificateWithAlternateUrls, AcmeError> {
+        let url = url.as_ref();
+        let response = self.post(client_config, url, "").await?;
+        let alternate_urls = link::alternate_urls(url, response.headers());
+        let pem = https_helper::text(response).await?;
+        debug!(?pem, ?alternate_urls, "certificate");
+        Ok(CertificateWithAlternateUrls {
+            pem,
+            alternate_urls,
+        })
     }
     /// Downloads the PEM certificate chain at `url`.
     pub(crate) async fn certificate(
@@ -199,7 +220,7 @@ impl Account {
         client_config: &Arc<ClientConfig>,
         url: impl AsRef<str>,
     ) -> Result<String, AcmeError> {
-        Ok(self.request(client_config, &url, "").await?.1)
+        Ok(self.request(client_config, &url, "").await?.body)
     }
     /// Picks the `tls-alpn-01` challenge and builds its validation certificate for `domain`.
     pub(crate) fn tls_alpn_01<'a>(
@@ -458,6 +479,20 @@ pub enum AcmeError {
     /// The authorization offers no `tls-alpn-01` challenge.
     #[error("no tls-alpn-01 challenge found")]
     NoTlsAlpn01Challenge,
+}
+
+/// The parts of an ACME API response that the client uses.
+struct ApiResponse {
+    body: String,
+    location: Option<String>,
+}
+
+/// The response from downloading a certificate, including any alternate chain URLs.
+pub(crate) struct CertificateWithAlternateUrls {
+    /// The PEM-encoded certificate chain.
+    pub(crate) pem: String,
+    /// The URLs of the alternate chains, see [`link::alternate_urls`].
+    pub(crate) alternate_urls: Vec<String>,
 }
 
 impl AcmeError {

@@ -1,21 +1,88 @@
 use crate::acme::ACME_TLS_ALPN_NAME;
+use crate::chain::{CertChain, RequiredSchemes};
+use rustls::SignatureScheme;
+use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::Mutex;
-use tracing::debug;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use time::OffsetDateTime;
+use tracing::{debug, warn};
 
-/// Cert resolver that serves the issued certificate to application traffic
-/// and per-domain validation certificates to `tls-alpn-01` clients.
+/// Cert resolver for the issued certificate and the `tls-alpn-01` validation certificates.
+///
+/// It serves only the default chain of [`CertChainPreference::DualChain`]: rustls hides some of
+/// the client's signature schemes from resolvers, so
+/// [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream) picks the alternate.
+///
+/// [`CertChainPreference::DualChain`]: crate::CertChainPreference::DualChain
 #[derive(Debug)]
 pub struct ResolvesServerCertAcme {
     inner: Mutex<Inner>,
+    /// Whether an alternate chain was ever set, so that handshakes without one skip the lock.
+    has_alternate: AtomicBool,
+}
+
+/// An alternate chain for DualChain mode, with the schemes that verifying each chain takes.
+#[derive(Debug)]
+pub(crate) struct AlternateChain {
+    /// The alternate chain with the primary's key.
+    pub(crate) key: Arc<CertifiedKey>,
+    /// When the first certificate of the chain expires, and with it the chain.
+    expiry: OffsetDateTime,
+    /// The schemes a client needs to verify the primary chain.
+    pub(crate) primary_schemes: RequiredSchemes,
+    /// The schemes a client needs to verify the alternate chain.
+    pub(crate) alternate_schemes: RequiredSchemes,
+}
+
+impl AlternateChain {
+    /// Creates the alternate `chain` for `primary`, which signs with the primary's key.
+    ///
+    /// `algorithms` verify the signatures that link the two chains.
+    pub(crate) fn new(
+        primary: &CertifiedKey,
+        chain: CertChain,
+        algorithms: &WebPkiSupportedAlgorithms,
+    ) -> Self {
+        let primary_chain = CertChain::new(primary.cert.clone());
+        Self {
+            primary_schemes: primary_chain.required_schemes(&chain, algorithms),
+            alternate_schemes: chain.likely_required_schemes(&primary_chain, algorithms),
+            // A chain that doesn't parse can't be served.
+            expiry: chain.expiry().unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            key: Arc::new(CertifiedKey::new(chain.into_certs(), primary.key.clone())),
+        }
+    }
+
+    /// Returns whether any client can get this alternate, one that offers its schemes only.
+    pub(crate) fn is_selectable(&self) -> bool {
+        match &self.alternate_schemes {
+            RequiredSchemes::Known(schemes) => {
+                self.primary_schemes.supported_by(schemes) == Some(false)
+            }
+            RequiredSchemes::Unknown => false,
+        }
+    }
+
+    /// Returns whether the chain has expired at `now`.
+    fn is_expired(&self, now: OffsetDateTime) -> bool {
+        self.expiry <= now
+    }
+
+    /// Returns whether a client offering `offered` can verify only this alternate.
+    fn serves(&self, offered: &[SignatureScheme]) -> bool {
+        self.primary_schemes.supported_by(offered) == Some(false)
+            && self.alternate_schemes.supported_by(offered) == Some(true)
+    }
 }
 
 #[derive(Debug)]
 struct Inner {
     cert: Option<Arc<CertifiedKey>>,
+    /// Alternate chain for DualChain mode, for clients that can only verify this one.
+    alt_cert: Option<AlternateChain>,
     auth_keys: BTreeMap<String, Arc<CertifiedKey>>,
 }
 
@@ -24,12 +91,53 @@ impl ResolvesServerCertAcme {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 cert: None,
+                alt_cert: None,
                 auth_keys: Default::default(),
             }),
+            has_alternate: AtomicBool::new(false),
         })
     }
+    /// Serves `cert`.
+    ///
+    /// The alternate of the previous certificate stays until one for `cert` replaces it, or it
+    /// expires, so that clients that need it keep getting a valid chain.
     pub(crate) fn set_cert(&self, cert: Arc<CertifiedKey>) {
         self.inner.lock().expect("poisoned").cert = Some(cert);
+    }
+    /// Serves `alternate` next to the certificate if it has the same leaf, and returns whether.
+    pub(crate) fn set_alternate(&self, alternate: AlternateChain) -> bool {
+        let mut inner = self.inner.lock().expect("poisoned");
+        let matches = match (&inner.cert, alternate.key.end_entity_cert()) {
+            (Some(cert), Ok(leaf)) => cert.end_entity_cert().ok() == Some(leaf),
+            _ => false,
+        };
+        if matches {
+            inner.alt_cert = Some(alternate);
+            self.has_alternate.store(true, Ordering::Relaxed);
+        } else {
+            warn!("alternate chain doesn't match the certificate, not serving it");
+        }
+        matches
+    }
+    /// Returns whether DualChain serves an alternate chain to some clients.
+    pub fn serves_alternate_chain(&self) -> bool {
+        let inner = self.inner.lock().expect("poisoned");
+        let now = OffsetDateTime::now_utc();
+        inner
+            .alt_cert
+            .as_ref()
+            .is_some_and(|alternate| alternate.is_selectable() && !alternate.is_expired(now))
+    }
+    /// Returns the alternate chain for a client that offers `offered`, if it needs it.
+    pub(crate) fn alternate_for(&self, offered: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        if !self.has_alternate.load(Ordering::Relaxed) {
+            return None;
+        }
+        let inner = self.inner.lock().expect("poisoned");
+        let alternate = inner.alt_cert.as_ref()?;
+        let now = OffsetDateTime::now_utc();
+        let serves = alternate.serves(offered) && !alternate.is_expired(now);
+        serves.then(|| alternate.key.clone())
     }
     pub(crate) fn set_auth_key(&self, domain: String, cert: Arc<CertifiedKey>) {
         self.inner
@@ -66,6 +174,101 @@ impl ResolvesServerCert for ResolvesServerCertAcme {
             }
         } else {
             self.inner.lock().expect("poisoned").cert.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::{self, CROSS_SIGNED_ROOT, Cert, chain};
+
+    const P256: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
+    const P384: SignatureScheme = SignatureScheme::ECDSA_NISTP384_SHA384;
+    const RSA: SignatureScheme = SignatureScheme::RSA_PKCS1_SHA256;
+    const RSA_PSS: SignatureScheme = SignatureScheme::RSA_PSS_SHA256;
+
+    /// Returns a resolver that serves the primary of [`CROSS_SIGNED_ROOT`], and that primary.
+    fn resolver() -> (Arc<ResolvesServerCertAcme>, Arc<CertifiedKey>) {
+        let resolver = ResolvesServerCertAcme::new();
+        let primary = Arc::new(fixture::certified_key(CROSS_SIGNED_ROOT.primary));
+        resolver.set_cert(primary.clone());
+        (resolver, primary)
+    }
+
+    /// Returns the alternate `certs` of `primary`.
+    fn alternate(primary: &CertifiedKey, certs: &[Cert]) -> AlternateChain {
+        AlternateChain::new(primary, chain(certs), &fixture::algorithms())
+    }
+
+    #[test]
+    fn set_alternate_needs_the_served_leaf() {
+        let (resolver, primary) = resolver();
+        assert!(!resolver.set_alternate(alternate(&primary, &[Cert::Intermediate])));
+        assert!(!resolver.serves_alternate_chain());
+        let unselectable = AlternateChain {
+            alternate_schemes: RequiredSchemes::Unknown,
+            ..alternate(&primary, CROSS_SIGNED_ROOT.alternate)
+        };
+        assert!(resolver.set_alternate(unselectable));
+        assert!(!resolver.serves_alternate_chain(), "no client can get it");
+        assert!(resolver.set_alternate(alternate(&primary, CROSS_SIGNED_ROOT.alternate)));
+        assert!(resolver.serves_alternate_chain());
+        let unserved = ResolvesServerCertAcme::new();
+        let alternate = alternate(&primary, CROSS_SIGNED_ROOT.alternate);
+        assert!(!unserved.set_alternate(alternate), "no certificate");
+    }
+
+    #[test]
+    fn previous_alternate_stays_until_it_expires() {
+        let (resolver, primary) = resolver();
+        resolver.set_alternate(alternate(&primary, CROSS_SIGNED_ROOT.alternate));
+        // A newer certificate, until its own alternate arrives.
+        resolver.set_cert(Arc::new(fixture::certified_key(&[Cert::Intermediate])));
+        assert_eq!(
+            resolver.alternate_for(&[P384]).map(|key| key.cert.clone()),
+            Some(fixture::certs(CROSS_SIGNED_ROOT.alternate))
+        );
+        let expired = AlternateChain {
+            expiry: OffsetDateTime::now_utc(),
+            ..alternate(&primary, CROSS_SIGNED_ROOT.alternate)
+        };
+        resolver.set_cert(primary);
+        resolver.set_alternate(expired);
+        assert!(resolver.alternate_for(&[P384]).is_none());
+        assert!(!resolver.serves_alternate_chain());
+    }
+
+    #[test]
+    fn alternate_goes_to_clients_that_can_verify_only_it() {
+        let known = |schemes: &[SignatureScheme]| RequiredSchemes::Known(schemes.to_vec());
+        let cases = [
+            (known(&[P256, RSA]), known(&[P256]), &[P256][..], true),
+            (known(&[P256, RSA]), known(&[P256]), &[P256, RSA], false),
+            // TLS 1.3 clients may list RSA PKCS#1 only for certificates, out of rustls' sight.
+            (known(&[P256, RSA]), known(&[P256]), &[P256, RSA_PSS], false),
+            // The client can verify neither chain.
+            (known(&[P256, RSA]), known(&[P384]), &[P256], false),
+            (RequiredSchemes::Unknown, known(&[P256]), &[P256], false),
+            (
+                known(&[P256, RSA]),
+                RequiredSchemes::Unknown,
+                &[P256],
+                false,
+            ),
+        ];
+        let (_, primary) = resolver();
+        for (primary_schemes, alternate_schemes, offered, served) in cases {
+            let alternate = AlternateChain {
+                primary_schemes,
+                alternate_schemes,
+                ..alternate(&primary, CROSS_SIGNED_ROOT.alternate)
+            };
+            assert_eq!(
+                alternate.serves(offered),
+                served,
+                "{alternate:?} for {offered:?}"
+            );
         }
     }
 }

@@ -126,34 +126,55 @@ impl Pebble {
 
     /// Fetches the roots of the ACME CA as a root store, without intermediates.
     pub(crate) async fn acme_root_store(&self) -> RootCertStore {
+        let mut root_store = RootCertStore::empty();
+        for index in 0..2 {
+            let root = self.management_cert(&format!("roots/{index}")).await;
+            root_store
+                .add(root)
+                .expect("failed to add Pebble root to root store");
+        }
+        root_store
+    }
+
+    /// Returns the common name of root `index`, 0 of the default chain and 1 of the alternate.
+    pub(crate) async fn root_cn(&self, index: usize) -> String {
+        let root = self.management_cert(&format!("roots/{index}")).await;
+        let (_, root) = x509_parser::parse_x509_certificate(&root).expect("failed to parse root");
+        let common_name = root.subject().iter_common_name().next();
+        common_name
+            .and_then(|common_name| common_name.as_str().ok())
+            .expect("root has no common name")
+            .to_owned()
+    }
+
+    /// Returns the intermediate of chain `index`, which identifies the chain.
+    pub(crate) async fn intermediate(&self, index: usize) -> CertificateDer<'static> {
+        self.management_cert(&format!("intermediates/{index}"))
+            .await
+    }
+
+    /// Fetches the first certificate of the PEM at `path` of the management API.
+    async fn management_cert(&self, path: &str) -> CertificateDer<'static> {
         let client = reqwest::Client::builder()
             .tls_backend_preconfigured(ClientConfig::clone(&self.client_config))
             .build()
             .expect("failed to build management API client");
-        let mut root_store = RootCertStore::empty();
-
-        // Index 1 only exists with PEBBLE_ALTERNATE_ROOTS, so a 404 there is expected.
-        for index in 0..2 {
-            let url = format!("https://localhost:{}/roots/{index}", self.ports.management);
-            let resp =
-                client.get(&url).send().await.unwrap_or_else(|e| {
-                    panic!("failed to reach Pebble management API at {url}: {e}")
-                });
-            if resp.status().is_success() {
-                let pem_text = resp.text().await.expect("failed to read Pebble root");
-                for p in pem::parse_many(&pem_text).expect("failed to parse Pebble root PEM") {
-                    root_store
-                        .add(CertificateDer::from(p.into_contents()))
-                        .expect("failed to add Pebble root to root store");
-                }
-            }
-        }
-
-        assert!(
-            !root_store.is_empty(),
-            "failed to fetch any roots from Pebble management API"
-        );
-        root_store
+        let url = format!("https://localhost:{}/{path}", self.ports.management);
+        let pem_text = client
+            .get(&url)
+            .send()
+            .await
+            .and_then(|resp| resp.error_for_status())
+            .unwrap_or_else(|e| panic!("failed to fetch {url}: {e}"))
+            .text()
+            .await
+            .unwrap_or_else(|e| panic!("failed to read {url}: {e}"));
+        let pems = pem::parse_many(&pem_text).expect("failed to parse Pebble PEM");
+        let first = pems
+            .into_iter()
+            .next()
+            .expect("no certificate in Pebble PEM");
+        CertificateDer::from(first.into_contents())
     }
 }
 
@@ -226,6 +247,8 @@ impl Ports {
         pebble.env("PEBBLE_WFE_NONCEREJECT", "0");
         // Validate almost every order. Pebble still reuses about 1 in 100 authorizations.
         pebble.env("PEBBLE_AUTHZREUSE", "0");
+        // Offers a second chain to another root, for the chain preference tests.
+        pebble.env("PEBBLE_ALTERNATE_ROOTS", "1");
         let pebble = Process::spawn("pebble", pebble, dir)?;
 
         Ok(vec![challtestsrv, pebble])

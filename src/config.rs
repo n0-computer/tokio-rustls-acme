@@ -14,6 +14,106 @@ use std::fmt::{self, Debug};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Common name of Let's Encrypt's ECDSA root.
+const LETSENCRYPT_ISRG_ROOT_X2: &str = "ISRG Root X2";
+
+/// Controls which certificate chain to serve, of those the CA offers (RFC 8555 section 7.4.2).
+///
+/// A chain is named by the issuer common name of its topmost certificate, like certbot's
+/// `--preferred-chain`. An alternate is used only if each of its certificates is issued and
+/// signed by the next. This checks the CA's response, it is no path validation.
+/// Let's Encrypt's default chain ends at ISRG Root X1, an RSA root, and it also offers one to
+/// ISRG Root X2, which needs no RSA, see <https://letsencrypt.org/certificates/>.
+///
+/// [`DualChain`](CertChainPreference::DualChain) picks the chain per connection from the
+/// `signature_algorithms` of the ClientHello: clients that can verify only the alternate get it.
+/// A client that offers RSA-PSS counts as verifying RSA PKCS#1 with the same hash, since TLS 1.3
+/// clients may list PKCS#1 only for certificates; one that can't gets the default chain. A
+/// client that verifies RSA certificates but offers no RSA scheme gets the alternate.
+/// This happens in [`AcmeAcceptor::into_stream`](crate::AcmeAcceptor::into_stream), which
+/// [`Incoming`](crate::Incoming) and the Axum acceptor use. A preference applies to new orders.
+///
+/// After a renewal, the previous certificate's alternate is served until the new one's arrives,
+/// or it expires. It is served with the previous key, to the clients that the previous
+/// certificate's chains called for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CertChainPreference {
+    /// Serves the default chain from the ACME server.
+    #[default]
+    Default,
+    /// Serves the chain to the given root instead of the default chain, if the CA offers one.
+    PreferredChain(ChainRoot),
+    /// Serves the default chain, and the chain to the given root to clients that only verify it.
+    DualChain(ChainRoot),
+}
+
+/// The root of a certificate chain, named by its common name, like `ISRG Root X2`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainRoot {
+    common_name: String,
+}
+
+impl ChainRoot {
+    /// Creates a chain root from its common name.
+    pub fn new(common_name: impl Into<String>) -> Self {
+        Self {
+            common_name: common_name.into(),
+        }
+    }
+    /// Returns the common name of the root.
+    pub fn common_name(&self) -> &str {
+        &self.common_name
+    }
+}
+
+impl From<&str> for ChainRoot {
+    fn from(common_name: &str) -> Self {
+        Self::new(common_name)
+    }
+}
+
+impl From<String> for ChainRoot {
+    fn from(common_name: String) -> Self {
+        Self::new(common_name)
+    }
+}
+
+impl fmt::Display for ChainRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.common_name)
+    }
+}
+
+impl CertChainPreference {
+    /// Returns a preference for the chain to `root`.
+    pub fn preferred_chain(root: impl Into<ChainRoot>) -> Self {
+        Self::PreferredChain(root.into())
+    }
+    /// Returns a preference that also serves the chain to `root` to clients that only verify it.
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "tls-webpki-roots")]
+    /// # {
+    /// use tokio_rustls_acme::{AcmeConfig, CertChainPreference};
+    ///
+    /// let config = AcmeConfig::new(["example.com"])
+    ///     .cert_chain(CertChainPreference::dual_chain("ISRG Root X2"));
+    /// # }
+    /// ```
+    pub fn dual_chain(root: impl Into<ChainRoot>) -> Self {
+        Self::DualChain(root.into())
+    }
+    /// Returns a preference for Let's Encrypt's chain to ISRG Root X2, which needs no RSA.
+    pub fn letsencrypt_x2() -> Self {
+        Self::preferred_chain(LETSENCRYPT_ISRG_ROOT_X2)
+    }
+    /// Returns a preference that adds Let's Encrypt's ISRG Root X2 chain for clients without RSA.
+    pub fn letsencrypt_dual_chain() -> Self {
+        Self::dual_chain(LETSENCRYPT_ISRG_ROOT_X2)
+    }
+}
+
 /// Configuration for an ACME resolver.
 ///
 /// The type parameters represent the error types for the certificate cache and account cache.
@@ -24,6 +124,7 @@ pub struct AcmeConfig<EC: Debug, EA: Debug = EC> {
     pub(crate) contact: Vec<String>,
     pub(crate) cache: Box<dyn Cache<EC = EC, EA = EA>>,
     pub(crate) eab: Option<ExternalAccountKey>,
+    pub(crate) cert_chain: CertChainPreference,
 }
 
 impl<EC: Debug, EA: Debug> fmt::Debug for AcmeConfig<EC, EA> {
@@ -129,6 +230,7 @@ impl AcmeConfig<Infallible, Infallible> {
             contact: vec![],
             cache: Box::new(NoCache::new()),
             eab: None,
+            cert_chain: CertChainPreference::Default,
         }
     }
 }
@@ -195,6 +297,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
         self
     }
 
+    /// Sets the certificate chain preference, see [`CertChainPreference`].
+    pub fn cert_chain(mut self, preference: CertChainPreference) -> Self {
+        self.cert_chain = preference;
+        self
+    }
+
     /// Stores certificates and account keys in `cache`.
     pub fn cache<C: 'static + Cache>(self, cache: C) -> AcmeConfig<C::EC, C::EA> {
         AcmeConfig {
@@ -204,6 +312,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeConfig<EC, EA> {
             contact: self.contact,
             cache: Box::new(cache),
             eab: self.eab,
+            cert_chain: self.cert_chain,
         }
     }
     /// Stores certificates in `cert_cache` and account keys in `account_cache`.

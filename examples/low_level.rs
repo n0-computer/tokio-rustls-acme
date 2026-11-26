@@ -87,6 +87,7 @@ async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u
             }
         };
         let rustls_config = rustls_config.clone();
+        let acceptor = acceptor.clone();
         let accept_future = acceptor.accept(tcp);
         // Start the clock before spawning, so executor queueing counts.
         let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
@@ -95,9 +96,10 @@ async fn serve(acceptor: AcmeAcceptor, rustls_config: Arc<ServerConfig>, port: u
             let handshake = async {
                 match accept_future.await? {
                     None => Ok(None),
-                    Some(start_handshake) => {
-                        start_handshake.into_stream(rustls_config).await.map(Some)
-                    }
+                    Some(start_handshake) => acceptor
+                        .into_stream(start_handshake, rustls_config)
+                        .await
+                        .map(Some),
                 }
             };
             match tokio::time::timeout_at(deadline, handshake).await {
